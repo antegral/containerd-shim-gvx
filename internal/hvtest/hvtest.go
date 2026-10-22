@@ -26,6 +26,9 @@ import (
 // AllowNoHypervisorEnv names the variable that allows a skip.
 const AllowNoHypervisorEnv = "GVX_ALLOW_NO_HYPERVISOR"
 
+// Available reports whether the hardware hypervisor starts.
+func Available() bool { return probe() == nil }
+
 // Require skips the test when the hypervisor does not start and the
 // environment allows that. Otherwise it fails the test.
 func Require(t testing.TB) {

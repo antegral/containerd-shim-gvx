@@ -69,7 +69,7 @@ func runConfig(t *testing.T, cfg Config) (code int, stdout, stderr string) {
 }
 
 func TestSandboxRunStaticAndDynamicELF64(t *testing.T) {
-	staticELF, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "hello-static-elf64\n")
+	staticELF, err := testelf.BuildGuestELF64At(runtime.GOARCH, staticBase(), 0, "hello-static-elf64\n")
 	if err != nil {
 		t.Fatalf("BuildGuestELF64 failed: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestSandboxRejectsELFOfOtherArchitecture(t *testing.T) {
 }
 
 func TestSandboxRunTwiceFails(t *testing.T) {
-	elfData, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "once\n")
+	elfData, err := testelf.BuildGuestELF64At(runtime.GOARCH, staticBase(), 0, "once\n")
 	if err != nil {
 		t.Fatalf("BuildGuestELF64 failed: %v", err)
 	}
@@ -349,6 +349,17 @@ func TestSandboxWorkspaceAndPortForward(t *testing.T) {
 	if err != nil || strings.TrimSpace(string(hostBytes)) != "workspace-ok" {
 		t.Fatalf("workspace result.txt = (%q, %v)", string(hostBytes), err)
 	}
+}
+
+// staticBase returns the link address of a static test ELF that the backend of
+// PlatformAuto can load. A hardware backend accepts the classic 0x400000. A host
+// without a hypervisor falls back to the macOS systrap engine, which needs a
+// higher address.
+func staticBase() uint64 {
+	if hvtest.Available() {
+		return 0x400000
+	}
+	return systrapStaticBase
 }
 
 // systrapStaticBase is a link address that the macOS systrap engine allows.
