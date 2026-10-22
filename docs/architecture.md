@@ -13,7 +13,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Priority-0 Dual-OS & Dual-Arch** | Targets `windows/amd64`, `windows/arm64`, `darwin/arm64`, and `darwin/amd64` from one codebase. | Compiles and runs native `linux/amd64` and `linux/arm64` ELF64 workloads on Windows and macOS. |
 | **Zero Runtime Elevation** | Runs under a standard user account and locks down the host process before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
 | **Hardware 4KB Paging (`whpx` & `hvf`)** | Uses `WinHvPlatform.dll` (Windows) and `Hypervisor.framework` (macOS) with 4KB EPT and Stage-1/Stage-2 tables. | Bypasses the Windows 64KB `VirtualAlloc` limit and the Apple Silicon 16KB host page limit. |
-| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows returns `ErrUnavailable`. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
+| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows (`winsystrap`) runs stub processes that a debug object controls. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
 | **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
 | **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Modifies less than 5% of upstream gVisor and builds via `go build` on Go 1.25+. |
@@ -43,8 +43,8 @@ The `systrap` fallback runs on macOS `arm64` only, and it needs 16KB guest pages
 
 | Host Target | Primary Engine (`whpx` / `hvf`) | Fallback Engine (`systrap`) | Host Page & Allocation Granularity | Platform Requirements & Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | Not implemented (`ErrUnavailable`). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
-| **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | Not implemented (`ErrUnavailable`). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
+| **`windows/amd64`** (Intel / AMD) | `platform/whpx` (`WinHvPlatform.dll` 4KB EPT) | `platform/systrap` (`winsystrap`: debug-object stops, `CC 90` syscall patch). | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 10 (2004+) and Windows 11 with the Windows Hypervisor Platform feature. Runs `linux/amd64` images. |
+| **`windows/arm64`** (Snapdragon X) | `platform/whpx` (`Arm64Support` 4KB Stage-2) | `platform/systrap` (`winsystrap`: debug-object stops, `brk` patch). Runs on hosts without WHP. | 4KB Page / 64KB `VirtualAlloc` Reserve | Windows 11 24H2 (Build `26100.3915+`) required for ARM64 WHPX. Runs `linux/arm64` images. |
 | **`darwin/arm64`** (Apple Silicon M1-M5) | `platform/hvf` (`Hypervisor.framework` Stage-1 4KB + Stage-2 16KB) | `platform/systrap` (`darwinsystrap`: 4B `B` Island Patch + `sys_icache_invalidate`), built with `-tags pagesize_16k`. | 16KB Host Page / 16KB Map Granularity | Entitlement `com.apple.security.hypervisor` for `hvf`. Runs `linux/arm64` images. |
 | **`darwin/amd64`** (Intel Mac) | `platform/hvf` (`Hypervisor.framework` VT-x 4KB EPT) | Dropped. | 4KB Page / 4KB Map Granularity | Runs `linux/amd64` images on `hvf`. |
 | **`linux/amd64`** | Upstream platforms (`kvm`, `systrap`). | Upstream `systrap`. | 4KB Page | CI builds and tests the packages that `gvx` owns. |
@@ -150,7 +150,9 @@ gvx/ (Fork of google/gvisor@go)
  │       │       ├── address_space_darwin.go # [NEW] mach_vm_remap mappings, page-trap patcher, trampoline islands
  │       │       ├── patcher_arm64_xplat.go # [NEW] Lazy page-trap arm64asm 4B B trampoline island patcher
  │       │       ├── trampoline_darwin_arm64.s
- │       │       ├── systrap_windows.go     # [NEW] Returns ErrUnavailable
+ │       │       ├── platform_windows.go    # [NEW] Windows platform, stub host client, debug object
+ │       │       ├── address_space_windows.go # [NEW] 4KB placeholder window, lazy patching, private code pages
+ │       │       ├── context_windows.go     # [NEW] Context.Switch over debug-object stops
  │       │       ├── systrap_darwin_amd64.go # [NEW] Returns ErrUnavailable
  │       │       └── stub/                  # [NEW] C and assembly sources and the signed arm64 stub binary
  │       └── fsimpl/
@@ -303,47 +305,69 @@ On Apple Silicon macOS (`darwin/arm64`), the host XNU kernel and `hv_vm_map()` o
 
 ### 3.3 Unified User-Mode Fallback Engine: `pkg/sentry/platform/systrap` (`winsystrap` & `darwinsystrap`) (M5)
 
-`pkg/sentry/platform/systrap` registers the `"systrap"` backend. Linux uses the upstream implementation. macOS `arm64` uses the `darwinsystrap` engine of `gvx`. Windows (`winsystrap`) is not implemented. The engine executes guest ELF64 code and in-guest JIT code (V8) directly on the host CPU at native speed without basic-block translation or instruction emulation.
+`pkg/sentry/platform/systrap` registers the `"systrap"` backend. Linux uses the upstream implementation. macOS `arm64` uses the `darwinsystrap` engine of `gvx`. Windows (`winsystrap`) uses the engine of `gvx` on `amd64` and `arm64`. The engine executes guest ELF64 code and in-guest JIT code (V8) directly on the host CPU at native speed without basic-block translation or instruction emulation.
 
-[`systrap-windows.md`](systrap-windows.md) records the measured Windows behavior and the `winsystrap` design. The Windows cells in the table below follow those measurements.
+[`systrap-windows.md`](systrap-windows.md) records the measured Windows behavior and the `winsystrap` design. The Windows cells in the table below follow that document.
 
 #### Multi-Process Hardware Page-Table (`CR3` / `TTBR0_EL1`) Isolation and `sysmsg` IPC (Descriptive Module)
 
-Running untrusted guest instructions inside the Sentry process without SFI masking would expose the Go runtime heap to arbitrary pointer writes. To preserve hardware MMU isolation (`CR3` on `amd64`, `TTBR0_EL1` on `arm64`) without a hypervisor, `platform/systrap` spawns an untrusted stub template process (`gvx-stub-darwin-arm64`) before `hostlockdown.Apply()` executes. The template forks one stub task for each address space.
+Running untrusted guest instructions inside the Sentry process without SFI masking would expose the Go runtime heap to arbitrary pointer writes. To preserve hardware MMU isolation (`CR3` on `amd64`, `TTBR0_EL1` on `arm64`) without a hypervisor, `platform/systrap` runs the guest in a stub process. The stub exists before `hostlockdown.Apply()` executes, or a process that exists then creates it.
 
-The stub subprocess contains no Go runtime, zero file descriptors, and zero network sockets, and is locked inside a Windows Job Object or macOS Seatbelt profile. Sentry and the stub subprocess share a `sysmsg` shared-memory region (`CreateFileMappingW` + `MapViewOfFile3` on Windows; `mmap` + `mach_vm_remap` on macOS). When guest code reaches a patched syscall site, the stub spills guest registers into its per-thread `Sysmsg` slot, wakes the Sentry thread, and waits for the reply. Windows uses a pair of event objects (`SetEvent` and `WaitForSingleObject`), because `WaitOnAddress` does not wake a waiter in another process. macOS uses `__ulock_wake` and `__ulock_wait`. Neither host needs a kernel socket or a pipe.
+On macOS, a template stub process (`gvx-stub-darwin-arm64`) forks one stub task for each address space. The stub contains no Go runtime, zero file descriptors, and zero network sockets, and it runs inside a Seatbelt profile. Sentry and the stub share a `sysmsg` region (`mmap` + `mach_vm_remap`). When guest code reaches a patched syscall site, the stub spills the guest registers into its per-thread `Sysmsg` slot and wakes the Sentry thread with `__ulock_wake`. The Sentry replies the same way. Neither side needs a kernel socket or a pipe.
 
-| `systrap` Subsystem | Windows (`winsystrap`: `amd64` & `arm64`), not implemented | macOS (`darwinsystrap`): `arm64` implemented, `amd64` dropped |
+On Windows, a stub host starts before the lockdown. The host is a copy of the Sentry executable that runs only a request loop. It creates one stub process for each address space. The stub is a suspended copy of the executable, and its entry point never runs. It lives in a one-process job under a Low-integrity token and holds no handle. The Sentry attaches every stub to one debug object. A patched syscall site, a page fault, or a signal raises an exception, and the debug object delivers it to the Sentry. The Sentry reads and writes the registers of the thread, so the stub needs no handler and no shared region. A stop costs about 70 to 190 µs.
+
+| `systrap` Subsystem | Windows (`winsystrap`: `amd64` & `arm64`), implemented | macOS (`darwinsystrap`): `arm64` implemented, `amd64` dropped |
 | :--- | :--- | :--- |
-| **Page Granularity** | Reserves a placeholder with `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)`, splits it to 4KB, and maps memory-file pages with `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`. The 64KB limit does not apply to such views. Every view starts as `PAGE_EXECUTE_READWRITE`, because a view that starts as read-write cannot become executable. | Needs `hostarch.PageSize` equal to the 16KB host page, so it requires `-tags pagesize_16k`. A build without the tag returns `*ErrUnsupportedPageSize`. The guest sees 16KB pages, and `mach_vm_remap` maps memory-file ranges into the stub task. |
-| **Guest Address Range** | Placeholders at `0x10000`, `0x400000`, 1TB, and 16TB succeeded in a fresh stub process, so a Linux `ET_EXEC` image at `0x400000` can load. | The range starts above the permanent `PROT_NONE` reservations of the host, which the Sentry reads from the template task. It ends below the `sysmsg` blocks. A Linux `ET_EXEC` image at `0x400000` does not load. |
-| **Lazy Execute Page-Trap** | Maps `PROT_EXEC` pages initially as `PAGE_READONLY`; on `EXCEPTION_ACCESS_VIOLATION` (`EXCEPTION_EXECUTE_FAULT`), receives the fault through a debug object, disassembles from verified `RIP`/`PC` and `.eh_frame` CFG boundaries, patches syscalls, and promotes to `PAGE_EXECUTE_READ`. | Maps `PROT_EXEC` pages read-only. On an instruction abort, the Sentry patches a private copy, flushes the instruction cache with `sys_icache_invalidate`, and promotes the page to `PROT_READ \| PROT_EXEC`. It rewrites only words inside ELF executable sections, because a data word can look like an instruction. |
-| **`amd64` Zero-Exception Syscall Patching** | Pattern A (95%): 5-byte `E9 <rel32>` (`jmp stub`) over `mov eax, imm32; syscall` (7B) or `syscall; cmp rax, -4095` (8B). Pattern B (4.9%): 2-byte `EB <rel8>` springboard to function-end `NOP` padding (`±127B`) chained to `E9 <rel32>`. Pattern C (<0.1%): `CC 90` (`int3`). A decode that cannot prove a pattern safe uses the same-size trap `0F 0B`. A `0F 05` pair inside another instruction stays unpatched. | Not applicable. |
-| **`arm64` Trampoline Island & I-Cache Flush** | Allocates a 4KB Trampoline Island within `±128 MB` of each executable VMA, atomically replaces 4-byte `svc #0` (`0xD4000001`) with `B <island_slot>` (`0x14000000 \| imm26`) without clobbering `X30 (LR)`, and calls `FlushInstructionCache`. | Reserves an island through `mm.MMap` within `±120 MB` of the patched page. It replaces `svc #0` with `B <island_slot>` without clobbering `X30 (LR)`. The same patcher rewrites `mrs` and `msr` of `TPIDR_EL0`, reads of `CTR_EL0`, and every instruction that names `X18`. |
-| **Register Virtualization** | `amd64`: Windows resets the FS base on every context switch. The guest then faults on its next `%fs:` read, the debugger receives the fault, and a trampoline runs `WRFSBASE`. `arm64`: Windows keeps `x18` and `TPIDR_EL0` across waits. `mrs ctr_el0` and `ic ivau` raise `STATUS_ILLEGAL_INSTRUCTION`, so the patcher rewrites them. | The kernel clobbers `TPIDR_EL0` on preemption and zeroes `X18` on every return from an exception. The `sysmsg` block holds both guest values, and patched slots read and write them there. |
-| **Unpatched Syscall Safety Net** | Registers `ProcessInstrumentationCallback` (`NtSetInformationProcess` Class 40 Nirvana Hook) to detect an unpatched `0F 05` (`*(uint16*)(R10 - 2) == 0x050F`), patch it in-place, and replay the Linux syscall. The kernel calls the hook after it ran the NT service, so the hook recovers from a missed site and is not a security layer. On `arm64`, a scan of every aligned word in guest pages removes every `svc` before it can run. | Each stub task applies a strict Seatbelt profile that allows only the host system calls that the stub needs. The kernel kills the stub on any other call, and the Sentry reports a dead stub. A Mach exception port cannot replay an unpatched `svc #0`, because XNU runs it as a host system call. |
+| **Page Granularity** | Reserves the guest window as one placeholder with `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` and maps memory-file pages as 4KB views with `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`. The 64KB limit does not apply to such views. The guest sees 4KB pages. | Needs `hostarch.PageSize` equal to the 16KB host page, so it requires `-tags pagesize_16k`. A build without the tag returns `*ErrUnsupportedPageSize`. The guest sees 16KB pages, and `mach_vm_remap` maps memory-file ranges into the stub task. |
+| **Guest Address Range** | `0x100000000000` (16TB) to `0x7edfffff0000`. The Sentry reserves it before the loader runs, so the loader places stacks, heaps, and DLLs elsewhere. The engine pages occupy the top 64KB. A Linux `ET_EXEC` image at `0x400000` does not load. | The range starts above the permanent `PROT_NONE` reservations of the host, which the Sentry reads from the template task. It ends below the `sysmsg` blocks. A Linux `ET_EXEC` image at `0x400000` does not load. |
+| **Lazy Execute Page-Trap** | Maps original frames without execute permission. On an execute fault, the Sentry receives the exception through the debug object, patches a private copy of the page, and maps the copy as `PAGE_EXECUTE_READ`. A write to a writable and executable page maps the original frame again. The scan covers the executable sections of the backing ELF file. | Maps `PROT_EXEC` pages read-only. On an instruction abort, the Sentry patches a private copy, flushes the instruction cache with `sys_icache_invalidate`, and promotes the page to `PROT_READ \| PROT_EXEC`. It rewrites only words inside ELF executable sections, because a data word can look like an instruction. |
+| **`amd64` Syscall Patching** | Replaces each decoded `0F 05` with the same-size trap `CC 90`. The scan decodes the page in 16 linear sweeps and patches a site when more than half of the sweeps agree. The Sentry emulates `SYSCALL` at the breakpoint. The patterns A, B, and C are not implemented. | Not applicable. |
+| **`arm64` Trampoline Island & I-Cache Flush** | Replaces `svc #0`, `mrs xN, ctr_el0`, `msr tpidr_el0, xN`, and `ic ivau, xN` in place with `brk` instructions. Windows raises an illegal-instruction exception, and the Sentry emulates the instruction. The engine uses no island and no branch. | Reserves an island through `mm.MMap` within `±120 MB` of the patched page. It replaces `svc #0` with `B <island_slot>` without clobbering `X30 (LR)`. The same patcher rewrites `mrs` and `msr` of `TPIDR_EL0`, reads of `CTR_EL0`, and every instruction that names `X18`. |
+| **Register Virtualization** | `amd64`: Windows resets the FS base at every context switch. The engine loads it through a trampoline at each start and repairs a faulting `%fs` access. `arm64`: Windows keeps `x18` and `TPIDR_EL0` across stops. A routine in the engine page writes `TPIDR_EL0`. | The kernel clobbers `TPIDR_EL0` on preemption and zeroes `X18` on every return from an exception. The `sysmsg` block holds both guest values, and patched slots read and write them there. |
+| **Unpatched Syscall Safety Net** | Not installed. The kernel calls `ProcessInstrumentationCallback` only after it ran the NT service, so the hook cannot stop a missed site. On `arm64`, a scan of every aligned word in guest pages removes every `svc` before it can run. | Each stub task applies a strict Seatbelt profile that allows only the host system calls that the stub needs. The kernel kills the stub on any other call, and the Sentry reports a dead stub. A Mach exception port cannot replay an unpatched `svc #0`, because XNU runs it as a host system call. |
 | **Cross-Arch Container Execution** | Running `GOARCH=amd64` `rungv` (`-platform=systrap`) on `windows/arm64` would invoke Windows 11 24H2 Prism. Not implemented. | Dropped. Rosetta 2 would run a translated stub, and a syscall-number Seatbelt filter on a translated process panicked the host kernel. |
+
+The first diagram shows the macOS engine. The second diagram shows the Windows engine.
 
 ```mermaid
 sequenceDiagram
-    participant Guest as Guest ELF / V8 JIT Page (Stub Process)
-    participant Island as 4KB Trampoline Island / Springboard Stub
-    participant Sysmsg as Shared Sysmsg Context Page (MapViewOfFile3 / mach_vm_remap)
+    participant Guest as Guest ELF / V8 JIT Page (Stub Task)
+    participant Island as 4KB Trampoline Island Slot
+    participant Sysmsg as Shared Sysmsg Context Page (mach_vm_remap)
     participant Sentry as Go Sentry Kernel Process
 
     Note over Guest,Sentry: First Execution of a PROT_EXEC Page (Lazy Page-Trap)
-    Guest->>Sentry: Execute-Fault on PAGE_READONLY / PROT_READ Page (Verified RIP/PC)
-    Sentry->>Guest: Disassemble via x86asm/arm64asm (.eh_frame CFG) & Patch 0F 05 / svc #0 in-place
-    Sentry->>Guest: Flush I-Cache (arm64) & Promote Page to EXECUTE_READ
+    Guest->>Sentry: Instruction abort on a PROT_READ page
+    Sentry->>Guest: Disassemble via arm64asm, patch svc #0 in place, flush the I-cache, and map the page as PROT_READ | PROT_EXEC
 
-    Note over Guest,Sentry: Subsequent Syscalls (Zero-Exception Fast Path)
-    Guest->>Island: In-Place 5B JMP / 2B Springboard (amd64) or 4B B <island_slot> (arm64, X30 intact)
-    Island->>Sysmsg: Spill GPRs (incl. RCX, R11, X18), Flags, TLS, and XSAVEOPT / V0..V31
-    Island->>Sentry: Wake Sentry via SetEvent (Windows) / __ulock_wake (macOS) & Wait
-    Sentry->>Sysmsg: Read Syscall Args, Dispatch Linux Syscall, Write Return Value
-    Sentry->>Island: Wake Stub Thread via SetEvent (Windows) / __ulock_wake (macOS)
-    Island->>Sysmsg: Reload Guest Registers & TLS
-    Island->>Guest: Jump to Return Address (PC + 2 on amd64 / PC + 4 on arm64)
+    Note over Guest,Sentry: Subsequent Syscalls
+    Guest->>Island: B <island_slot> (X30 intact)
+    Island->>Sysmsg: Spill GPRs, flags, TLS, and V0..V31
+    Island->>Sentry: Wake Sentry via __ulock_wake and wait
+    Sentry->>Sysmsg: Read the syscall arguments, dispatch the Linux syscall, write the return value
+    Sentry->>Island: Wake the stub thread via __ulock_wake
+    Island->>Sysmsg: Reload the guest registers and TLS
+    Island->>Guest: Jump to PC + 4
+```
+
+```mermaid
+sequenceDiagram
+    participant Guest as Guest Thread (Stub Process)
+    participant Debug as Debug Object
+    participant Sentry as Go Sentry Kernel Process
+
+    Note over Guest,Sentry: First Execution of a Code Page (Lazy Page-Trap)
+    Guest->>Debug: Execute access violation on a non-executable view
+    Debug->>Sentry: Exception event
+    Sentry->>Guest: Patch a private copy, map it as PAGE_EXECUTE_READ, and continue the thread
+
+    Note over Guest,Sentry: Every Syscall
+    Guest->>Debug: brk (arm64) or int3 (amd64) at the patched site
+    Debug->>Sentry: Exception event
+    Sentry->>Guest: GetThreadContext, NtSuspendThread, and NtDebugContinue (the thread parks)
+    Sentry->>Sentry: Dispatch the Linux syscall
+    Sentry->>Guest: SetThreadContext and NtResumeThread
 ```
 
 ### 3.4 Register Preservation and Two-Tier Synchronization Contract (Linux ELF & Wine / WoW64 / ARM64EC) (Descriptive Module)
@@ -525,7 +549,7 @@ Implementation proceeds across five sequential milestones (`M1` through `M5`) ta
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | `pkg/sentry/platform/whpx` (Windows `amd64`/`arm64`), `pkg/sentry/platform/hvf` (macOS `arm64`/`amd64`), shared-page stubs generated in Go (`bluepill_*.go`, `stubgen_*.go`), `cmd/rungv`, and `pkg/gvx`. | Boot static `busybox` (`PID 1`) via `platform/whpx` on Windows and `platform/hvf` on macOS and execute commands at a `busybox ash` prompt. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | `clone`, `futex`, signals, TLS (`ARCH_SET_FS` & `TPIDR_EL0`), VDSO, `pkg/netbackend` (`-net=nat -p` & `-net=wg`), and `pkg/oci` (multi-arch Tar-to-EROFS + `fsimpl/overlay`). | Run unmodified `alpine:3.20`, `nginx:alpine`, `python:3.12-alpine`, and `node:22-alpine` OCI images (`amd64` & `arm64`) on Windows and macOS. |
 | **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | `pkg/sentry/fsimpl/hostfs` (`os.OpenRoot`, `NtCreateFile`/`openat`, `.gvx_meta`) and `pkg/hostlockdown` (Windows RestrictedToken/JobObject & macOS Seatbelt `sandbox_init`). | Pass POSIX rename/unlink torture tests (`git rebase`, `bun install`) on `/workspace`; verify subprocess creation fails on both Windows and macOS. |
-| **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap`; `winsystrap` is not implemented)** | `pkg/sentry/platform/systrap`: `commit_mm_darwin.go`, the lazy page-trap `arm64asm` syscall patcher (`patcher_arm64_xplat.go`), trampoline islands, `sysmsg` shared-memory stub tasks, and a strict Seatbelt profile for each stub. The `x86asm` patcher, `winsystrap`, and Rosetta 2 / Prism support stay out of scope. | Execute static, dynamic, and JIT (`node`, `python3`) `arm64` ELF64 workloads via `-platform=systrap` on macOS `arm64` with `-tags pagesize_16k`. Windows and macOS `amd64` return `ErrUnavailable`. |
+| **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap` and `winsystrap`)** | `pkg/sentry/platform/systrap`: the macOS files (`commit_mm_darwin.go`, `patcher_arm64_xplat.go`, trampoline islands, `sysmsg` stub tasks, and a Seatbelt profile for each stub), and the Windows files (the stub host, the debug object, the placeholder window, and the `x86asm` and `brk` patchers). Rosetta 2 / Prism support stays out of scope. | Execute static and dynamic ELF64 workloads via `-platform=systrap` on macOS `arm64` with `-tags pagesize_16k`, and on Windows `amd64` and `arm64`. macOS `amd64` returns `ErrUnavailable`. |
 
 ### 4.1 Host-Native-First Execution Order and Unified E2E Suite (Descriptive Module)
 

@@ -1,54 +1,56 @@
 # Windows `systrap` Engine: Measured Behavior and Design
 
-This document records what the project measured on Windows hosts for a `winsystrap` engine. It also records the design that those measurements allow. The engine runs a Linux guest natively inside a stub process, without a hypervisor. Read [`architecture.md`](architecture.md) section 3.3 first for the shared `systrap` concepts.
+This document describes the `systrap` engine for Windows. The engine runs a Linux guest natively inside a stub process, without a hypervisor. The document records what the project measured on Windows hosts, the design that those measurements allow, and the limits of the result. Read [`architecture.md`](architecture.md) section 3.3 first for the shared `systrap` concepts.
 
 | Topic | Result |
 | :--- | :--- |
-| Status | Not implemented. `systrap_windows.go` returns `*ErrUnavailable`. |
-| `windows/arm64` with `arm64` guests | Feasible. All blocking questions have a measured answer. |
-| `windows/amd64` with `amd64` guests | Feasible for correctness. Windows has no kernel filter that proves syscall completeness. |
-| Strongest result | A debugger process can receive guest faults and rewrite registers. It needs no code in the stub. |
-| Largest open risk | `ntdll` code stays executable in the stub, so a hostile guest can still reach NT system calls. |
+| Status | Implemented for `windows/arm64` and `windows/amd64`. The engine runs the Sentry and its guests on both hosted runners. |
+| Stops | Every system call, page fault, and signal reaches the Sentry through a debug object. One stop costs about 70 to 115 µs on `arm64` and about 80 to 190 µs on `amd64`, depending on the host. |
+| Not implemented | A fast path that skips the debugger. Section 9 lists it as the main performance work. |
+| Security | The engine is not a syscall sandbox. Windows has no filter for NT system calls, so a hostile guest can reach the NT services of the stub token. |
+| Value | Hosts without the Windows Hypervisor Platform (WHP): the `windows-11-arm` runner, and Windows on ARM virtual machines on Apple silicon. |
 
 ## 1. Purpose and Scope
 
-The `whpx` backend is the primary Windows engine. It needs the Windows Hypervisor Platform (WHP). Some hosts have no WHP. The `windows-11-arm` hosted runner reports `WHvCapabilityCodeHypervisorPresent = 0`. Parallels states that Apple silicon hosts do not support nested virtualization (KB 116239, reviewed October 2024). Windows on ARM virtual machines there therefore probably lack WHP.
+The `whpx` backend is the primary Windows engine. It needs WHP. Some hosts have no WHP. The `windows-11-arm` hosted runner reports `WHvCapabilityCodeHypervisorPresent = 0`. Parallels states that Apple silicon hosts do not support nested virtualization (KB 116239, reviewed October 2024). Windows on ARM virtual machines there therefore probably lack WHP.
 
-A Windows `systrap` engine would let those hosts run guests. It would also let CI run real guests on `windows-11-arm`. The `windows-latest` runner has WHP (`present = 1`), so the `amd64` engine has less value than the `arm64` engine.
+The `systrap` engine lets those hosts run guests. It also lets CI run real guests on `windows-11-arm`. The `windows-latest` runner has WHP (`present = 1`), so the `amd64` engine matters less than the `arm64` engine. Both engines pass the same tests.
 
-This document covers the engine design and the evidence for it. It does not change any code. The SPEC keeps `winsystrap` marked as not implemented until a milestone in section 10 passes.
+The package `pkg/sentry/platform/systrap` holds the code. The files with the suffix `_windows`, `_xplat`, and `_windows_amd64` or `_windows_arm64` belong to `gvx`. Section 8 maps the files.
 
 ## 2. Measurement Method
 
 The probes are Go programs in [`windows-systrap-probes/`](windows-systrap-probes/). They use only the `syscall` package and raw machine code that the probe generates at run time. They need no C toolchain.
 
-Each probe ran on a throwaway orphan branch. A workflow with `on: push` built the probe and ran it on two GitHub-hosted runners. `windows-latest` is `amd64`. `windows-11-arm` is `arm64`. The runs are listed in section 11.
+Each probe ran on a throwaway orphan branch. A workflow with `on: push` built the probe and ran it on two GitHub-hosted runners. `windows-latest` is `amd64`. `windows-11-arm` is `arm64`. The engine tests ran on the same runners through the workflow that section 10 describes.
 
-All results come from one image per architecture. Another Windows build can differ. Repeat the probes on the target build before you rely on a number. The procedure is in section 12.
+All results come from one image per architecture. Another Windows build can differ. Repeat the probes on the target build before you rely on a number. Section 11 gives the procedure.
 
 ## 3. Verified Findings
 
-Every row below is a measurement unless the row says "documented". Times are averages. Run identifiers appear in section 11.
+Every row below is a measurement unless the row says "documented". Times are averages. Run identifiers appear in section 10.
 
 ### 3.1 Memory
 
-The engine needs 4KB mappings of a shared memory file in the address space of another process. The SPEC assumed 64KB regions. The probes show that placeholders remove that limit.
+The engine needs 4KB mappings of a shared memory file in the address space of another process. The original SPEC assumed 64KB regions. The probes show that placeholders remove that limit.
 
 | Finding | `amd64` | `arm64` |
 | :--- | :--- | :--- |
 | `VirtualAlloc2` placeholder in a remote process, split into 4KB placeholders | works | works |
 | `MapViewOfFile3` with `MEM_REPLACE_PLACEHOLDER` at a non-64KB address and offset | works | works |
 | Two remote addresses map the same 4KB section page | both read the same bytes | both read the same bytes |
-| Protection change on one 4KB view after a `PAGE_EXECUTE_READWRITE` mapping | RX, R, NOACCESS, RWX all work | same |
-| Protection change to execute after a `PAGE_READWRITE` mapping | fails with `ERROR_INVALID_PARAMETER` | fails |
-| Placeholders at `0x10000`, `0x400000`, 1TB, and 16TB in a fresh remote process | all succeed | all succeed |
+| Protection change on one 4KB page inside a 32-page view | works | works |
+| `UnmapViewOfFile2` with `MEM_PRESERVE_PLACEHOLDER` at the middle of a view | fails | fails |
+| Same call at the base of a view | the whole view becomes a placeholder | same |
+| A view that starts as `PAGE_READWRITE`, then changes to execute | fails with `ERROR_INVALID_PARAMETER` | fails |
+| Reserve 110 TiB (`0x100000000000` to `0x7ee000000000`) as one placeholder before the loader runs | succeeds in every stub of the probe and of the engine tests | same |
 | Remote 4KB split, map, protect, unmap | 4.0, 2.6, 2.0, 2.9 µs | 1.7, 1.4, 1.8, 7.2 µs |
 
-Rule: map every guest view as `PAGE_EXECUTE_READWRITE`, then lower the protection with `VirtualProtectEx`. A view that starts as read-write can never become executable.
+The window map in section 6.2 follows these rules. A mapping of arbitrary size becomes one view. A partial unmap unmaps the whole view and maps the surviving parts again.
 
-The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kernelbase.dll`. They are not exports of `kernel32.dll` on either runner. `pkg/memutil/memutil_windows.go` looks up `MapViewOfFile3` in `kernel32.dll`, so that path always falls back to `MapViewOfFile`. The fallback works for mappings in the current process. The tree keeps this behavior until a change replaces it.
+The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kernelbase.dll`. They are not exports of `kernel32.dll` on either runner. `pkg/memutil/memutil_windows.go` looks up `MapViewOfFile3` in `kernel32.dll`, so that path always falls back to `MapViewOfFile`. The fallback works for mappings in the current process. The engine binds its own calls in `nt_windows.go`.
 
-### 3.2 Cross-Process Signaling
+### 3.2 Signaling and Process Cost
 
 | Finding | `amd64` | `arm64` |
 | :--- | :--- | :--- |
@@ -56,7 +58,7 @@ The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kern
 | Round trip of two auto-reset events between two processes | 19.5 to 27.4 µs | 12.0 to 12.6 µs |
 | `CreateProcess(CREATE_SUSPENDED)`, terminate, wait | 1.2 to 2.6 ms | 2.7 to 3.0 ms |
 
-`WaitOnAddress` keeps its wait list in the memory of one process, so it cannot signal across processes. Microsoft documents that the waker is a thread of the same process. The stub and the Sentry must signal with event objects. The SPEC text that names `WakeByAddressSingle` for this link is wrong.
+`WaitOnAddress` keeps its wait list in the memory of one process, so it cannot signal across processes. The event round trip is the cost that a fast path would pay. The current engine does not use events.
 
 ### 3.3 System Call Behavior
 
@@ -66,10 +68,9 @@ The exports `VirtualAlloc2`, `MapViewOfFile3`, and `WaitOnAddress` live in `kern
 | `syscall` or `svc` executed from private RWX memory | runs as an NT service | runs as an NT service |
 | Linux numbers 0 to 3 with zero arguments | NT services 0 to 3 run and return `NTSTATUS` | same |
 | `SetProcessMitigationPolicy(ProcessSystemCallFilterPolicy)` with `FilterId = 1` | fails with `ERROR_INVALID_PARAMETER` | fails |
-| `SetProcessMitigationPolicy(ProcessSystemCallDisablePolicy)` with `0x1` and `0x5` | succeeds | succeeds |
-| Same policy with `0x4` alone | `ERROR_ACCESS_DENIED` | `ERROR_ACCESS_DENIED` |
+| Win32k disable at process creation (`PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`) | works | works |
 
-Windows traps no system call instruction. An unpatched Linux `syscall` or `svc` runs as the NT service with the same number. The call returns an `NTSTATUS` in the register where the guest expects a Linux result. Windows offers no per-process filter to an unprivileged process. The `0x5` policy value blocks Win32k and file-system control calls. It does not block other services.
+Windows traps no system call instruction. An unpatched Linux `syscall` or `svc` runs as the NT service with the same number. The call returns an `NTSTATUS` in the register where the guest expects a Linux result. Windows offers no per-process filter to an unprivileged process.
 
 ### 3.4 CPU State
 
@@ -77,26 +78,34 @@ Windows traps no system call instruction. An unpatched Linux `syscall` or `svc` 
 | :--- | :--- | :--- |
 | `RDFSBASE` and `WRFSBASE` in user mode | execute | not applicable |
 | FS base after a sleep, a yield, or 300 ms of contention | reset to 0 | not applicable |
-| `TPIDR_EL0` with a junk value across 200 real 5 ms kernel waits | not applicable | kept |
-| `x18` with a junk value across 200 real 5 ms kernel waits | not applicable | kept |
+| `TPIDR_EL0` with a junk value across 200 real 5 ms kernel waits, and across a debug stop | kept | kept |
+| `x18` with a junk value across a debug stop, set and read with `CONTEXT_X18` | not applicable | kept |
 | `mrs x0, ctr_el0` | not applicable | `STATUS_ILLEGAL_INSTRUCTION` |
 | `ic ivau` | not applicable | `STATUS_ILLEGAL_INSTRUCTION` |
+| `brk #imm` with an unknown immediate | not applicable | `STATUS_ILLEGAL_INSTRUCTION` |
 | `dc cvau`, `dc zva`, `mrs x0, dczid_el0` | not applicable | execute |
+| Single-step flag in `CONTEXT` (`TF`, or `PSTATE.SS`) | raises a single-step exception | raises a single-step exception |
+| `SetThreadContext` with `SegCs = 0` | the thread loses the upper 32 bits of `RIP` and `RSP` | not applicable |
 
-Windows resets the FS base of a thread when it switches contexts. A Linux `amd64` guest keeps its thread pointer there. A recovery method in section 7.2 restored the value 908 times in 1.5 seconds with no wrong read. On `arm64`, Windows uses `x18` for the TEB and treats `TPIDR_EL0` as reserved. Neither register changed across real waits.
+Windows resets the FS base of a thread when it switches contexts. A Linux `amd64` guest keeps its thread pointer there. Section 6.6 describes the repair. On `arm64`, Windows uses `x18` for the TEB and treats `TPIDR_EL0` as reserved. Neither register changed across real waits or debug stops.
+
+The last row is a trap for any code that builds a `CONTEXT` from zero. A zero `SegCs` puts the thread in 32-bit compatibility mode. The engine sets `SegCs = 0x33` and `SegSs = 0x2b` in every record.
 
 ### 3.5 Debugger Path
 
-A debugger process can receive a guest fault before Windows runs any user-mode dispatch code in the stub. This is the Windows analog of `ptrace` for faults.
+A debugger process receives a guest fault before Windows runs any user-mode dispatch code in the stub. This is the Windows analog of `ptrace`.
 
 | Finding | `amd64` | `arm64` |
 | :--- | :--- | :--- |
-| First-chance exception reaches the debugger with the faulting address | yes | yes |
-| `GetThreadContext` and `SetThreadContext` change registers and resume | yes | yes (`x0` came back as written) |
-| Guest `x18` holds a junk value during the exception | not applicable | the process survived and resumed |
-| Time per event (wait, read context, write context, continue) | 89.9 µs for `int3` | 61.2 to 74.7 µs |
-| `ud2` or `brk #imm` event on a trap instruction | `int3` event arrives, `ud2` untested | `brk #imm` event arrives as an illegal instruction |
-| `mrs ctr_el0` event emulated by the debugger | not applicable | works, 74.7 µs |
+| First-chance exception reaches the debug object with the faulting address | yes | yes |
+| `GetThreadContext` and `SetThreadContext` change registers and resume | yes | yes |
+| Park a thread: `NtSuspendThread`, then `NtDebugContinue`. Other threads of the process run on. | yes | yes |
+| Resume a parked thread: `SetThreadContext`, then `NtResumeThread` | yes | yes |
+| Two stub processes on one debug object, events carry the right process ID | yes | yes |
+| Time per stop (event, read context, park, set context, resume) in the probe | 113 to 132 µs | 75 to 93 µs |
+| Process-wide freeze while one exception waits for a reply | yes | yes |
+
+The kernel freezes every thread of the process while an exception waits for a reply. A blocking Linux system call in the Sentry would then freeze the guest threads that could unblock it. The engine parks the thread and replies at once. The cost is one suspend and one resume for each stop.
 
 Caution for `amd64`: the `CONTEXT` structure starts with six home slots, so `ContextFlags` sits at offset 48. A wrong offset returns an all-zero context and no error.
 
@@ -104,12 +113,16 @@ Caution for `amd64`: the `CONTEXT` structure starts with six home slots, so `Con
 
 | Finding | `amd64` | `arm64` |
 | :--- | :--- | :--- |
-| `NtCreateThreadEx` with `SKIP_LOADER_INIT` and `SKIP_THREAD_ATTACH` runs guest-like code in a running process | yes | yes |
+| `NtCreateThreadEx` with `SKIP_LOADER_INIT` and `SKIP_THREAD_ATTACH` runs code in a running or an initialized process | yes | yes |
+| Same call in a process that never ran its loader, then `SetThreadContext` before the first run | the context applies | the thread ignores the context and runs `ntdll` start code |
+| Let the loader finish with a debug object attached, then park the initial thread at the initial breakpoint | yes | yes |
+| Thread start at `ntdll!DbgBreakPoint`, then `SetThreadContext` while the thread is parked | yes | yes |
 | Same call after `ntdll` `.text` becomes read-only | the thread did not run and the process died | same |
 | Same call after every syscall instruction in `ntdll` `.text` becomes an undefined instruction (524 and 1444 sites) | the thread did not run and the process died | same |
 | A generated minimal PE image with no imports | starts, then exits with `0xC000007B` | same |
+| Low-integrity restricted token, one-process job, Win32k disable, all at creation | works with the whole flow | works with the whole flow |
 
-A new thread starts in `ntdll!RtlUserThreadStart`. That path needs executable `ntdll` code and its syscall instructions. Removing `ntdll` syscall gadgets therefore breaks thread creation. The design in section 6.5 works around this. The minimal PE attempt is unfinished. It does not show that a generated PE is impossible.
+A new thread starts in `ntdll!RtlUserThreadStart`. That path needs executable `ntdll` code and its syscall instructions. Removing the `ntdll` syscall gadgets therefore breaks thread creation, and the stub keeps `ntdll` executable. The engine does not generate a PE image. It starts a second copy of the Sentry executable as the stub image and parks it before the entry point runs.
 
 ### 3.7 Instruction Scan of Real Binaries
 
@@ -126,142 +139,178 @@ The scan in [`windows-systrap-probes/x86scan/`](windows-systrap-probes/x86scan/)
 
 A blind byte replacement of `0F 05` would corrupt 34 instructions in 4.42 MB of `x86-64` code. On `aarch64`, every aligned word is an instruction, and the pattern is a 32-bit value. The decode was stable on this compiler output. The sample is small and it holds no JIT code.
 
+### 3.8 Engine Measurements
+
+These numbers come from the engine tests and the stub probe on the hosted runners.
+
+| Measure | `amd64` | `arm64` |
+| :--- | :--- | :--- |
+| One guest system call, `TestManySystemCalls` | 80 to 190 µs | 70 to 115 µs |
+| `Probe` round trip (2000 calls) | 78 to 167 µs | 68 to 91 µs |
+| Create and release 25 address spaces (`TestAddressSpaceChurn`) | 0.4 to 0.5 s | 0.8 s |
+| FS base repairs during 1.5 billion loop iterations | 9 to 12 | not applicable |
+
+The cost is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead.
+
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
 
 The SPEC lists `ProcessInstrumentationCallback` (information class 40) as the "Unpatched Syscall Safety Net". The kernel calls the callback when it returns to user mode. By then the kernel has already run the NT service. The callback sees the return address in `R10` and can detect a `0F 05` at `R10 - 2`.
 
-This design has three consequences. First, the hook cannot stop the first NT service from running with Linux arguments. Second, a hostile guest can probably remove the hook with a hidden `syscall` that calls `NtSetInformationProcess`. This part is inference and no probe tested it. Third, installing the hook on the current process needs no privilege, so the stub can install it at start (ntdoc, `ProcessInstrumentationCallback`).
+This design has three consequences. First, the hook cannot stop the first NT service from running with Linux arguments. Second, a hostile guest can probably remove the hook with a hidden `syscall` that calls `NtSetInformationProcess`. This part is inference and no probe tested it. Third, installing the hook on the current process needs no privilege (ntdoc, `ProcessInstrumentationCallback`).
 
-Use the hook for one job: detect that a site was missed, patch the site, and replay the Linux call. Treat each detection as a defect in the patcher. Do not count the hook in the security model.
+The engine does not install the hook. A missed site runs as an NT service and returns garbage. The scan in section 6.3 is the only protection, and it has the limits that section 5 lists.
 
 ## 5. Why Variable-Length Instructions Matter
 
-The `x86-64` `syscall` instruction is two bytes. A same-size replacement fits every site. The bytes `0F 0B` (`ud2`) or `CC 90` (`int3` plus `nop`) trap and keep every other byte in place. The debugger path resolves the trap. Patching is therefore possible on `amd64`.
+The `x86-64` `syscall` instruction is two bytes. A same-size replacement fits every site. The engine writes `CC 90` (`int3` plus `nop`) over each SYSCALL. Every other byte stays in place, so nothing moves and nothing needs relocation. The debugger resolves the trap. Patching is therefore possible on `amd64`.
 
-The 5-byte `jmp rel32` fast path in the SPEC is harder. It overwrites three bytes after the `syscall`. The patcher must move those instructions into a trampoline, fix any `RIP`-relative operand, and prove that no branch lands inside the window. That work needs exact instruction boundaries. The SPEC patterns A, B, and C exist for this reason.
+The 5-byte `jmp rel32` patterns of the SPEC are harder. They overwrite three bytes after the `syscall`. A patcher must move those instructions into a trampoline, fix any `RIP`-relative operand, and prove that no branch lands inside the window. That work needs exact instruction boundaries. The engine uses no such pattern.
 
-Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. A decoder that starts at a known boundary removes them. The decoder gives no guarantee for four kinds of code:
+Finding the sites is the main problem. A byte scan has false positives: 34 of 539 pairs were not syscalls. The engine decodes each page with `x86asm` in 16 linear sweeps. The sweeps start at different offsets. It patches a site only when more than half of them agree. The decoder gives no guarantee for four kinds of code:
 
 - Data that sits inside executable sections, such as tables and padding.
 - Hand-written assembly with computed jumps.
 - Just-in-time compiled code with no symbols.
 - Code that a guest writes after the scan.
 
-An indirect jump into the middle of an instruction can run a hidden `0F 05`. A hostile guest plants such a jump on purpose. Linux uses `seccomp` to catch every such call. macOS uses a Seatbelt filter that kills the stub. Windows has no equivalent. The engine can therefore make benign guests correct, but it cannot prove completeness for hostile `amd64` code.
+The engine limits the first kind with the section headers of the backing ELF file. It scans a page again each time the page becomes executable, which covers the last kind.
 
-`arm64` is different. Every instruction is four bytes and aligned. A scan of every aligned word in executable pages finds every `svc` that can run. The page-trap design keeps pages non-executable until the Sentry scans them, so no `svc` can run in a guest page without a scan. This holds for guest pages only. Section 8 explains the gap that remains.
+An indirect jump into the middle of an instruction can run a hidden `0F 05`. A hostile guest plants such a jump on purpose. Linux uses `seccomp` to catch every such call. macOS uses a Seatbelt filter that kills the stub. Windows has no equivalent. The engine makes benign guests correct, but it cannot prove completeness for hostile `amd64` code.
 
-## 6. Design for `windows/arm64`
+`arm64` is different. Every instruction is four bytes and aligned. A scan of every aligned word in executable pages finds every `svc` that can run. The page trap keeps pages non-executable until the Sentry scans them, so no `svc` can run in a guest page without a scan. This holds for guest pages only. Section 7 explains the gap that remains.
 
-The engine reuses the macOS design where Windows allows it. The macOS code in `pkg/sentry/platform/systrap` supplies the patcher (`patcher_arm64_xplat.go`, already tagged `darwin || windows`), the code image logic, and the Sentry-side address space model.
+## 6. Design
 
-### 6.1 Components
+### 6.1 Processes
 
 | Component | Role |
 | :--- | :--- |
-| Stub host (helper process) | Starts before `hostlockdown.Apply`. Creates stub processes, jobs, and debug objects on request. Passes handles to the Sentry with `DuplicateHandle`. |
-| Stub process | Runs guest code. Holds no handle except one event pair per thread. Runs under a restricted Low-integrity token and its own job. |
-| Sentry | Owns the memory file, the guest address space map, and the patcher. Receives faults through a debug object. |
-| `sysmsg` page | Shared memory with one block per guest thread. Holds the spilled registers and the virtual register values. |
-| Debug object | One native debug object receives the faults of many stub processes. |
+| Sentry | Owns the memory file, the guest address space maps, the patcher, and the debug object. |
+| Stub host | A copy of the Sentry executable that runs only a request loop. It starts before `hostlockdown.Apply`, because the lockdown job allows one process. |
+| Stub process | Another copy of the executable, created suspended, with the entry point never reached. It holds the guest address space and one thread for each guest thread. |
+| Debug object | One native debug object, created by the Sentry, receives the exceptions of every stub. One goroutine on one OS thread waits for events and routes each to the guest thread. |
+
+The `init` function of the package runs the host loop when the environment variable `GVX_SYSTRAP_STUBHOST` is set. The Sentry starts the host with that variable and talks to it over the standard pipes. A request names no path and no command line, so a compromised Sentry cannot start a program of its choice.
+
+The host creates each stub with `CreateProcessAsUser`. It uses a copy of its own token without privileges at Low integrity, and it adds the Win32k and handle mitigations when Windows accepts them. It puts the stub in a job that allows one process, kills on close, and blocks all window operations. It attaches the stub to the debug object of the Sentry, because the lockdown can remove the right to debug a process from the Sentry. It duplicates the process and thread handles into the Sentry, and it keeps the job handle until the Sentry releases the stub.
+
+A stub reaches the ready state in four steps. The Sentry reserves the guest window as one placeholder while the stub is suspended. It resumes the initial thread, and the loader runs. The loader raises the initial breakpoint of a debuggee. The Sentry suspends the initial thread there, replies, and never resumes it. The stub is then fully initialized and idle.
 
 ### 6.2 Address Space
 
-The Sentry creates a placeholder for the guest range in each stub process. It splits placeholders to 4KB and maps memory file pages with `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`. Every view starts as `PAGE_EXECUTE_READWRITE`. The Sentry then sets the protection that the guest mapping needs.
+The guest window of a stub is `[0x100000000000, 0x7edfffff0000)`. It starts at 16 TiB, above the heaps and stacks that Windows places in the first few TiB, and it ends below the system DLLs. The top 64KB hold the engine pages: 16KB of code and 48KB of data. `MinUserAddress` and `MaxUserAddress` exclude them.
 
-Execute permission stays off until the page trap runs. Endpoint protection software can flag executable views that start as writable. Section 9 lists this risk.
+`windowMap` turns each `MapFile`, `Unmap`, and protection request into the five operations that Windows allows on placeholders. It keeps one extent for each placeholder or view. A mapping of any size becomes one view. A partial change unmaps the whole view and maps the surviving parts again. A randomized test checks the map against a reference model with a fake host that enforces the Windows rules. The code runs on macOS too, so the logic has a fast test on the development host.
+
+The memory file is a temporary file. `sectionCache` creates a section of that file for the file handle that `memmap.File.FD` returns, and it creates a new section when the file grows. A host file that the Sentry opened read-only, such as an erofs layer, maps through a read-only section. A file without a host handle, such as a workspace file of `hostfs`, maps through a copy of its bytes in an anonymous section. Such a mapping cannot be writable.
 
 ### 6.3 Page Trap and Patching
 
-1. Map a guest page with the guest protection minus execute.
+1. Map a guest page without execute permission. The view shows the original frame.
 2. Receive the execute fault through the debug object.
-3. Copy the page into a private section and scan every aligned word.
-4. Replace each `svc #0` with a branch to a trampoline slot.
-5. Replace every other `svc` with an undefined instruction.
-6. Replace `mrs ctr_el0` with a constant load, and emulate `ic ivau` as a no-op or a flush call.
-7. Map the patched copy as execute-read and call `FlushInstructionCache`.
+3. Copy the frame, scan the copy, and replace the sites (section 6.5 and 6.6 list them).
+4. Map the copy as execute-read from a private section, and call `FlushInstructionCache`.
+5. Continue the thread.
+6. After a write fault to a writable and executable page, map the original frame again.
+7. Patch the page again at the next fetch.
 
-Step 5 turns a hostile `svc #N` into a fault that the debugger sees. Step 6 follows the macOS patcher. The patcher on macOS already rewrites `mrs ctr_el0`. The `ic ivau` case is new, because macOS allows it.
+The original frame can be shared between address spaces and mapped at different addresses. The stub therefore never executes the original frame. A guest that writes to the page that it executes would make the engine swap the two mappings forever. The engine reports SIGSEGV for that write.
 
-### 6.4 Fast Path and Slow Path
+### 6.4 Stops and Resumes
 
-A patched `svc #0` branches to a trampoline slot. The slot spills the guest registers to the `sysmsg` block. It signals the Sentry event and waits on its own event with one `NtSignalAndWaitForSingleObject` call. The measured event round trip is 12.0 to 12.6 µs.
+A guest thread is parked or running. A parked thread has a suspend count of one, and its registers live in the Sentry. A stop starts when the thread raises an exception. The kernel freezes the process and sends the event to the debug object. The pump routes the event to the thread, and `Switch` reads its context.
 
-All other guest events use the debug object. These are page faults, illegal instructions, and breakpoints. The measured cost is 61 to 75 µs per event. The Sentry reads and writes the full thread context. `x18` does not matter on this path, because Windows never runs user-mode dispatch code for a first-chance exception that a debugger continues.
+| Stop | Action |
+| :--- | :--- |
+| Trap at a patched site | The thread parks, and the Sentry runs the system call. |
+| Execute fault in a code page | The engine patches the page and continues the thread. |
+| Write fault in a writable and executable page | The engine maps the original frame again and continues the thread. |
+| Single step after a forced stop | The thread parks, and `Switch` returns an interrupt. |
+| Any other exception | The thread parks, and the Sentry gets a signal. |
 
-The trampoline must restore the host `x18` value before it calls into `ntdll`. It must restore the guest value before it returns to guest code. The stub keeps the `sysmsg` pointer in `TPIDR_EL0`, because the patcher already rewrites every guest access to that register.
+To park a thread, the engine suspends it, replies to the event, and copies the registers into `arch.Context64`. The next `Switch` writes the registers with `SetThreadContext` and resumes the thread.
 
-### 6.5 Threads and `ntdll`
+A new thread starts at `ntdll!DbgBreakPoint` through `NtCreateThreadEx` without loader initialization. It stops there once, and the engine parks it. This avoids the `arm64` problem of a context that the kernel ignores before the first run.
 
-A guest `clone` with `CLONE_THREAD` needs a new stub thread. The probes show that a loader-less thread runs code only while `ntdll` stays intact. The design therefore keeps `ntdll` executable and accepts this exposure. A later milestone can pre-create a pool of parked threads and then remove the `ntdll` gadgets. That change limits each guest address space to the pool size.
+`Interrupt` stops a running thread with the single-step flag. The engine suspends the thread, sets `TF` or `PSTATE.SS`, and resumes it. The thread raises one single-step exception after one instruction, and the stop follows the normal path. A thread inside engine code steps on until it reaches guest code. This design has no race with an exception that the thread raised before the suspend.
 
-### 6.6 Stub Image
+A stop copies only the general-purpose registers. `PullFullState` reads the vector state from the parked thread when the Sentry asks for it, and `FullStateChanged` makes the next start write it. On `amd64` the engine allocates the record with `InitializeContext` and `CONTEXT_XSTATE`. The upper halves of the AVX and AVX-512 registers then travel between the Sentry and the thread. A signal handler of the guest can then use them without damage.
 
-The stub needs a process with no Go runtime. Three options exist. The project can commit a prebuilt stub as it does on macOS. It can generate a PE image in Go. It can start an existing system executable that waits.
+### 6.5 `windows/arm64`
 
-The first option has the lowest risk. The second needs a working minimal PE, which section 3.6 shows as unfinished.
+The patcher replaces `svc #0`, `mrs xN, ctr_el0`, `msr tpidr_el0, xN`, and `ic ivau, xN` with `brk` instructions. Windows reports a `brk` with an unknown immediate as an illegal instruction. The Sentry finds the site in its table and emulates the instruction. It returns a system call, loads the constant `0x8444c004` for `CTR_EL0`, writes the TLS register, or calls `FlushInstructionCache` for the address in `xN`. A `brk` that the guest wrote becomes SIGTRAP, and any other illegal instruction becomes SIGILL.
 
-## 7. Design for `windows/amd64`
+`CONTEXT` has no field for `TPIDR_EL0`. A routine in the engine page (`msr tpidr_el0, x16; brk`) writes it. The Sentry runs the routine when the TLS value of the guest differs from the value in the thread. That happens at the start of a new thread and after a guest write of the register. The guest reads the register natively. Windows keeps `x18` and `TPIDR_EL0` across stops, and `CONTEXT_X18` makes the engine read and write `x18`.
 
-The `amd64` engine follows section 6 for memory, signaling, the stub host, and the debugger path. This section lists only the differences.
+### 6.6 `windows/amd64`
 
-### 7.1 Syscall Patching
+The patcher replaces each SYSCALL with `CC 90` and each `RDFSBASE` with `INT3` and `NOP` bytes. The trap raises `EXCEPTION_BREAKPOINT` with `RIP` one byte after the site. The Sentry sets `RCX` and `R11` as the hardware does, and it moves `RIP` two bytes ahead.
 
-The patcher decodes each executable page with `x86asm` from symbol, `.eh_frame`, or entry boundaries. It replaces each decoded `syscall` with a same-size trap (`0F 0B`). It replaces the SPEC patterns A and B only when a decode proves the window safe. It leaves a `0F 05` pair that sits inside another instruction untouched. It treats just-in-time code pages as pages with no syscall. The callback of section 4 detects a missed site.
+Windows resets the FS base of a thread at every context switch. Before it starts a thread with a nonzero FS base, the engine points `RIP` at a trampoline in the engine page. Each thread owns one trampoline and one data slot:
 
-### 7.2 FS Base Recovery
+```
+wrfsbase rax          ; rax holds the guest FS base
+mov rax, [rip+d1]     ; load the guest rax from the slot
+jmp [rip+d2]          ; jump to the guest rip from the slot
+```
 
-A Linux guest keeps its thread pointer in the FS base. Windows resets the base to zero on a context switch. A read such as `mov %fs:0x28, %rax` then faults at address `0x28`, and a read such as `mov %fs:-0x10, %eax` faults in kernel space. The debugger receives each fault. It stores the guest `RAX` and `RIP` in the stub, redirects `RIP` to a trampoline, and continues. The trampoline runs `WRFSBASE` with the saved guest value, restores `RAX`, and jumps back to the faulting instruction.
+A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address, and if it has an FS prefix, runs the trampoline again. Four repairs at one address within two milliseconds count as a real fault. The engine allows 512 threads in one stub.
 
-The measured recovery handled 908 faults in 1.5 seconds with a sleep every 20 reads. No read returned a wrong value. The method has two known gaps. A guest that executes `RDFSBASE` reads zero after a switch, so the patcher must rewrite that instruction. A guest that uses `%fs:(%reg)` with a register that holds a mapped address does not fault.
+### 6.7 Confinement
 
-### 7.3 Red Zone
+The stub runs with a token that has no privileges and Low integrity, in a job that allows one process. The host applies the Win32k, strict handle, and extension point mitigations when Windows accepts them, and it falls back to fewer mitigations otherwise. `Platform.Confinement` reports the result. The stub holds no handle. Most NT services therefore fail with `STATUS_INVALID_HANDLE`.
 
-The System V ABI gives a leaf function 128 bytes below `RSP`. A user-mode exception dispatch writes a `CONTEXT` structure below `RSP` and destroys that zone. The debugger path avoids that write, because the kernel resumes the thread without user-mode dispatch. The engine must never let an exception reach user-mode dispatch.
-
-## 8. Security Model
+## 7. Security Model
 
 | Engine | Syscall filter | Guest can reach host NT services | Basis |
 | :--- | :--- | :--- | :--- |
 | Linux `systrap` | `seccomp` allowlist in the Sentry, trap for guests | no | kernel filter |
 | macOS `systrap` | Seatbelt profile kills the stub | no | kernel filter |
 | Windows `whpx` and `hvf` | none needed | no | hardware virtualization |
-| Windows `arm64` `winsystrap` | none | yes, through `ntdll` stubs | token, job, mitigation policy, page scan |
-| Windows `amd64` `winsystrap` | none | yes, through `ntdll` stubs and hidden `0F 05` | token, job, mitigation policy |
+| Windows `arm64` `systrap` | none | yes, through `ntdll` stubs | token, job, mitigation policy, page scan |
+| Windows `amd64` `systrap` | none | yes, through `ntdll` stubs and hidden `0F 05` | token, job, mitigation policy |
 
-The Windows `arm64` engine blocks every `svc` in guest pages before it runs. A hostile guest can still jump to an `svc` inside `ntdll` and choose the registers. That call runs with the token of the stub. The stub token is a Low-integrity restricted token.
+The Windows `arm64` engine blocks every `svc` in guest pages before it runs. A hostile guest can still jump to an `svc` inside `ntdll` and choose the registers. That call runs with the token of the stub.
 
-The stub job blocks new processes. The mitigation policy `0x5` blocks Win32k and file-system control calls. The stub holds no handle except its event pair, so most NT services fail with `STATUS_INVALID_HANDLE`. This resembles the exposure of a sandboxed browser renderer. That comparison is inference.
+The stub job blocks new processes. The stub holds no handle, so most NT services fail. This resembles the exposure of a sandboxed browser renderer. That comparison is inference. A guest could also attack the debug object through a hidden NT call, but it holds no handle to it.
 
 State this limit in every user-facing document for the engine. Do not describe the engine as a syscall sandbox on Windows. A Windows host that needs that guarantee must use `whpx`.
 
-## 9. Unverified Assumptions
+## 8. Implementation Map
 
-Each item below needs a probe or a prototype before the engine ships.
+| File | Content |
+| :--- | :--- |
+| `nt_windows.go` | Bindings of the NT and Win32 calls. |
+| `stubhost_windows.go` | The stub host loop, its token, job, and mitigation setup, and the Sentry-side client. |
+| `debug_windows.go` | The debug object and the event pump. |
+| `stubproc_windows.go` | Stub bring-up and guest thread creation. |
+| `thread_windows.go` | Guest thread state, park and resume, and the forced stop. |
+| `address_space_windows.go`, `section_windows.go` | The address space, lazy patching, sections, and the private page pool. |
+| `viewmap_xplat.go` | The window map. |
+| `context_windows.go` | `Context.Switch`, event classification, and signals. |
+| `platform_windows.go`, `probe_windows.go` | `New`, `Close`, and `Probe`. |
+| `arch_windows_arm64.go`, `arch_windows_amd64.go` | Patching, TLS or FS base, and site emulation for each architecture. |
+| `hostctx_xplat_*.go`, `hostctx_windows_amd64.go` | `CONTEXT` record layout and conversion, including the XSTATE area. |
+| `patcher_amd64_xplat.go` | The `x86asm` scanner and the in-page patch. |
+| `code_image_xplat.go` | ELF section headers that limit the scan to code. |
 
-| Priority | Assumption | How to test |
-| :--- | :--- | :--- |
-| 1 | A helper that started before the lockdown can create stubs, and the locked Sentry can use their handles. | Lock a test process with `hostlockdown.Apply`. Ask the helper for a stub. Map memory into it. |
-| 2 | One debug object serves many stub processes and many threads without a serialization bottleneck. | Run 8 stub processes with 4 threads each. Measure events per second. |
-| 3 | A stub process starts without the Go runtime from a prebuilt or generated image. | Build a stub with an LLVM toolchain. Run it on both runners. |
-| 4 | Patching `ic ivau` as a no-op keeps JIT guests (V8, JVM) correct. | Run `node` and a JVM with the patch. |
-| 5 | The debugger path scales for guests that fault on many pages. | Touch 100 MB in a guest and measure the time. |
-| 6 | Endpoint protection software tolerates the stub host and the debug object. | Run on a host with Microsoft Defender at default settings. |
-| 7 | The `NtSignalAndWaitForSingleObject` round trip matches the measured event round trip. | Measure with two processes. |
+The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdown_windows_test.go`, `viewmap_xplat_test.go`, and `patcher_amd64_xplat_test.go`. They run guests that the tests assemble by hand, through the same `Context.Switch` that the Sentry calls.
 
-## 10. Implementation Milestones
+## 9. Limits and Open Work
 
-| Milestone | Deliverable | Verified by |
-| :--- | :--- | :--- |
-| W1 | Native debug object wrappers, stub host, job and token confinement | Unit tests on both runners. |
-| W2 | Stub address space with 4KB placeholders and per-page protection | Unit tests on both runners. |
-| W3 | `arm64` code image scan, patcher reuse, trampoline generator, fast and slow path | A static guest prints a line on `windows-11-arm`. |
-| W4 | `arm64` thread, signal, and fork support | The e2e `systrap` suite on `windows-11-arm`. |
-| W5 | `amd64` patcher, FS base recovery, trampoline generator | A static guest prints a line on `windows-latest`. |
-| W6 | `amd64` thread, signal, and fork support | The e2e `systrap` suite on `windows-latest`. |
-| W7 | Hardening: callback, mitigation policies, soak tests, documentation | CI and the weekly image gates. |
+| Item | State |
+| :--- | :--- |
+| Fast path | Not implemented. A patched `svc` or `syscall` could branch to a trampoline that signals the Sentry with an event pair, and skip the debugger. The measured event round trip is 12 to 27 µs, against 70 to 190 µs for a stop. |
+| Guest addresses below 16 TiB | A non-PIE `ET_EXEC` image that links at `0x400000` does not load. Position-independent images load. The macOS engine has the same limit. |
+| Writing to the executing page | A guest that writes to the page that it executes gets SIGSEGV. |
+| GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
+| Workspace files | A file without a host handle maps through a copy. A writable shared mapping of such a file fails with `ENODEV`. |
+| Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. |
+| JIT engines | The `ic ivau` emulation and the scan of anonymous code are untested with V8 or a JVM. |
+| Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |
+| Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
 
-## 11. Evidence
+## 10. Evidence
 
 | Run | Runners | Content |
 | :--- | :--- | :--- |
@@ -271,10 +320,11 @@ Each item below needs a probe or a prototype before the engine ships.
 | `39796084304` | both | Debugger event latency and register writes. |
 | `39800771242`, `39802593217`, `39803097982` | both | `x18` across waits, policy flags, `ntdll` patching, loader-less threads. |
 | `39803487649` | both | FS base recovery with the debugger. |
+| `39809735687`, `39811366093` | both | Stub design: initialized stub, start trap, park and resume, `x18` and `TPIDR_EL0` across stops, Low-integrity token, job, Win32k, second stub on one debug object. |
 
 The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
 
-## 12. Reproduction Procedure
+## 11. Reproduction Procedure
 
 > [!CAUTION]
 > Run the probes only from a throwaway branch. They execute raw machine code and raw NT system calls. Delete the branch after the run.
@@ -283,10 +333,12 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 2. Set the workflow trigger to `push` on that branch.
 3. Use the runner labels `windows-latest` and `windows-11-arm`.
 4. Run `go build` in the probe directory with Go 1.24 or newer.
-5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, or `R2`.
+5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
 
-## 13. Sources
+To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each stop, with the exception code, the address, and the bytes at the program counter, to standard error. The output has an upper bound of 300 lines.
+
+## 12. Sources
 
 | Source | Supports |
 | :--- | :--- |

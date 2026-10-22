@@ -378,8 +378,8 @@ func staticBase() uint64 {
 // systrapBase returns a link address that the systrap platform of the host
 // allows. The macOS engine places guest addresses above the host reservations,
 // which end at 0x7000000000 on Apple silicon, so it needs an address at 16TB.
-// The upstream Linux platform accepts the classic 0x400000, and the amd64 HTTP
-// server guest needs an address below 4GB.
+// The Windows engine reserves the range from 16TB up, for the same reason. The
+// upstream Linux platform accepts the classic 0x400000.
 func systrapBase() uint64 {
 	if runtime.GOOS == "linux" {
 		return 0x400000
