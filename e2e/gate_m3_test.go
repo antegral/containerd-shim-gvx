@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || windows
+//go:build darwin || windows || linux
 
 package e2e
 
@@ -328,7 +328,7 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 
 	// A foreign architecture is a usage error on the hardware backend,
 	// whether the user names the backend or leaves the choice to auto.
-	for _, plat := range []string{string(hypervisorPlatform()), "auto"} {
+	for _, plat := range []string{string(autoPlatform()), "auto"} {
 		_, stderr, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+plat, "-net=none",
 			"-arch="+foreign, "-cache-dir="+cacheDir, "-image=alpine:3.20", "--", "/bin/true")
 		wantErr := "guest architecture " + foreign + " needs -platform=systrap"
@@ -337,7 +337,7 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 		}
 	}
 	_, err = gvx.New(context.Background(), gvx.Config{
-		Platform:            hypervisorPlatform(),
+		Platform:            autoPlatform(),
 		Architecture:        foreign,
 		NetworkMode:         gvx.NetModeNone,
 		OCIImage:            "alpine:3.20",
@@ -345,11 +345,11 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 		DisableHostLockdown: true,
 	})
 	if !errors.Is(err, gvx.ErrInvalidConfig) {
-		t.Errorf("gvx.New with a foreign architecture on %s = %v, want ErrInvalidConfig", hypervisorPlatform(), err)
+		t.Errorf("gvx.New with a foreign architecture on %s = %v, want ErrInvalidConfig", autoPlatform(), err)
 	}
 
 	// The host architecture runs from the same cache.
-	_, _, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+string(hypervisorPlatform()), "-net=none",
+	_, _, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+string(autoPlatform()), "-net=none",
 		"-cache-dir="+cacheDir, "-image=alpine:3.20", "--", "/bin/true")
 	if code != 0 {
 		t.Errorf("rungv run of the host architecture exit code = %d, want 0", code)

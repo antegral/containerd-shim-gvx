@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || windows
+//go:build darwin || windows || linux
 
 package e2e
 
@@ -63,7 +63,7 @@ type gateBackend struct {
 // subtests skip only when the engine reports a missing prerequisite.
 func gateBackends() []gateBackend {
 	return []gateBackend{
-		{string(hypervisorPlatform()), hypervisorPlatform()},
+		{string(autoPlatform()), autoPlatform()},
 		{"systrap", gvx.PlatformSystrap},
 	}
 }

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || windows
+//go:build darwin || windows || linux
 
 package e2e
 
@@ -198,7 +198,7 @@ func requireStaticELF(t *testing.T, data []byte) {
 
 func TestE2EGateM2BusyboxIsStatic(t *testing.T) {
 	requireRegistry(t)
-	requireStaticELF(t, busyboxBinary(t, hypervisorPlatform()))
+	requireStaticELF(t, busyboxBinary(t, autoPlatform()))
 }
 
 // TestE2EGateM2BusyboxAshInteractive drives a real interactive ash through
@@ -217,7 +217,7 @@ func TestE2EGateM2BusyboxAshInteractive(t *testing.T) {
 		{"terminal_line_discipline", []string{"/bin/busybox", "ash"}, true, "tty"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := startAshSession(t, hypervisorPlatform(), tc.argv, tc.tty)
+			s := startAshSession(t, autoPlatform(), tc.argv, tc.tty)
 
 			s.do(`echo "stdin=$(if [ -t 0 ]; then echo tty; else echo pipe; fi)"`, "stdin="+tc.stdinKind+"\n")
 

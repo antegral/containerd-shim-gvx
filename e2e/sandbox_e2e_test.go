@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || windows
+//go:build darwin || windows || linux
 
 package e2e
 
@@ -57,10 +57,14 @@ const (
 	rungvPkg         = "z.gfire.dev/gvx/cmd/rungv"
 )
 
-// hypervisorPlatform returns the explicit hardware backend of the host OS.
-func hypervisorPlatform() gvx.PlatformType {
-	if runtime.GOOS == "windows" {
+// autoPlatform returns the backend that -platform=auto selects: the hardware
+// hypervisor on Windows and macOS, and the upstream systrap platform on Linux.
+func autoPlatform() gvx.PlatformType {
+	switch runtime.GOOS {
+	case "windows":
 		return gvx.PlatformWHPX
+	case "linux":
+		return gvx.PlatformSystrap
 	}
 	return gvx.PlatformHVF
 }
@@ -243,8 +247,8 @@ func TestE2EStaticAndDynamicELF64AcrossBackends(t *testing.T) {
 	}
 
 	// -platform=auto must resolve to the hardware backend of the host OS.
-	wantBackend := string(hypervisorPlatform())
-	for _, plat := range []gvx.PlatformType{gvx.PlatformAuto, hypervisorPlatform()} {
+	wantBackend := string(autoPlatform())
+	for _, plat := range []gvx.PlatformType{gvx.PlatformAuto, autoPlatform()} {
 		t.Run(string(plat)+"_static", func(t *testing.T) {
 			code, stdout, backend := runELF(t, plat, staticELF)
 			if code != 0 || stdout != "e2e-static-ok\n" || backend != wantBackend {
@@ -324,7 +328,7 @@ func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("rungv run exit code = %d, want 0\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
-	if want := "rungv: platform=" + string(hypervisorPlatform()); !strings.Contains(stderr, want) {
+	if want := "rungv: platform=" + string(autoPlatform()); !strings.Contains(stderr, want) {
 		t.Fatalf("rungv run stderr = %q, want it to report %q", stderr, want)
 	}
 	if strings.Contains(stderr, "lockdown disabled") {
@@ -337,7 +341,7 @@ func TestE2ERungvReportsBackendAndRunsUnderDefaultLockdown(t *testing.T) {
 
 	// -lockdown=false is an explicit and loud opt-out.
 	_, stderr, code = runTool(t, rungv, "run",
-		"-lockdown=false", "-platform="+string(hypervisorPlatform()), "-net=none",
+		"-lockdown=false", "-platform="+string(autoPlatform()), "-net=none",
 		"-cache-dir="+t.TempDir(), "-workspace="+workspace,
 		elfPath)
 	if code != 0 {
@@ -509,14 +513,17 @@ func TestE2EHostLockdownEnforcedByDefault(t *testing.T) {
 
 	t.Run("default_is_locked", func(t *testing.T) {
 		rep, workspace, outside := probeRun(t)
-		if rep.Platform != string(hypervisorPlatform()) {
-			t.Errorf("Platform = %q, want %q", rep.Platform, hypervisorPlatform())
+		if rep.Platform != string(autoPlatform()) {
+			t.Errorf("Platform = %q, want %q", rep.Platform, autoPlatform())
 		}
 		if !rep.Lockdown.Applied || !rep.LockedAPI {
 			t.Errorf("Lockdown.Applied=%v IsLockedDown=%v, want both true by default", rep.Lockdown.Applied, rep.LockedAPI)
 		}
-		if !rep.Lockdown.SubprocessBlocked || !rep.Lockdown.UnboundFileOpenBlocked {
-			t.Errorf("Lockdown status = %+v, want SubprocessBlocked and UnboundFileOpenBlocked", rep.Lockdown)
+		// The Linux seccomp filter cannot read paths, so a workspace keeps
+		// opens relative to a directory descriptor, and the status says so.
+		wantUnbound := runtime.GOOS != "linux"
+		if !rep.Lockdown.SubprocessBlocked || rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
+			t.Errorf("Lockdown status = %+v, want SubprocessBlocked and UnboundFileOpenBlocked=%v", rep.Lockdown, wantUnbound)
 		}
 		if rep.ReadOutsideErr == "" {
 			t.Errorf("host read of a file outside the workspace succeeded after lockdown: %q", rep.OutsideReadBytes)
@@ -1031,7 +1038,7 @@ func TestE2ENetstackDualTrackNATAndWireGuard(t *testing.T) {
 }
 
 func TestE2ERealLinuxBusyboxPythonNodeAcrossBackends(t *testing.T) {
-	platforms := []gvx.PlatformType{hypervisorPlatform()}
+	platforms := []gvx.PlatformType{autoPlatform()}
 
 	workcases := []struct {
 		name       string

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build (darwin || windows) && !(darwin && arm64 && pagesize_16k)
+//go:build (darwin || windows || linux) && !(darwin && arm64 && pagesize_16k)
 
 package e2e
 

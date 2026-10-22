@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || windows
+//go:build darwin || windows || linux
 
 package e2e
 
@@ -661,7 +661,7 @@ func TestE2EGateM4TortureUnderDefaultLockdown(t *testing.T) {
 	rungv := toolPath(t, rungvPkg)
 	workspace := t.TempDir()
 	caseInsensitive := hostCaseInsensitive(t, workspace)
-	stdout, stderr, code := runTool(t, rungv, "run", "-platform="+string(hypervisorPlatform()), "-net=none",
+	stdout, stderr, code := runTool(t, rungv, "run", "-platform="+string(autoPlatform()), "-net=none",
 		"-cache-dir="+sharedCacheDir(t), "-workspace="+workspace,
 		"-image="+busyboxImage, "--", "sh", "-c", tortureScript(caseInsensitive))
 	requireGuestMarkers(t, code, stdout, stderr, posixTortureMarkers...)
