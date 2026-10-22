@@ -54,6 +54,11 @@ type thread struct {
 	// forced stop set. Callers hold mu.
 	stepping bool
 
+	// lastExecPC and execRepeats count the execute faults at one pc that the
+	// engine retried without a patch. Callers hold mu.
+	lastExecPC  uint64
+	execRepeats int
+
 	// closeOnce makes sure that the handle closes once. The stub process and
 	// the context can both release the thread, and a second CloseHandle could
 	// close a new object that reuses the handle value.
@@ -202,6 +207,7 @@ func (th *thread) start(ac *arch.Context64, loadFP bool) error {
 	defer th.mu.Unlock()
 	th.ctx.loadFrom(ac, loadFP)
 	th.stepping = false
+	th.lastExecPC, th.execRepeats = 0, 0
 	return th.archStart(ac)
 }
 

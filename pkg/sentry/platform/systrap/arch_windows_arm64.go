@@ -58,6 +58,10 @@ const (
 
 func brkWord(imm uint32) uint32 { return arm64BRK | imm<<5 }
 
+// fetchWindow is the length of an instruction in bytes. Instructions are
+// aligned, so a fetch never crosses a block.
+const fetchWindow = 4
+
 // archProc is the arm64 state of a stub process.
 type archProc struct{}
 

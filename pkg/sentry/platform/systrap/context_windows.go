@@ -286,6 +286,10 @@ const (
 	avExecute = 8
 )
 
+// execRetryLimit is the number of faults at one pc that the engine retries
+// without a patch before it reports SIGSEGV.
+const execRetryLimit = 3
+
 // faultStop serves an access violation. The engine repairs a fault that its
 // own page state caused and reports every other fault as SIGSEGV.
 func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *addressSpace, th *thread, ac *arch.Context64, ev debugEvent) outcome {
@@ -294,18 +298,41 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 	switch kind {
 	case avExecute:
 		addr = pc
-		if st, _, ok := as.blockStateOf(blockRound(pc)); ok {
-			if st == blockData {
-				if err := as.patchBlock(ctx, mm, pc); err != nil {
-					return fatal(fmt.Errorf("patch the code page at %#x: %w", blockRound(pc), err), unix.ENOMEM)
+		if _, _, ok := as.blockStateOf(blockRound(pc)); ok {
+			// An instruction can cross into the next block. The fault then
+			// names an address in the next block, and pc stays in the block
+			// that is already executable. The loop patches every block that
+			// the fetch window of the instruction touches.
+			patched := false
+			for base := blockRound(pc); base < pc+fetchWindow; base += blockSize {
+				if st, _, ok := as.blockStateOf(base); !ok || st != blockData {
+					continue
 				}
+				if err := as.patchBlock(ctx, mm, base); err != nil {
+					return fatal(fmt.Errorf("patch the code page at %#x: %w", base, err), unix.ENOMEM)
+				}
+				patched = true
 			}
-			// A block that is already executable means that another thread
-			// patched it after this thread faulted. Either way the thread retries.
-			if err := th.continueEvent(ev); err != nil {
-				return fatal(err, unix.EFAULT)
+			if patched {
+				th.execRepeats = 0
+			} else if th.lastExecPC == pc {
+				th.execRepeats++
+			} else {
+				th.lastExecPC, th.execRepeats = pc, 1
 			}
-			return running
+			// Without a patch, the fault can come from another thread that
+			// patched the block after this thread faulted, so the thread retries.
+			// A fault that repeats means that the fetch reaches a block that
+			// the guest did not map for execution.
+			if patched || th.execRepeats <= execRetryLimit {
+				if err := th.continueEvent(ev); err != nil {
+					return fatal(err, unix.EFAULT)
+				}
+				return running
+			}
+			if a := ev.Info[1]; a >= pc && a-pc < fetchWindow {
+				addr = a
+			}
 		}
 	case avWrite:
 		base := blockRound(addr)

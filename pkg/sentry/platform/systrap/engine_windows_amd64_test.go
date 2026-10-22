@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
@@ -45,4 +46,33 @@ func TestFSBaseIsRepairedAfterPreemption(t *testing.T) {
 		t.Errorf("sum = %d, want %d", got, want)
 	}
 	t.Logf("the engine repaired the FS base %d times", r.as.sp.fsRepairs.Load())
+}
+
+// TestInstructionCrossesBlockBoundary runs an instruction whose first bytes
+// end one block and whose last bytes start the next block. The first block is
+// executable when the fetch of the next block faults, so pc stays in a block
+// that needs no patch. The engine must patch the block that the fault names.
+// A guest that runs a pipeline of a shell hit this fault in a call
+// instruction.
+func TestInstructionCrossesBlockBoundary(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	movabs := imm64([]byte{0x48, 0xB8}, 93) // mov rax, 93: ten bytes.
+	const inFirst = 4
+	first := make([]byte, blockSize)
+	for i := range first {
+		first[i] = 0x90 // nop
+	}
+	copy(first[blockSize-inFirst:], movabs[:inFirst])
+	second := append(append([]byte(nil), movabs[inFirst:]...), 0x0F, 0x05)
+	r.mapPage(codeVA, execAccess, first)
+	r.mapPage(codeVA+blockSize, execAccess, second)
+	r.mapPage(stackVA, hostarch.ReadWrite)
+	r.ac.SetIP(codeVA)
+	r.ac.SetStack(stackVA + blockSize - 0x100)
+
+	// A livelock of faults would block Switch for good, so a timer stops it.
+	stop := time.AfterFunc(30*time.Second, r.ctx.Interrupt)
+	defer stop.Stop()
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 93, r.ac)
 }

@@ -61,6 +61,10 @@ const (
 	slotStride = 16
 )
 
+// fetchWindow is the longest instruction in bytes. A fetch of one instruction
+// touches at most this many bytes from pc.
+const fetchWindow = amd64MaxInsnLen
+
 // archProc is the amd64 state of a stub process.
 type archProc struct {
 	slots [maxSlots]bool
