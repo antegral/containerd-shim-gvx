@@ -205,7 +205,8 @@ func TestGrantsAccess(t *testing.T) {
 				t.Fatalf("DACL: %v", err)
 			}
 			if got := grantsAccess(dacl, logon, tt.mask); got != tt.want {
-				t.Fatalf("grantsAccess = %v, want %v", got, tt.want)
+				t.Fatalf("grantsAccess = %v, want %v for mask %#x and descriptor %q (parsed as %q)",
+					got, tt.want, uint32(tt.mask), tt.sddl, sd.String())
 			}
 		})
 	}

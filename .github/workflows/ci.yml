@@ -6,9 +6,9 @@ name: ci
 on:
   push:
     branches: [main]
-    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml"]
   pull_request:
-    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+    paths-ignore: ["**.md", "docs/**", "LICENSE", ".github/workflows/diagnose.yml", ".github/workflows/e2e-images.yml"]
   workflow_dispatch:
     inputs:
       only:

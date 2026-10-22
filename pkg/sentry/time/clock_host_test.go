@@ -17,6 +17,7 @@
 package time
 
 import (
+	"runtime"
 	"testing"
 	stdtime "time"
 
@@ -42,20 +43,32 @@ func TestMonotonicNanosecondsNeverGoesBackwards(t *testing.T) {
 	}
 }
 
+// runtimeClockTolerance bounds the difference between the host clock and the
+// Go runtime clock. On macOS both read the same counter. On Windows the Go
+// runtime reads the interrupt time, which advances in timer ticks of up to
+// 15.6ms, while the host clock reads the performance counter.
+func runtimeClockTolerance() stdtime.Duration {
+	if runtime.GOOS == "windows" {
+		return 20 * stdtime.Millisecond
+	}
+	return stdtime.Millisecond
+}
+
 // TestMonotonicNanosecondsTracksRuntimeClock compares deltas with the Go runtime
-// monotonic clock, which reads the same host counter. A wrong unit or a wrong
-// clock source shows up as a large mismatch.
+// monotonic clock. A wrong unit or a wrong clock source shows up as a large
+// mismatch.
 func TestMonotonicNanosecondsTracksRuntimeClock(t *testing.T) {
+	tol := runtimeClockTolerance()
 	hostStart := MonotonicNanoseconds()
 	goStart := stdtime.Now()
 	spinFor(20 * stdtime.Millisecond)
 	hostElapsed := stdtime.Duration(MonotonicNanoseconds() - hostStart)
 	goElapsed := stdtime.Since(goStart)
-	if hostElapsed < 20*stdtime.Millisecond {
+	if hostElapsed < 20*stdtime.Millisecond-tol {
 		t.Fatalf("host clock advanced %v while the runtime clock advanced %v", hostElapsed, goElapsed)
 	}
-	if diff := hostElapsed - goElapsed; diff < -stdtime.Millisecond || diff > stdtime.Millisecond {
-		t.Fatalf("host clock advanced %v, runtime clock advanced %v, want a difference below 1ms", hostElapsed, goElapsed)
+	if diff := hostElapsed - goElapsed; diff < -tol || diff > tol {
+		t.Fatalf("host clock advanced %v, runtime clock advanced %v, want a difference below %v", hostElapsed, goElapsed, tol)
 	}
 }
 

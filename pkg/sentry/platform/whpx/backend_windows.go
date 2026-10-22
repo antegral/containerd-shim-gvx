@@ -247,6 +247,19 @@ func (b *winBackend) setRegs(index uint32, rb *regBatch) error {
 	if len(names) == 0 {
 		return nil
 	}
-	return call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
+	err := call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
 		b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[0])), uintptr(len(names)), uintptr(unsafe.Pointer(&vals[0])))
+	if err == nil || len(names) == 1 {
+		return err
+	}
+	// The batch call reports one status for all registers. Setting them one by
+	// one names the register that the hypervisor refuses. The processor is
+	// already in an unknown state, so the extra calls cost nothing.
+	for i := range names {
+		if one := call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
+			b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[i])), 1, uintptr(unsafe.Pointer(&vals[i]))); one != nil {
+			return fmt.Errorf("%w (register name %#x is refused: %v)", err, names[i], one)
+		}
+	}
+	return err
 }

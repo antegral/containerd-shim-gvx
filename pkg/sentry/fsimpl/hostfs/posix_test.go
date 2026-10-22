@@ -107,14 +107,35 @@ func TestRenamePopulatedDirectoryKeepsOpenFilesAndDentries(t *testing.T) {
 	e.mustMkdir("d/sub")
 	e.writeFile("d/sub/f", []byte("payload"))
 	fd := e.mustOpen("d/sub/f", linux.O_RDWR)
-	defer fd.DecRef(e.ctx)
 	subVD, err := e.vfsObj.GetDentryAt(e.ctx, e.creds, e.pop("d/sub"), &vfs.GetDentryOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer subVD.DecRef(e.ctx)
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			fd.DecRef(e.ctx)
+			subVD.DecRef(e.ctx)
+		}
+	}
+	defer release()
 
 	if err := e.rename("d", "e"); err != nil {
+		if runtime.GOOS == "windows" && errors.Is(err, linuxerr.EACCES) {
+			// NTFS is expected to refuse the rename of a directory that has an
+			// open descendant. The guest sees EACCES, and nothing moved. Closing
+			// the descendants must make the same rename work.
+			wantErrno(t, "old path after the refused rename", func() error { _, err := e.stat("d/sub/f"); return err }(), nil)
+			release()
+			if err := e.rename("d", "e"); err != nil {
+				t.Fatalf("rename d e after closing the descendants: %v", err)
+			}
+			if got := e.readFile("e/sub/f"); string(got) != "payload" {
+				t.Fatalf("read new path = %q", got)
+			}
+			t.Skip("NTFS refuses to rename a directory with an open descendant, as expected")
+		}
 		t.Fatalf("rename d e: %v", err)
 	}
 	wantErrno(t, "stat old path", func() error { _, err := e.stat("d/sub/f"); return err }(), linuxerr.ENOENT)
