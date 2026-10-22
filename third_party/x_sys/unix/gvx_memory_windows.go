@@ -387,10 +387,13 @@ func Mprotect(b []byte, prot int) error {
 	return nil
 }
 
-// Fallocate extends a file or punches a hole, as far as Windows allows.
+// Fallocate extends a file or zeroes a range, as far as Windows allows.
 // Mode 0 grows the file to off+length and never shrinks it.
-// FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE marks the file sparse and zeroes the
-// range with FSCTL_SET_ZERO_DATA. NTFS refuses the call with EBUSY while a view maps the range.
+// FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE zeroes the range with
+// FSCTL_SET_ZERO_DATA. NTFS refuses the call with EBUSY while a view maps the
+// range. The call never marks the file sparse: the first write to each hole of
+// a sparse file waits for NTFS to allocate a cluster, and a guest that wrote
+// to a mapped sparse memory file ran 10 to 20 times slower.
 func Fallocate(fd int, mode uint32, off int64, length int64) error {
 	if off < 0 || length <= 0 {
 		return EINVAL
@@ -407,9 +410,6 @@ func Fallocate(fd int, mode uint32, off int64, length int64) error {
 		}
 		return nil
 	case FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE:
-		if true {
-			return ENOTSUP // experiment: keep the file dense
-		}
 		// NTFS caches in 4KB pages. A range that splits a page would zero live neighbours.
 		if off%winPageSize != 0 || (off+length)%winPageSize != 0 {
 			return ENOTSUP
@@ -418,9 +418,6 @@ func Fallocate(fd int, mode uint32, off int64, length int64) error {
 			return nil
 		}
 		var returned uint32
-		if err := windows.DeviceIoControl(handle, windows.FSCTL_SET_SPARSE, nil, 0, nil, 0, &returned, nil); err != nil {
-			return winErrno(err)
-		}
 		// FILE_ZERO_DATA_INFORMATION: FileOffset, then BeyondFinalZero.
 		zero := [2]int64{off, min(off+length, st.Size)}
 		err := windows.DeviceIoControl(handle, windows.FSCTL_SET_ZERO_DATA, (*byte)(unsafe.Pointer(&zero)), uint32(unsafe.Sizeof(zero)), nil, 0, &returned, nil)

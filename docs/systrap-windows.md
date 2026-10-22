@@ -149,8 +149,16 @@ These numbers come from the engine tests and the stub probe on the hosted runner
 | `Probe` round trip (2000 calls) | 78 to 167 µs | 68 to 91 µs |
 | Create and release 25 address spaces (`TestAddressSpaceChurn`) | 0.4 to 0.5 s | 0.8 s |
 | FS base repairs during 1.5 billion loop iterations | 9 to 12 | not applicable |
+| One `fork` in a shell loop | 33 ms | 27 ms |
+| One `fork` and `exec` of `/bin/true` | 89 ms | 58 ms |
+| One system call in a `dd` loop | 141 µs | 80 µs |
+| `git add` of 200 small files, sparse memory file | 8 to 12 s | 12 to 19 s |
+| `git add` of 200 small files, dense memory file | 1.3 s | 0.8 s |
 
-The cost is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead.
+The cost of a system call is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each start a stub process, which costs 27 to 60 ms.
+
+The memory file of the Sentry is a temporary NTFS file. An earlier version marked it sparse when it tried to release pages. The first write to each hole of a sparse file waits for NTFS to allocate a cluster. Samples of the guest program counter showed the guest blocked at store instructions, and the `git add` row above shows the cost. 
+The `unix.Fallocate` shim now never sets the sparse flag. A dense memory file reserves its disk space when it grows. Twenty-four memory files of one gigabyte exhausted the disk of a hosted runner.
 
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
 
@@ -258,7 +266,7 @@ mov rax, [rip+d1]     ; load the guest rax from the slot
 jmp [rip+d2]          ; jump to the guest rip from the slot
 ```
 
-A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address, and if it has an FS prefix, runs the trampoline again. Eight repairs in a row at one address with identical registers count as a real fault, because a repair that works changes the registers. A loop that waits in the kernel on each pass, for example on a page of a file view, can need a repair on each pass. The engine allows 512 threads in one stub.
+A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address, and if it has an FS prefix, runs the trampoline again. Eight repairs in a row at one address with identical registers count as a real fault, because a repair that works changes the registers. A loop that waits in the kernel on each pass can need a repair on each pass. A wait on a page of a file view is an example. The engine allows 512 threads in one stub.
 
 ### 6.7 Confinement
 
@@ -325,6 +333,8 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39800771242`, `39802593217`, `39803097982` | both | `x18` across waits, policy flags, `ntdll` patching, loader-less threads. |
 | `39803487649` | both | FS base recovery with the debugger. |
 | `39809735687`, `39811366093` | both | Stub design: initialized stub, start trap, park and resume, `x18` and `TPIDR_EL0` across stops, Low-integrity token, job, Win32k, second stub on one debug object. |
+| `39864134146`, `39864138530` | both | Cost of `fork`, `exec`, and system calls from the host side. |
+| `39866441714`, `39866444969`, `39869493336`, `39869496938` | both | `git add` with the sparse and with the dense memory file. |
 | `39845577561`, `39846215053` | `arm64` | Node 22 gates: SIGILL at `dc civac`, then both gates pass with the `nop` replacement. |
 | `39853085199`, `39854000516` | `amd64` | Shell pipeline hang on an AMD EPYC 9V74 runner: 12 of 12 runs. The state dump shows a `call` at the end of a page. |
 | `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Seventeen runs on two other models (EPYC 7763 and 9V45) also pass. |
