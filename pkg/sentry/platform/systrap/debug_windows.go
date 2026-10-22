@@ -61,6 +61,10 @@ var (
 	// traceAll also prints the stops of patched traps, which are system calls
 	// and the repairs that the engine makes. GVX_SYSTRAP_TRACE=2 sets it.
 	traceAll = os.Getenv("GVX_SYSTRAP_TRACE") == "2"
+	// traceWatch prints the state of every stub process every three seconds.
+	// GVX_SYSTRAP_TRACE=2 and GVX_SYSTRAP_TRACE=3 set it. The value 3 prints
+	// nothing else, so it does not change the timing of the guest.
+	traceWatch = traceAll || os.Getenv("GVX_SYSTRAP_TRACE") == "3"
 )
 
 var (
@@ -88,7 +92,7 @@ func newDebugger() (*debugger, error) {
 	}
 	d := &debugger{obj: obj, procs: make(map[uint32]*stubProc), done: make(chan struct{})}
 	go d.run()
-	if traceAll {
+	if traceWatch {
 		go d.watch()
 	}
 	return d, nil
@@ -96,7 +100,7 @@ func newDebugger() (*debugger, error) {
 
 // watch prints the state of every stub process every three seconds, so that a
 // trace of a hung guest shows which thread waits for what. GVX_SYSTRAP_TRACE=2
-// starts it.
+// and GVX_SYSTRAP_TRACE=3 start it.
 func (d *debugger) watch() {
 	tick := time.NewTicker(3 * time.Second)
 	defer tick.Stop()
