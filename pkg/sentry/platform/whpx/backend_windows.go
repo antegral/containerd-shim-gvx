@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -77,9 +79,43 @@ func ptrFromUintptr(addr uintptr) unsafe.Pointer {
 	return *(*unsafe.Pointer)(unsafe.Pointer(&addr))
 }
 
+// whvRegInternalActivityState is WHvRegisterInternalActivityState. The stub
+// writes zero to it after every HLT exit, so that the processor leaves the
+// halted state.
+const whvRegInternalActivityState = 0x80000005
+
+// hvStatusAccessDenied is HV_STATUS_ACCESS_DENIED as WinHvPlatform returns it.
+const hvStatusAccessDenied = 0xc0350006
+
 // winBackend implements backend with WinHvPlatform.dll.
 type winBackend struct {
 	partition uintptr
+
+	// activityDenied is set after the hypervisor refused a write to
+	// WHvRegisterInternalActivityState. A hosted Windows runner (nested
+	// virtualization) refuses it, and then WHP resumes the processor after an
+	// HLT intercept without the write. The backend omits the register from every
+	// later call.
+	activityDenied atomic.Bool
+}
+
+// withoutActivityState returns the batch without WHvRegisterInternalActivityState.
+func withoutActivityState(names []uint32, vals []byte) ([]uint32, []byte) {
+	outNames := make([]uint32, 0, len(names))
+	outVals := make([]byte, 0, len(vals))
+	for i, name := range names {
+		if name == whvRegInternalActivityState {
+			continue
+		}
+		outNames = append(outNames, name)
+		outVals = append(outVals, vals[i*regValueSize:(i+1)*regValueSize]...)
+	}
+	return outNames, outVals
+}
+
+func isAccessDenied(err error) bool {
+	var he *hresultError
+	return errors.As(err, &he) && he.hr == hvStatusAccessDenied
 }
 
 // newBackend loads WinHvPlatform.dll.
@@ -245,11 +281,23 @@ func (b *winBackend) getRegs(index uint32, rb *regBatch) error {
 
 func (b *winBackend) setRegs(index uint32, rb *regBatch) error {
 	names, vals := rb.view()
+	if b.activityDenied.Load() {
+		names, vals = withoutActivityState(names, vals)
+	}
 	if len(names) == 0 {
 		return nil
 	}
 	err := call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
 		b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[0])), uintptr(len(names)), uintptr(unsafe.Pointer(&vals[0])))
+	if err != nil && isAccessDenied(err) && slices.Contains(names, whvRegInternalActivityState) {
+		b.activityDenied.Store(true)
+		names, vals = withoutActivityState(names, vals)
+		if len(names) == 0 {
+			return nil
+		}
+		err = call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
+			b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[0])), uintptr(len(names)), uintptr(unsafe.Pointer(&vals[0])))
+	}
 	if err == nil || len(names) == 1 {
 		return err
 	}
