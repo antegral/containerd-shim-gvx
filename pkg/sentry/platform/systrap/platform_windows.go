@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"sync"
 
@@ -91,6 +92,9 @@ func New() (*Platform, error) {
 // idempotent. No AddressSpace of this Platform may be used afterwards.
 func (p *Platform) Close() error {
 	p.closeOnce.Do(func() {
+		if traceWatch {
+			fmt.Fprintf(os.Stderr, "systrap: closing, %s\n", statsLine())
+		}
 		p.dbg.close()
 		p.closeErr = p.host.close()
 		p.priv.close()

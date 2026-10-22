@@ -161,6 +161,7 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
+	countStop(ev)
 	if traceAll && !traceMuted.Load() {
 		th.traceStop(as, ev)
 	}

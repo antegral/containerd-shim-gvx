@@ -74,6 +74,36 @@ var (
 	traceMuted atomic.Bool
 )
 
+// stopStats counts the stops of every stub by kind. The watch trace prints the
+// counts, which show what the time of a guest goes to.
+var stopStats struct {
+	trap, faultRead, faultWrite, faultExec, step, other atomic.Uint64
+}
+
+// countStop adds one stop to stopStats.
+func countStop(ev debugEvent) {
+	switch {
+	case ev.State == dbgStateSingleStep:
+		stopStats.step.Add(1)
+	case ev.Code == statusBreakpoint, ev.Code == statusIllegalInsn, ev.Code == statusPrivInsn:
+		stopStats.trap.Add(1)
+	case ev.Code == statusAccessViol && ev.Info[0] == avExecute:
+		stopStats.faultExec.Add(1)
+	case ev.Code == statusAccessViol && ev.Info[0] == avWrite:
+		stopStats.faultWrite.Add(1)
+	case ev.Code == statusAccessViol, ev.Code == statusInPageError:
+		stopStats.faultRead.Add(1)
+	default:
+		stopStats.other.Add(1)
+	}
+}
+
+func statsLine() string {
+	return fmt.Sprintf("stops: trap %d, read fault %d, write fault %d, execute fault %d, step %d, other %d",
+		stopStats.trap.Load(), stopStats.faultRead.Load(), stopStats.faultWrite.Load(), stopStats.faultExec.Load(),
+		stopStats.step.Load(), stopStats.other.Load())
+}
+
 func tracef(format string, args ...any) {
 	limit := int64(400)
 	if traceAll {
@@ -123,7 +153,7 @@ func (d *debugger) dumpState() {
 		procs = append(procs, sp)
 	}
 	d.mu.Unlock()
-	fmt.Fprintf(os.Stderr, "systrap: watch: %d stub processes, %d foreign events\n", len(procs), d.foreign.Load())
+	fmt.Fprintf(os.Stderr, "systrap: watch: %d stub processes, %d foreign events, %s\n", len(procs), d.foreign.Load(), statsLine())
 	for _, sp := range procs {
 		sp.mu.Lock()
 		threads := make([]*thread, 0, len(sp.threads))
