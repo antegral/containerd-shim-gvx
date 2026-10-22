@@ -15,11 +15,13 @@
 package hostfs
 
 import (
+	"os"
 	"sync/atomic"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/memutil"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
@@ -44,9 +46,14 @@ func (m testChunkMemory) AllocateChunk(length uint64) (memmap.FileRange, error) 
 
 func newTestChunkMemory(t *testing.T) ChunkMemory {
 	t.Helper()
-	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+	const name = "hostfs-chunk-test"
+	memFD, err := memutil.CreateMemFD(name, 0)
 	if err != nil {
-		t.Fatalf("NewDefaultMemoryFile: %v", err)
+		t.Fatalf("CreateMemFD: %v", err)
+	}
+	mf, err := pgalloc.NewMemoryFile(os.NewFile(uintptr(memFD), name), pgalloc.MemoryFileOpts{})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
 	}
 	t.Cleanup(mf.Destroy)
 	return testChunkMemory{MemoryFile: mf, releases: new(atomic.Int64)}
