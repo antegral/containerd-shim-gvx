@@ -719,6 +719,63 @@ func TestCloseTerminatesStubs(t *testing.T) {
 	}
 }
 
+// waitPool waits until the pool of p holds poolDepth stubs and returns their
+// process IDs.
+func waitPool(t *testing.T, p *Platform) []uint32 {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for len(p.pool.ready) < poolDepth {
+		if time.Now().After(deadline) {
+			t.Fatalf("the pool holds %d stubs after 30 s, want %d", len(p.pool.ready), poolDepth)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.dbg.mu.Lock()
+	defer p.dbg.mu.Unlock()
+	var pids []uint32
+	for pid := range p.dbg.procs {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+func TestPooledStubServesNewAddressSpace(t *testing.T) {
+	p := newPlatform(t)
+	pooled := waitPool(t, p)
+	asI, err := p.NewAddressSpace(platform.AddressSpaceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := asI.(*addressSpace)
+	t.Cleanup(as.Release)
+	for _, pid := range pooled {
+		if pid == as.sp.pid {
+			return
+		}
+	}
+	t.Errorf("the address space runs in stub %d, which is not one of the pooled stubs %v", as.sp.pid, pooled)
+}
+
+func TestCloseTerminatesPooledStubs(t *testing.T) {
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pooled := waitPool(t, p)
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for _, pid := range pooled {
+		for alive(pid) {
+			if time.Now().After(deadline) {
+				t.Fatalf("pooled stub %d is still alive after Close", pid)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
 // alive reports whether the process exists and has not exited.
 func alive(pid uint32) bool {
 	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)

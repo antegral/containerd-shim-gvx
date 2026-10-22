@@ -157,9 +157,97 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	return sp, nil
 }
 
-// newStubProc creates a stub. The reservation of the guest window can fail
-// when the loader placed something there, so the call retries with a new stub.
+// poolDepth is the number of ready stubs that the platform keeps. A stub takes
+// 10 to 20 ms to start, and each fork and each exec of a guest needs one.
+const poolDepth = 2
+
+// stubPool keeps ready stubs, so that a fork or an exec does not wait for the
+// loader of a new process. One goroutine fills the pool while the guests run.
+type stubPool struct {
+	ready chan *stubProc
+	stop  chan struct{}
+	done  chan struct{}
+}
+
+// startPool starts the goroutine that fills the pool.
+func (p *Platform) startPool() {
+	p.pool = &stubPool{
+		ready: make(chan *stubProc, poolDepth),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	go p.fillPool()
+}
+
+func (p *Platform) fillPool() {
+	pool := p.pool
+	defer close(pool.done)
+	for {
+		select {
+		case <-pool.stop:
+			return
+		default:
+		}
+		sp, err := p.newStubProcFresh()
+		if err != nil {
+			// The next call of NewAddressSpace reports the failure. Wait
+			// before the next try, so that a failing host does not make a busy loop.
+			select {
+			case <-pool.stop:
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+			continue
+		}
+		select {
+		case pool.ready <- sp:
+		case <-pool.stop:
+			sp.destroy()
+			return
+		}
+	}
+}
+
+// stopPool stops the goroutine and terminates the stubs that no guest took.
+func (p *Platform) stopPool() {
+	if p.pool == nil {
+		return
+	}
+	close(p.pool.stop)
+	<-p.pool.done
+	for {
+		select {
+		case sp := <-p.pool.ready:
+			sp.destroy()
+		default:
+			return
+		}
+	}
+}
+
+// newStubProc returns a ready stub from the pool, or creates one when the pool
+// is empty.
 func (p *Platform) newStubProc() (*stubProc, error) {
+	if p.pool != nil {
+		for {
+			select {
+			case sp := <-p.pool.ready:
+				if sp.dead.Load() {
+					sp.destroy()
+					continue
+				}
+				return sp, nil
+			default:
+			}
+			break
+		}
+	}
+	return p.newStubProcFresh()
+}
+
+// newStubProcFresh creates a stub. The reservation of the guest window can fail
+// when the loader placed something there, so the call retries with a new stub.
+func (p *Platform) newStubProcFresh() (*stubProc, error) {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		var sp *stubProc

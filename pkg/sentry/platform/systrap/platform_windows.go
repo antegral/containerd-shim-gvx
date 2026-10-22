@@ -42,6 +42,8 @@ type Platform struct {
 
 	host *stubHost
 	dbg  *debugger
+	// pool holds ready stubs. It is nil in a platform that did not start it.
+	pool *stubPool
 
 	sections sectionCache
 	priv     privPool
@@ -79,13 +81,15 @@ func New() (*Platform, error) {
 		dbg.close()
 		return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the stub host did not start: %v", err)}
 	}
-	return &Platform{
+	p := &Platform{
 		host:      host,
 		dbg:       dbg,
 		breakAddr: breakAddr,
 		userMin:   winBase,
 		userMax:   internalBase,
-	}, nil
+	}
+	p.startPool()
+	return p, nil
 }
 
 // Close terminates every stub process and frees the Sentry-side memory. It is
@@ -98,6 +102,7 @@ func (p *Platform) Close() error {
 				printSamples()
 			}
 		}
+		p.stopPool()
 		p.dbg.close()
 		p.closeErr = p.host.close()
 		p.priv.close()
