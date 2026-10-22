@@ -54,3 +54,29 @@ jobs:
             args+=(-exec "$PWD/scripts/codesign-exec.sh")
           fi
           go test "${args[@]}" $PACKAGES
+      - name: Show crash reports and sandbox denials of the run
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          sw_vers
+          sysctl machdep.cpu.brand_string hw.pagesize
+          for f in ~/Library/Logs/DiagnosticReports/*.ips; do
+            [ -e "$f" ] || continue
+            echo "== $f"
+            python3 - "$f" <<'PY'
+          import json, sys
+          raw = open(sys.argv[1]).read()
+          header, _, body = raw.partition("\n")
+          try:
+              d = json.loads(body)
+          except Exception as e:
+              print("unreadable:", e); sys.exit(0)
+          for k in ("procName", "exception", "termination"):
+              print(k, d.get(k))
+          for th in d.get("threads", []):
+              if th.get("triggered"):
+                  for fr in th["frames"][:6]:
+                      print("  ", fr.get("symbol"), fr.get("imageOffset"))
+          PY
+          done
+          log show --last 10m --style compact --predicate 'eventMessage CONTAINS "Sandbox:" AND eventMessage CONTAINS "deny"' | grep -v "kern.hv_vmm_present\|/private/etc/passwd\|/usr/bin/true\|/bin/sh\|remote:\*:1" | tail -40 || true
