@@ -12,16 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build !linux
+//go:build linux && !gvx_seccomp_log
 
 package gvx
 
-// platformAfterLockdown is false on Windows and macOS. Their platforms start
-// first, because the lockdown forbids new processes.
-const platformAfterLockdown = false
-
-// lockdownReadPaths is empty. Only the Linux lockdown restricts reads by path.
-func lockdownReadPaths() []string { return nil }
-
-// primeHost has nothing to cache.
-func primeHost() {}
+// seccompLogOnly is false in a normal build. A system call outside the
+// allowlist kills the process.
+const seccompLogOnly = false

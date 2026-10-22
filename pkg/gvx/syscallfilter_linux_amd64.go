@@ -12,10 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux && !cgo
+//go:build linux && amd64
 
-package hostlockdown
+package gvx
 
-// cgoEnabled is false when the build has no C runtime, so the Go runtime can run
-// one system call on every thread. The Linux lockdown needs that.
-const cgoEnabled = false
+import (
+	"golang.org/x/sys/unix"
+
+	"z.gfire.dev/gvx/pkg/seccomp"
+)
+
+// archRejectedRules lists the amd64 calls that arm64 lacks: open, creat, fork,
+// and vfork.
+func archRejectedRules() seccomp.SyscallRules {
+	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		unix.SYS_OPEN:  seccomp.MatchAll{},
+		unix.SYS_CREAT: seccomp.MatchAll{},
+		unix.SYS_FORK:  seccomp.MatchAll{},
+		unix.SYS_VFORK: seccomp.MatchAll{},
+	})
+}

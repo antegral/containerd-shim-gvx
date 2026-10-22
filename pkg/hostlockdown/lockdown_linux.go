@@ -19,168 +19,64 @@ package hostlockdown
 import (
 	"errors"
 	"fmt"
-	"net"
-	"os"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// The Linux lockdown uses Landlock. A Landlock domain denies every new
-// path-based file access that no rule allows, including execve, while
-// descriptors that the process holds keep working. That matches the macOS
-// Seatbelt profile. The domain also inherits to every thread that a locked
-// thread creates.
-//
-// Landlock restricts one thread, unless the sync flag asks for all threads of
-// the process. The Go runtime runs goroutines on many threads, so Apply uses
-// the flag and sets no_new_privs on every thread with
-// syscall.AllThreadsSyscall. The Go runtime supports that call only in a build
-// without cgo, so a cgo build returns ErrUnsupported.
+// probeExecPath names a file that does not exist. A filter that rejects
+// execve returns EPERM before the kernel looks at the path. Without a filter
+// the call returns ENOENT and starts nothing.
+const probeExecPath = "/gvx-lockdown-probe/does-not-exist"
 
-// Landlock access rights of ABI version 1 to 3.
-const (
-	landlockFSV1 = unix.LANDLOCK_ACCESS_FS_EXECUTE |
-		unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
-		unix.LANDLOCK_ACCESS_FS_READ_FILE |
-		unix.LANDLOCK_ACCESS_FS_READ_DIR |
-		unix.LANDLOCK_ACCESS_FS_REMOVE_DIR |
-		unix.LANDLOCK_ACCESS_FS_REMOVE_FILE |
-		unix.LANDLOCK_ACCESS_FS_MAKE_CHAR |
-		unix.LANDLOCK_ACCESS_FS_MAKE_DIR |
-		unix.LANDLOCK_ACCESS_FS_MAKE_REG |
-		unix.LANDLOCK_ACCESS_FS_MAKE_SOCK |
-		unix.LANDLOCK_ACCESS_FS_MAKE_FIFO |
-		unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK |
-		unix.LANDLOCK_ACCESS_FS_MAKE_SYM
-	landlockFSRefer    = unix.LANDLOCK_ACCESS_FS_REFER    // ABI 2
-	landlockFSTruncate = unix.LANDLOCK_ACCESS_FS_TRUNCATE // ABI 3
-
-	// landlockNetABI is the first ABI that restricts TCP bind and connect.
-	landlockNetABI = 4
-
-	// landlockSyncABI is the first ABI that has LANDLOCK_RESTRICT_SELF_TSYNC.
-	// Without the flag, each thread would get its own domain.
-	landlockSyncABI = 8
-
-	// rulesetSizeV1 and rulesetSizeV4 are the sizes of the ruleset attribute
-	// before and after the network fields.
-	rulesetSizeV1 = 8
-	rulesetSizeV4 = 16
-)
-
-// workspaceWriteMask lists the rights that a writable workspace needs on top
-// of the read rights.
-const workspaceWriteMask = unix.LANDLOCK_ACCESS_FS_WRITE_FILE |
-	unix.LANDLOCK_ACCESS_FS_REMOVE_DIR |
-	unix.LANDLOCK_ACCESS_FS_REMOVE_FILE |
-	unix.LANDLOCK_ACCESS_FS_MAKE_CHAR |
-	unix.LANDLOCK_ACCESS_FS_MAKE_DIR |
-	unix.LANDLOCK_ACCESS_FS_MAKE_REG |
-	unix.LANDLOCK_ACCESS_FS_MAKE_SOCK |
-	unix.LANDLOCK_ACCESS_FS_MAKE_FIFO |
-	unix.LANDLOCK_ACCESS_FS_MAKE_BLOCK |
-	unix.LANDLOCK_ACCESS_FS_MAKE_SYM |
-	unix.LANDLOCK_ACCESS_FS_REFER |
-	unix.LANDLOCK_ACCESS_FS_TRUNCATE
-
-// workspaceReadMask lists the rights that a read-only workspace keeps.
-const workspaceReadMask = unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR
-
-// handledFS returns the file access rights that the ruleset handles for the
-// Landlock ABI version abi. A handled right is denied unless a rule allows it.
-func handledFS(abi int) uint64 {
-	mask := uint64(landlockFSV1)
-	if abi >= 2 {
-		mask |= landlockFSRefer
-	}
-	if abi >= 3 {
-		mask |= landlockFSTruncate
-	}
-	return mask
-}
-
-// landlockABI returns the Landlock ABI version of the kernel.
-func landlockABI() (int, error) {
-	v, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, 0, 0, unix.LANDLOCK_CREATE_RULESET_VERSION)
-	if errno != 0 {
-		return 0, errno
-	}
-	return int(v), nil
-}
-
-// allThreads runs one system call on every thread of the process.
-func allThreads(trap, a1, a2, a3 uintptr) error {
-	if _, _, errno := syscall.AllThreadsSyscall(trap, a1, a2, a3); errno != 0 {
-		return errno
-	}
-	return nil
-}
-
+// applyOSLockdown installs the seccomp filter of the embedder and observes
+// that the filter holds. The filter follows the model of the gVisor Sentry:
+// an allowlist of system calls, with every other call killing the process.
+// The caller adds EPERM rules for the calls that this function probes, so that
+// the probes do not kill the process.
 func applyOSLockdown(opts Options) (Status, error) {
-	if cgoEnabled {
-		return Status{}, fmt.Errorf("%w: the Linux lockdown needs a build with CGO_ENABLED=0", ErrUnsupported)
+	if opts.InstallSyscallFilter == nil {
+		return Status{}, errors.New("hostlockdown: the Linux lockdown needs Options.InstallSyscallFilter")
 	}
-	abi, err := landlockABI()
+	// The root descriptor lets the open probe walk an absolute path through a
+	// directory descriptor. It must exist before the filter rejects opens.
+	root, err := unix.Open("/", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return Status{}, fmt.Errorf("%w: Landlock is unavailable (Linux 5.13 or newer with Landlock enabled): %v", ErrUnsupported, err)
+		return Status{}, fmt.Errorf("hostlockdown: open the root directory for the probes: %w", err)
 	}
-	if abi < landlockSyncABI {
-		return Status{}, fmt.Errorf("%w: Landlock ABI %d, but the lockdown needs ABI %d (LANDLOCK_RESTRICT_SELF_TSYNC) to put all threads in one domain",
-			ErrUnsupported, abi, landlockSyncABI)
-	}
+	defer unix.Close(root)
 
-	fs := handledFS(abi)
-	attr := unix.LandlockRulesetAttr{Access_fs: fs}
-	size := uintptr(rulesetSizeV1)
-	blockNet := abi >= landlockNetABI && !opts.AllowOutboundNet
-	if abi >= landlockNetABI {
-		size = rulesetSizeV4
-		if blockNet {
-			attr.Access_net = unix.LANDLOCK_ACCESS_NET_BIND_TCP | unix.LANDLOCK_ACCESS_NET_CONNECT_TCP
-		}
-	}
-	rs, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_CREATE_RULESET, uintptr(unsafe.Pointer(&attr)), size, 0)
-	if errno != 0 {
-		return Status{}, fmt.Errorf("hostlockdown: landlock_create_ruleset: %w", errno)
-	}
-	rulesetFD := int(rs)
-	defer unix.Close(rulesetFD)
-
-	if opts.WorkspacePath != "" {
-		if err := allowWorkspace(rulesetFD, opts, fs); err != nil {
-			return Status{}, err
-		}
-	}
-	for _, path := range opts.ReadPaths {
-		if err := allowRead(rulesetFD, path, fs); err != nil {
-			return Status{}, err
-		}
-	}
-
-	if err := allThreads(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); err != nil {
-		return Status{}, fmt.Errorf("hostlockdown: prctl(PR_SET_NO_NEW_PRIVS): %w", err)
-	}
-	// One call with the sync flag puts every thread into one domain. A call
-	// per thread would put each thread into its own domain, and a thread may
-	// trace only a process in its own domain or in a child domain. The upstream
-	// systrap platform traces its stub processes from many threads.
-	if _, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(rulesetFD), unix.LANDLOCK_RESTRICT_SELF_TSYNC, 0); errno != 0 {
-		return Status{}, fmt.Errorf("hostlockdown: landlock_restrict_self: %w", errno)
+	if err := opts.InstallSyscallFilter(); err != nil {
+		return Status{}, fmt.Errorf("hostlockdown: install the syscall filter: %w", err)
 	}
 
 	st := Status{}
 	if err := probeExecBlocked(); err != nil {
 		return st, err
 	}
-	st.SubprocessBlocked = true
-	if err := probeOpenBlocked(opts.WorkspacePath); err != nil {
+	if err := probeForkBlocked(); err != nil {
 		return st, err
 	}
-	st.UnboundFileOpenBlocked = true
-	if blockNet {
-		if err := probeConnectBlocked(); err != nil {
+	st.SubprocessBlocked = true
+
+	cwdBlocked, err := probeOpen(unix.AT_FDCWD, "/etc/passwd")
+	if err != nil {
+		return st, err
+	}
+	if !cwdBlocked {
+		return st, errors.New("hostlockdown: the filter allows an open relative to the working directory")
+	}
+	dirfdBlocked, err := probeOpen(root, "etc/passwd")
+	if err != nil {
+		return st, err
+	}
+	if !dirfdBlocked && opts.WorkspacePath == "" {
+		return st, errors.New("hostlockdown: the filter allows an open through a directory descriptor, and no workspace needs it")
+	}
+	st.UnboundFileOpenBlocked = dirfdBlocked
+
+	if !opts.AllowOutboundNet {
+		if err := probeSocketBlocked(); err != nil {
 			return st, err
 		}
 		st.NetworkOutboundBlocked = true
@@ -188,114 +84,69 @@ func applyOSLockdown(opts Options) (Status, error) {
 	return st, nil
 }
 
-// allowWorkspace adds the rule that lets the process use the workspace tree.
-func allowWorkspace(rulesetFD int, opts Options, handled uint64) error {
-	fd, err := unix.Open(opts.WorkspacePath, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("hostlockdown: open workspace %q: %w", opts.WorkspacePath, err)
-	}
-	defer unix.Close(fd)
-	allowed := uint64(workspaceReadMask)
-	if !opts.WorkspaceReadOnly {
-		allowed |= workspaceWriteMask
-	}
-	// A rule may name only rights that the ruleset handles.
-	rule := unix.LandlockPathBeneathAttr{Allowed_access: allowed & handled, Parent_fd: int32(fd)}
-	if _, _, errno := syscall.Syscall6(unix.SYS_LANDLOCK_ADD_RULE, uintptr(rulesetFD), unix.LANDLOCK_RULE_PATH_BENEATH,
-		uintptr(unsafe.Pointer(&rule)), 0, 0, 0); errno != 0 {
-		return fmt.Errorf("hostlockdown: landlock_add_rule for %q: %w", opts.WorkspacePath, errno)
-	}
-	return nil
-}
-
-// allowRead adds a rule that lets the process read path. A directory gets the
-// read rights of a tree. A file gets the file read right, because a rule may
-// not name directory rights for a file.
-func allowRead(rulesetFD int, path string, handled uint64) error {
-	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("hostlockdown: open read path %q: %w", path, err)
-	}
-	defer unix.Close(fd)
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return fmt.Errorf("hostlockdown: stat read path %q: %w", path, err)
-	}
-	allowed := uint64(unix.LANDLOCK_ACCESS_FS_READ_FILE)
-	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
-		allowed |= unix.LANDLOCK_ACCESS_FS_READ_DIR
-	}
-	rule := unix.LandlockPathBeneathAttr{Allowed_access: allowed & handled, Parent_fd: int32(fd)}
-	if _, _, errno := syscall.Syscall6(unix.SYS_LANDLOCK_ADD_RULE, uintptr(rulesetFD), unix.LANDLOCK_RULE_PATH_BENEATH,
-		uintptr(unsafe.Pointer(&rule)), 0, 0, 0); errno != 0 {
-		return fmt.Errorf("hostlockdown: landlock_add_rule for %q: %w", path, errno)
-	}
-	return nil
-}
-
-// probeExecBlocked proves that the process cannot start a program. The probe
-// forks and executes an existing file in the child. The lockdown makes the exec
-// fail with EACCES, and ForkExec reports that error. A missing lockdown starts
-// the program, and the probe reaps it and fails.
+// probeExecBlocked proves that execve fails with EPERM. The path does not
+// exist, so a missing filter cannot replace the process image.
 func probeExecBlocked() error {
-	for _, path := range []string{"/bin/true", "/usr/bin/true", "/bin/sh", "/usr/bin/env"} {
-		if _, err := os.Stat(path); err != nil {
-			continue
-		}
-		pid, err := syscall.ForkExec(path, []string{path}, &syscall.ProcAttr{})
-		if err == nil {
-			var ws syscall.WaitStatus
-			_, _ = syscall.Wait4(pid, &ws, 0, nil)
-			return fmt.Errorf("hostlockdown: the exec probe started %s", path)
-		}
-		if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM) {
-			return nil
-		}
-		return fmt.Errorf("hostlockdown: exec probe of %s returned %v, want EACCES", path, err)
+	path, err := unix.BytePtrFromString(probeExecPath)
+	if err != nil {
+		return err
 	}
-	return errors.New("hostlockdown: no executable file exists for the exec probe")
+	_, _, errno := unix.Syscall(unix.SYS_EXECVE, uintptr(unsafe.Pointer(path)), 0, 0)
+	if errno != unix.EPERM {
+		return fmt.Errorf("hostlockdown: the execve probe returned %v, want EPERM", errnoOrNone(errno))
+	}
+	atFDCWD := unix.AT_FDCWD
+	_, _, errno = unix.Syscall6(unix.SYS_EXECVEAT, uintptr(atFDCWD), uintptr(unsafe.Pointer(path)), 0, 0, 0, 0)
+	if errno != unix.EPERM {
+		return fmt.Errorf("hostlockdown: the execveat probe returned %v, want EPERM", errnoOrNone(errno))
+	}
+	return nil
 }
 
-// probeOpenBlocked proves that a new open outside the workspace fails.
-func probeOpenBlocked(workspace string) error {
-	for _, path := range []string{"/etc/passwd", "/etc/hostname", "/proc/self/status"} {
-		if workspace != "" && pathBeneath(path, workspace) {
-			continue
-		}
-		fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-		if err == nil {
-			unix.Close(fd)
-			return fmt.Errorf("hostlockdown: open probe of %s succeeded", path)
-		}
-		if errors.Is(err, unix.EACCES) {
-			return nil
-		}
-		if errors.Is(err, unix.ENOENT) {
-			continue
-		}
-		return fmt.Errorf("hostlockdown: open probe of %s returned %v, want EACCES", path, err)
+// probeForkBlocked proves that clone fails with EPERM for flags other than the
+// thread flags of the Go runtime. The probe passes CLONE_THREAD without
+// CLONE_SIGHAND. The kernel rejects that with EINVAL, so a missing filter
+// creates no thread and no process.
+func probeForkBlocked() error {
+	_, _, errno := unix.RawSyscall6(unix.SYS_CLONE, unix.CLONE_THREAD, 0, 0, 0, 0, 0)
+	if errno != unix.EPERM {
+		return fmt.Errorf("hostlockdown: the clone probe returned %v, want EPERM", errnoOrNone(errno))
 	}
-	return errors.New("hostlockdown: no readable file exists for the open probe")
+	return nil
 }
 
-func pathBeneath(path, dir string) bool {
-	if len(path) < len(dir) || path[:len(dir)] != dir {
-		return false
+// probeOpen reports whether the filter rejects opening path below dirfd. An
+// EPERM result means rejected. Any other failure means that the call reached
+// the kernel path lookup. A success closes the descriptor at once.
+func probeOpen(dirfd int, path string) (blocked bool, err error) {
+	fd, err := unix.Openat(dirfd, path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	switch {
+	case err == nil:
+		_ = unix.Close(fd)
+		return false, nil
+	case errors.Is(err, unix.EPERM):
+		return true, nil
+	default:
+		return false, nil
 	}
-	return len(path) == len(dir) || path[len(dir)] == '/' || dir[len(dir)-1] == '/'
 }
 
-// probeConnectBlocked proves that a new outbound TCP connection fails. The
-// connection targets a closed loopback port, so a missing restriction returns
-// ECONNREFUSED and a working one returns EACCES.
-func probeConnectBlocked() error {
-	c, err := net.Dial("tcp", "127.0.0.1:1")
+// probeSocketBlocked proves that a new TCP socket fails with EPERM.
+func probeSocketBlocked() error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err == nil {
-		_ = c.Close()
-		return errors.New("hostlockdown: TCP connect probe succeeded")
+		_ = unix.Close(fd)
+		return errors.New("hostlockdown: the socket probe created a TCP socket")
 	}
-	if errors.Is(err, unix.EACCES) {
-		return nil
+	if !errors.Is(err, unix.EPERM) {
+		return fmt.Errorf("hostlockdown: the socket probe returned %v, want EPERM", err)
 	}
-	return fmt.Errorf("hostlockdown: TCP connect probe returned %v, want EACCES", err)
+	return nil
+}
+
+func errnoOrNone(errno unix.Errno) error {
+	if errno == 0 {
+		return errors.New("success")
+	}
+	return errno
 }

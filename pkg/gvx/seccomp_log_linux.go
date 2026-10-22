@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux && cgo
+//go:build linux && gvx_seccomp_log
 
-package hostlockdown
+package gvx
 
-// cgoEnabled is true when the build links the C runtime. The Go runtime
-// refuses to run one system call on every thread of such a process, and the
-// Linux lockdown needs that.
-const cgoEnabled = true
+// seccompLogOnly is true in a diagnostic build. A system call outside the
+// allowlist runs and the kernel logs it. Read the log with dmesg to learn
+// which calls the allowlist lacks. Never ship this build.
+const seccompLogOnly = true

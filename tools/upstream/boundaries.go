@@ -182,6 +182,10 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/netbackend"}, "golang.zx2c4.com/wireguard/*", "SPEC section 3.5 Track B embeds wireguard-go"},
 	{[]string{"pkg/netbackend"}, "golang.org/x/sys/*", "host DNS resolver discovery needs GetAdaptersAddresses on Windows and the resolver configuration on macOS"},
 
+	// pkg/gvx: the Linux lockdown reuses the seccomp allowlist of the gVisor Sentry.
+	{[]string{"pkg/gvx"}, "runsc/boot/filter/config", "the Linux lockdown installs the runsc Sentry allowlist"},
+	{[]string{"pkg/gvx"}, "pkg/seccomp", "the Linux lockdown builds the seccomp program with the upstream rule types"},
+	{[]string{"pkg/gvx"}, "golang.org/x/sys/unix", "the Linux lockdown names system calls for the extra rules"},
 	// pkg/oci: the EROFS writer and the layer codecs have no SPEC row of their own.
 	{[]string{"pkg/oci"}, "pkg/erofs", "SPEC section 3.6 compiles layer tarballs with the upstream erofs ABI"},
 	{[]string{"pkg/oci"}, "github.com/klauspost/compress/*", "zstd-compressed OCI layers"},
@@ -198,6 +202,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/systrap"}, "pkg/cpuid", "arch.Context64 and the CPUID trap path need cpuid.Initialize before a test builds a context"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/pgalloc", "tests build the pgalloc.MemoryFile that backs guest pages"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/usage", "pgalloc.AllocOpts takes a usage.MemoryKind"},
+	{[]string{"pkg/hostlockdown"}, "pkg/seccomp", "tests install a small seccomp program through Options.InstallSyscallFilter"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/hostlockdown", "a test proves that the stub keeps working after hostlockdown.Apply"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "a test pins that the vDSO image that the Sentry maps never names x18"},
 }

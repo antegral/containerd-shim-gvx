@@ -71,21 +71,12 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
 
-	primeHost()
-	openPlat := func() error {
-		plat, platName, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
-		if err != nil {
-			return err
-		}
-		sb.plat = plat
-		sb.platName = platName
-		return nil
+	plat, platName, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
+	if err != nil {
+		return cleanup(err)
 	}
-	if !platformAfterLockdown {
-		if err := openPlat(); err != nil {
-			return cleanup(err)
-		}
-	}
+	sb.plat = plat
+	sb.platName = platName
 
 	if err := sb.initOCILayers(ctx); err != nil {
 		return cleanup(err)
@@ -115,12 +106,6 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
 		}
 		sb.lockdown = st
-	}
-
-	if platformAfterLockdown {
-		if err := openPlat(); err != nil {
-			return cleanup(err)
-		}
 	}
 
 	return sb, nil
@@ -204,10 +189,10 @@ func openHVF() (platform.Platform, string, error) {
 // socket to reach the peer port. The none mode gets no outbound access.
 func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 	opts := hostlockdown.Options{
-		WorkspacePath:     s.cfg.WorkspacePath,
-		WorkspaceReadOnly: s.cfg.WorkspaceReadOnly,
-		AllowOutboundNet:  s.cfg.NetworkMode == NetModeNAT,
-		ReadPaths:         lockdownReadPaths(),
+		WorkspacePath:        s.cfg.WorkspacePath,
+		WorkspaceReadOnly:    s.cfg.WorkspaceReadOnly,
+		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
+		InstallSyscallFilter: s.syscallFilter(),
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {
 		opts.OutboundUDPPorts = []uint16{s.wgPeerPort}

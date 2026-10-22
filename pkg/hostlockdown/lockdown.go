@@ -20,8 +20,6 @@ package hostlockdown
 
 import (
 	"errors"
-	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -55,11 +53,12 @@ type Options struct {
 	// Ignored when AllowOutboundNet is true.
 	OutboundUDPPorts []uint16
 
-	// ReadPaths lists extra host files and directories that the locked process
-	// may read. Only Linux supports it, because only Landlock restricts reads
-	// by path. Apply returns an error on another host when the list is not
-	// empty.
-	ReadPaths []string
+	// InstallSyscallFilter installs the seccomp program of the embedder. Only
+	// Linux uses it, and Apply fails there when it is nil. The caller builds the
+	// program, because the allowlist depends on the Sentry platform, which this
+	// package must not import. The function must install the program on every
+	// thread of the process.
+	InstallSyscallFilter func() error
 }
 
 // Status reports the containment primitives enforced by Apply. Apply sets a
@@ -76,7 +75,12 @@ type Status struct {
 	// UnboundFileOpenBlocked reports that opens outside the workspace fail.
 	// macOS: probe opens failed in the whole process. Windows: probe opens
 	// failed on a thread that holds the restricted token, so only threads
-	// that call BindThread have this property.
+	// that call BindThread have this property. Linux: the seccomp filter
+	// rejects every open when no workspace exists. With a workspace, the filter
+	// rejects opens relative to the working directory but must allow opens
+	// relative to a directory descriptor, and seccomp cannot read the path. An
+	// absolute path opened through such a descriptor still reaches the host
+	// root, so the field stays false.
 	UnboundFileOpenBlocked bool
 
 	// IntegrityDowngraded reports a Low integrity primary token. Windows only.
@@ -119,9 +123,6 @@ func Apply(opts Options) (Status, error) {
 		if port == 0 {
 			return Status{}, errors.New("hostlockdown: OutboundUDPPorts contains port 0")
 		}
-	}
-	if len(opts.ReadPaths) > 0 && runtime.GOOS != "linux" {
-		return Status{}, fmt.Errorf("hostlockdown: ReadPaths needs Linux, not %s", runtime.GOOS)
 	}
 	st, err := applyOSLockdown(opts)
 	if err != nil {
