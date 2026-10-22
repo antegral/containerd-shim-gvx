@@ -164,9 +164,6 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if out, ok := th.archEvent(as, ac, ev); ok {
 		return out
 	}
-	if traceEvents && !traceAll && !traceMuted.Load() {
-		th.traceStop(as, ev)
-	}
 	switch ev.State {
 	case dbgStateSingleStep:
 		return c.stepStop(th, ac, ev)
@@ -176,27 +173,27 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 		return c.faultStop(ctx, mm, as, th, ac, ev)
 	case statusIllegalInsn, statusPrivInsn:
 		sig, code := th.illegalSignal(as, th.ctx.pc())
-		return c.signalStop(th, ac, ev, linux.Signal(sig), code, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.Signal(sig), code, th.ctx.pc())
 	case statusBreakpoint:
-		return c.signalStop(th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, th.ctx.pc())
 	case statusSingleStep:
 		return c.stepStop(th, ac, ev)
 	case statusDatatypeMis:
-		return c.signalStop(th, ac, ev, linux.SIGBUS, busAdrAln, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGBUS, busAdrAln, th.ctx.pc())
 	case statusIntDivZero:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeIntDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntDiv, th.ctx.pc())
 	case statusIntOverflow:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeIntOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntOvf, th.ctx.pc())
 	case statusFltDivZero:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltDiv, th.ctx.pc())
 	case statusFltOverflow:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltOvf, th.ctx.pc())
 	case statusFltUnderflow:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltUnd, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltUnd, th.ctx.pc())
 	case statusFltInexact:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltRes, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltRes, th.ctx.pc())
 	case statusFltInvalid, statusFltDenormal, statusFltStack:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
 	}
 	return fatal(fmt.Errorf("the stub reported exception %#x at %#x (pc %#x)", ev.Code, ev.Addr, th.ctx.pc()), unix.EFAULT)
 }
@@ -241,7 +238,11 @@ func (c *Context) stepStop(th *thread, ac *arch.Context64, ev debugEvent) outcom
 }
 
 // signalStop reports a signal of the guest at pc.
-func (c *Context) signalStop(th *thread, ac *arch.Context64, ev debugEvent, sig linux.Signal, code int32, addr uint64) outcome {
+func (c *Context) signalStop(as *addressSpace, th *thread, ac *arch.Context64, ev debugEvent, sig linux.Signal, code int32, addr uint64) outcome {
+	if traceEvents && !traceMuted.Load() {
+		tracef("signal %d code %d to the guest", sig, code)
+		th.traceStop(as, ev)
+	}
 	if err := th.stopAndPull(ac, ev); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
@@ -351,6 +352,12 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, ev debugEvent, kin
 		at = hostarch.Read
 	}
 	sig, code := linux.Signal(linux.SIGSEGV), int32(segvMapErr)
+	defer func() {
+		if traceEvents && !traceMuted.Load() {
+			tracef("signal %d code %d to the guest at %#x", sig, code, addr)
+			th.traceStop(as, ev)
+		}
+	}()
 	if ev.Code == statusInPageError {
 		sig, code = linux.SIGBUS, busAdrErr
 	} else if as.mapped(addr) {
