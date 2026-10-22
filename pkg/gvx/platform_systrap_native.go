@@ -47,6 +47,8 @@ func probeStub() (StubInfo, error) {
 		PID:             info.StubPID,
 		ProtocolVersion: info.ProtocolVersion,
 		RoundTrip:       info.RoundTrip,
+		UserMin:         info.UserMin,
+		UserMax:         info.UserMax,
 	}, nil
 }
 

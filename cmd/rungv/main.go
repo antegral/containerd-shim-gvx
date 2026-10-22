@@ -299,6 +299,9 @@ func stubSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 		"protocol version: %d\n"+
 		"syscall round trip: %s\n",
 		info.Arch, info.HostPageSize, info.PID, info.ProtocolVersion, info.RoundTrip)
+	if info.UserMax != 0 {
+		_, _ = fmt.Fprintf(stdout, "guest address range: %#x-%#x\n", info.UserMin, info.UserMax)
+	}
 	return 0
 }
 

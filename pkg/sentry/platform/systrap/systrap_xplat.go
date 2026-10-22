@@ -75,4 +75,7 @@ type ProbeInfo struct {
 	// RoundTrip is the mean time of one guest system call round trip,
 	// from the guest svc through the Sentry back to the guest.
 	RoundTrip time.Duration
+	// UserMin and UserMax bound the guest address range. The platform derives
+	// them from the layout of the stub task, so they differ between hosts.
+	UserMin, UserMax uint64
 }

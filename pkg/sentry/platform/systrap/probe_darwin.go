@@ -74,6 +74,8 @@ func Probe() (ProbeInfo, error) {
 		PageSize:        int(p.host.hello.PageSize),
 		StubPID:         p.host.tmpl.pid,
 		ProtocolVersion: p.host.hello.Version,
+		UserMin:         p.userMin,
+		UserMax:         p.userMax,
 	}
 	as, err := newAddressSpace(p)
 	if err != nil {

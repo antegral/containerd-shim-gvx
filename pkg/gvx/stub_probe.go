@@ -32,6 +32,9 @@ type StubInfo struct {
 	ProtocolVersion uint32
 	// RoundTrip is the mean time of one guest system call round trip.
 	RoundTrip time.Duration
+	// UserMin and UserMax bound the guest address range. They are zero when the
+	// engine does not report a range.
+	UserMin, UserMax uint64
 }
 
 // ProbeStub spawns the systrap stub, completes the handshake, measures one
