@@ -348,12 +348,23 @@ func (st *auditState) auditAgainstUpstream(abs, relSlash string, tier IsolationT
 	}
 	if hasRule && rule.Kind == PatchExpand {
 		st.ruleUsed[rule.Path] = true
-		set, err := buildSet(path.Base(relSlash), repoBytes, nonLinuxTargets)
+		set, err := buildSetPlain(path.Base(relSlash), repoBytes, nonLinuxTargets)
 		if err != nil {
 			return err
 		}
 		if !allTrue(set) {
 			st.violations = append(st.violations, fmt.Errorf("%w: %s must build on every non-Linux target (allowlist line %d)", errPatchMismatch, relSlash, rule.Line))
+		}
+	}
+	if hasRule && rule.Kind == PatchLinuxOnly && (class == ClassPristine || class == ClassFormat) {
+		// An untouched file in a linux-only scope must already be Linux-only, including under -race, -msan, and -asan.
+		set, err := buildSet(path.Base(relSlash), repoBytes, nonLinuxTargets)
+		if err != nil {
+			return err
+		}
+		if i := slices.Index(set, true); i >= 0 {
+			st.violations = append(st.violations, fmt.Errorf("%w: %s compiles on %s but allowlist line %d fences it; run -mode=retag",
+				errPatchMismatch, relSlash, buildCases(nonLinuxTargets)[i], rule.Line))
 		}
 	}
 	switch class {

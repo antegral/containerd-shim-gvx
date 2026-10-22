@@ -287,7 +287,7 @@ func TestX18RestartPhases(t *testing.T) {
 // left alone by the scan.
 func TestLiteralWordsMarksPools(t *testing.T) {
 	// ldr x0, .+8 at offset 0 reads offsets 8 and 12. ldr q0, .+16 at offset 4 reads offsets 20..32.
-	code := words(0x58000040, 0x9c000080, 0x12345678, 0x12345679, insnNOP, 0, 0, 0, 0)
+	code := words(0x58000040, 0x9c000080, 0x12345678, 0x12345679, arm64NOP, 0, 0, 0, 0)
 	marks := literalWords(code)
 	for _, off := range []int{8, 12, 20, 24, 28, 32} {
 		if _, ok := marks[off]; !ok {

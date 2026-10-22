@@ -310,3 +310,86 @@ func TestFilenameGOOS(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildSetEvaluatesSanitizerTagSets(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		src  string
+		tag  string
+	}{
+		{"race", "//go:build race\n\npackage x\n", "race"},
+		{"msan", "//go:build msan\n// +build msan\n\npackage x\n", "msan"},
+		{"asan", "//go:build asan && amd64\n\npackage x\n", "asan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			plain, err := buildSetPlain("a.go", []byte(tc.src), nonLinuxTargets)
+			if err != nil || anyTrue(plain) {
+				t.Fatalf("plain build set = %v, %v; want no target to compile the file", plain, err)
+			}
+			tagged, err := buildSet("a.go", []byte(tc.src), nonLinuxTargets)
+			if err != nil || !anyTrue(tagged) {
+				t.Fatalf("tagged build set = %v, %v; want some case to compile the file", tagged, err)
+			}
+			for i, c := range buildCases(nonLinuxTargets) {
+				if tagged[i] && (len(c.tags) != 1 || c.tags[0] != tc.tag) {
+					t.Errorf("file compiles in %s, want only -tags %s", c, tc.tag)
+				}
+			}
+
+			patched, changed, err := applyPatch("pkg/x/a.go", []byte(tc.src), Patch{Kind: PatchLinuxOnly})
+			if err != nil || !changed {
+				t.Fatalf("applyPatch = %q, %v, %v; want a fence", patched, changed, err)
+			}
+			if !strings.Contains(string(patched), "//go:build linux && "+tc.tag) {
+				t.Errorf("fenced file = %q, want a linux && %s constraint", patched, tc.tag)
+			}
+			if strings.Contains(string(patched), "+build") {
+				t.Errorf("fenced file kept a stale // +build line: %q", patched)
+			}
+			after, err := buildSet("a.go", patched, nonLinuxTargets)
+			if err != nil || anyTrue(after) {
+				t.Fatalf("fenced file still compiles on a non-Linux case: %v, %v", after, err)
+			}
+			linux, err := buildSet("a.go", patched, linuxTargets)
+			if err != nil || !anyTrue(linux) {
+				t.Fatalf("fenced file no longer compiles on Linux: %v, %v", linux, err)
+			}
+			if _, again, err := applyPatch("pkg/x/a.go", patched, Patch{Kind: PatchLinuxOnly}); err != nil || again {
+				t.Fatalf("fence is not idempotent: changed=%v err=%v", again, err)
+			}
+		})
+	}
+}
+
+func TestExpandRuleIgnoresSanitizerTags(t *testing.T) {
+	t.Parallel()
+
+	// An unconstrained file compiles everywhere with every tag set; expand must leave it alone.
+	if _, changed, err := applyPatch("pkg/x/a.go", []byte("package x\n"), Patch{Kind: PatchExpand}); err != nil || changed {
+		t.Fatalf("expand on unconstrained file: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestAuditFlagsSanitizerFileThatEscapesTheFence(t *testing.T) {
+	t.Parallel()
+
+	up := with(baseUpstream(), "pkg/hostsyscall/race.go", "//go:build race\n\npackage hostsyscall\n")
+	unfenced := with(cleanRepo(), "pkg/hostsyscall/race.go", "//go:build race\n\npackage hostsyscall\n")
+	fenced := with(cleanRepo(), "pkg/hostsyscall/race.go", "//go:build linux && race\n\npackage hostsyscall\n")
+	patches := "linux-only pkg/hostsyscall/\n"
+
+	if _, err := (auditFixture{upstream: up, repo: with(unfenced, "pkg/hostsyscall/sys.go", "//go:build linux\n\npackage hostsyscall\n"), patches: patches}).run(t); !errors.Is(err, errPatchMismatch) {
+		t.Fatalf("unfenced race file: err = %v, want %v", err, errPatchMismatch)
+	}
+	report, err := auditFixture{upstream: up, repo: with(fenced, "pkg/hostsyscall/sys.go", "//go:build linux\n\npackage hostsyscall\n"), patches: patches}.run(t)
+	if err != nil {
+		t.Fatalf("fenced race file failed the audit: %v", err)
+	}
+	if report.Fence != 2 || report.Budgeted != 0 {
+		t.Fatalf("report = %+v, want two fences outside the budget", report)
+	}
+}

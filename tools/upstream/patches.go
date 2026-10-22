@@ -219,13 +219,42 @@ func LoadPatchSet(allowlistPath string) (_ *PatchSet, err error) {
 	return ps, nil
 }
 
-// matchesTarget reports whether the Go toolchain compiles the file for goos/goarch.
+// sanitizerTagSets lists the optional build tags that change which files the compiler selects.
+// The first entry is the plain build. `go test -race`, `-msan`, and `-asan` each add one tag.
+var sanitizerTagSets = [][]string{nil, {"race"}, {"msan"}, {"asan"}}
+
+// buildCase is one compiler configuration: a target plus a sanitizer tag set.
+type buildCase struct {
+	target buildTarget
+	tags   []string
+}
+
+func (c buildCase) String() string {
+	if len(c.tags) == 0 {
+		return c.target.goos + "/" + c.target.goarch
+	}
+	return c.target.goos + "/" + c.target.goarch + " with -tags " + strings.Join(c.tags, ",")
+}
+
+// buildCases returns every target and sanitizer tag set combination, in buildSet result order.
+func buildCases(targets []buildTarget) []buildCase {
+	cases := make([]buildCase, 0, len(targets)*len(sanitizerTagSets))
+	for _, t := range targets {
+		for _, tags := range sanitizerTagSets {
+			cases = append(cases, buildCase{target: t, tags: tags})
+		}
+	}
+	return cases
+}
+
+// matchesCase reports whether the Go toolchain compiles the file in configuration c.
 // It applies file-name suffixes and //go:build lines exactly as `go build` does.
-func matchesTarget(name string, src []byte, t buildTarget) (bool, error) {
+func matchesCase(name string, src []byte, c buildCase) (bool, error) {
 	ctx := build.Context{
-		GOOS:        t.goos,
-		GOARCH:      t.goarch,
+		GOOS:        c.target.goos,
+		GOARCH:      c.target.goarch,
 		Compiler:    "gc",
+		BuildTags:   c.tags,
 		ReleaseTags: build.Default.ReleaseTags,
 		OpenFile: func(string) (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(src)), nil
@@ -233,16 +262,30 @@ func matchesTarget(name string, src []byte, t buildTarget) (bool, error) {
 	}
 	ok, err := ctx.MatchFile("/virtual", name)
 	if err != nil {
-		return false, fmt.Errorf("match build constraints of %s for %s/%s: %w", name, t.goos, t.goarch, err)
+		return false, fmt.Errorf("match build constraints of %s for %s: %w", name, c, err)
 	}
 	return ok, nil
 }
 
-// buildSet returns, for each target in targets, whether the file compiles there.
+// buildSet returns, for each case of buildCases(targets), whether the file compiles there.
+// Sanitizer tags matter: a file tagged only `race` compiles on every OS under `go test -race`.
 func buildSet(name string, src []byte, targets []buildTarget) ([]bool, error) {
-	out := make([]bool, len(targets))
+	return evalCases(name, src, buildCases(targets))
+}
+
+// buildSetPlain evaluates the file without sanitizer tags, one result per target.
+func buildSetPlain(name string, src []byte, targets []buildTarget) ([]bool, error) {
+	cases := make([]buildCase, len(targets))
 	for i, t := range targets {
-		ok, err := matchesTarget(name, src, t)
+		cases[i] = buildCase{target: t}
+	}
+	return evalCases(name, src, cases)
+}
+
+func evalCases(name string, src []byte, cases []buildCase) ([]bool, error) {
+	out := make([]bool, len(cases))
+	for i, c := range cases {
+		ok, err := matchesCase(name, src, c)
 		if err != nil {
 			return nil, err
 		}
@@ -332,7 +375,7 @@ func linuxFenceExpr(cur, extra string) (string, error) {
 func applyPatch(relSlash string, src []byte, rule Patch) ([]byte, bool, error) {
 	switch rule.Kind {
 	case PatchExpand:
-		set, err := buildSet(path.Base(relSlash), src, nonLinuxTargets)
+		set, err := buildSetPlain(path.Base(relSlash), src, nonLinuxTargets)
 		if err != nil {
 			return nil, false, err
 		}

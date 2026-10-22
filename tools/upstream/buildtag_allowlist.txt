@@ -38,6 +38,9 @@ seam pkg/sentry/fsimpl/erofs/filesystem.go
 expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !pagesize_64k && !pagesize_16k
 expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !pagesize_64k && !pagesize_16k
 
+# Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno.go).
+seam pkg/syserr/syserr.go
+
 # pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
 expr pkg/memutil/memutil_unsafe.go linux || darwin
 expr pkg/memutil/mmap.go linux || darwin

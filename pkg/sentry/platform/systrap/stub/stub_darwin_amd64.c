@@ -303,6 +303,9 @@ static int kick_thread(uint64_t index) {
 #ifdef GV_PROFILE_OVERRIDE
 static const char sandbox_child[] = GV_PROFILE_OVERRIDE;
 #else
+#ifdef GV_PROFILE_OVERRIDE
+static const char sandbox_child[] = GV_PROFILE_OVERRIDE;
+#else
 static const char sandbox_child[] =
     "(version 1)\n"
     "(deny default)\n"
@@ -311,6 +314,7 @@ static const char sandbox_child[] =
     "(deny syscall-mach" GV_DENY_ACTION ")\n"
     "(allow syscall-mach (machtrap-number " GV_ALLOW_MACH "))\n"
     "(deny syscall-mig" GV_DENY_ACTION ")\n";
+#endif
 #endif
 
 typedef struct {

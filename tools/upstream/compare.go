@@ -7,6 +7,7 @@ import (
 	"go/build/constraint"
 	"go/format"
 	"path"
+	"slices"
 	"strings"
 )
 
@@ -182,6 +183,10 @@ func dropPlusBuild(src []byte) []byte {
 // and that it keeps every Linux target building as before.
 func verifyConstraintPatch(in compareInput, repoExpr string) (FileClass, error) {
 	base := path.Base(in.relSlash)
+	repoNonPlain, err := buildSetPlain(base, in.repo, nonLinuxTargets)
+	if err != nil {
+		return 0, err
+	}
 	repoNon, err := buildSet(base, in.repo, nonLinuxTargets)
 	if err != nil {
 		return 0, err
@@ -204,7 +209,7 @@ func verifyConstraintPatch(in compareInput, repoExpr string) (FileClass, error) 
 		if repoExpr != mustParseString(want) {
 			return 0, fmt.Errorf("%w: %s has %q, rule on line %d wants %q", errPatchMismatch, in.relSlash, repoExpr, in.rule.Line, want)
 		}
-		if !allTrue(repoNon) {
+		if !allTrue(repoNonPlain) {
 			return 0, fmt.Errorf("%w: %s does not build on every non-Linux target", errPatchMismatch, in.relSlash)
 		}
 		return ClassExpand, requireLinuxSuperset(in.relSlash, repoLin, upLin)
@@ -214,18 +219,19 @@ func verifyConstraintPatch(in compareInput, repoExpr string) (FileClass, error) 
 		}
 		return ClassExpand, nil
 	case PatchLinuxOnly:
-		if anyTrue(repoNon) {
-			return 0, fmt.Errorf("%w: %s still builds on a non-Linux target", errPatchMismatch, in.relSlash)
+		if i := slices.Index(repoNon, true); i >= 0 {
+			return 0, fmt.Errorf("%w: %s still builds on %s", errPatchMismatch, in.relSlash, buildCases(nonLinuxTargets)[i])
 		}
 		if !anyTrue(upNon) {
 			return 0, fmt.Errorf("%w: %s", errRedundantPatch, in.relSlash)
 		}
+		cases := buildCases(linuxTargets)
 		for i := range repoLin {
 			if repoLin[i] && !upLin[i] {
-				return 0, fmt.Errorf("%w: %s builds on %s/%s where upstream does not", errPatchMismatch, in.relSlash, linuxTargets[i].goos, linuxTargets[i].goarch)
+				return 0, fmt.Errorf("%w: %s builds on %s where upstream does not", errPatchMismatch, in.relSlash, cases[i])
 			}
 			if in.rule.Expr == "" && upLin[i] && !repoLin[i] {
-				return 0, fmt.Errorf("%w: %s stopped building on %s/%s", errPatchMismatch, in.relSlash, linuxTargets[i].goos, linuxTargets[i].goarch)
+				return 0, fmt.Errorf("%w: %s stopped building on %s", errPatchMismatch, in.relSlash, cases[i])
 			}
 		}
 		return ClassFence, nil
@@ -237,9 +243,10 @@ func verifyConstraintPatch(in compareInput, repoExpr string) (FileClass, error) 
 }
 
 func requireLinuxSuperset(relSlash string, repoLin, upLin []bool) error {
+	cases := buildCases(linuxTargets)
 	for i := range upLin {
 		if upLin[i] && !repoLin[i] {
-			return fmt.Errorf("%w: %s stopped building on %s/%s", errPatchMismatch, relSlash, linuxTargets[i].goos, linuxTargets[i].goarch)
+			return fmt.Errorf("%w: %s stopped building on %s", errPatchMismatch, relSlash, cases[i])
 		}
 	}
 	return nil
