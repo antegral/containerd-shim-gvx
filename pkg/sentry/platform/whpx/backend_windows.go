@@ -257,7 +257,7 @@ func (b *winBackend) setRegs(index uint32, rb *regBatch) error {
 	// already in an unknown state, so the extra calls cost nothing.
 	for i := range names {
 		if one := call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
-			b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[i])), 1, uintptr(unsafe.Pointer(&vals[i]))); one != nil {
+			b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[i])), 1, uintptr(unsafe.Pointer(&vals[i*regValueSize]))); one != nil {
 			return fmt.Errorf("%w (register name %#x is refused: %v)", err, names[i], one)
 		}
 	}

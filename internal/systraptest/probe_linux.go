@@ -17,6 +17,8 @@
 package systraptest
 
 import (
+	"errors"
+
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/platform/systrap"
 )
@@ -25,6 +27,9 @@ import (
 // missing-prerequisite error, so any start failure counts as one: the host
 // forbids what the platform needs, for example ptrace of a child.
 func probe() (missing bool, err error) {
+	if cgoBuild {
+		return true, errors.New("the upstream systrap platform hangs while it starts in a cgo build (race builds use cgo)")
+	}
 	if _, err := systrap.New(platform.Options{}); err != nil {
 		return true, err
 	}

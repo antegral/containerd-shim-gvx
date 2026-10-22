@@ -205,8 +205,17 @@ func TestGrantsAccess(t *testing.T) {
 				t.Fatalf("DACL: %v", err)
 			}
 			if got := grantsAccess(dacl, logon, tt.mask); got != tt.want {
-				t.Fatalf("grantsAccess = %v, want %v for mask %#x and descriptor %q (parsed as %q)",
-					got, tt.want, uint32(tt.mask), tt.sddl, sd.String())
+				var entries []string
+				for i := uint32(0); i < uint32(dacl.AceCount); i++ {
+					var ace *windows.ACCESS_ALLOWED_ACE
+					if err := windows.GetAce(dacl, i, &ace); err != nil {
+						entries = append(entries, fmt.Sprintf("GetAce(%d): %v", i, err))
+						continue
+					}
+					entries = append(entries, fmt.Sprintf("type %d flags %#x mask %#x", ace.Header.AceType, ace.Header.AceFlags, uint32(ace.Mask)))
+				}
+				t.Fatalf("grantsAccess = %v, want %v for mask %#x and %d entries: %q",
+					got, tt.want, uint32(tt.mask), dacl.AceCount, entries)
 			}
 		})
 	}

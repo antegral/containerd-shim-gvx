@@ -493,7 +493,7 @@ Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framew
 
 #### Linux Lockdown Sequence (`lockdown_linux.go`) (Procedural Module)
 
-Execute these steps in `lockdown_linux.go` after opening the `systrap` platform, cached `.erofs` layer descriptors, network sockets, and the `/workspace` directory. The build must not use cgo, because the Go runtime runs one system call on every thread only without cgo.
+Execute these steps in `lockdown_linux.go` after opening the `systrap` platform, cached `.erofs` layer descriptors, network sockets, and the `/workspace` directory. The build must not use cgo. The Go runtime runs one system call on every thread only without cgo, and the upstream `systrap` platform hangs while it starts in a cgo build.
 
 1. Query the Landlock ABI version with `landlock_create_ruleset`. Return `ErrUnsupported` when the kernel lacks Landlock.
 2. Create a ruleset that handles every file access right of the ABI. Handle TCP bind and connect from ABI 4 on, unless the options allow outbound traffic.

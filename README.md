@@ -40,7 +40,7 @@ Run an unmodified OCI image or ELF binary from the CLI via `cmd/rungv`, or embed
 Use these steps to compile `rungv` and run an unmodified OCI image on Windows or macOS:
 
 > [!IMPORTANT]
-> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On Linux, build with `CGO_ENABLED=0`, because the host lockdown restricts every thread. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
+> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On Linux, build with `CGO_ENABLED=0`. The upstream systrap platform hangs in a cgo build, and the host lockdown restricts every thread. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
 
 1. Build `rungv` with the standard Go 1.25+ toolchain (and apply ad-hoc signing on macOS for `hvf`).
 2. Run an unmodified OCI image (`nginx:alpine`) with `-p 8080:80` port forwarding and `-net=nat` networking.
