@@ -110,10 +110,12 @@ func (sp *stubProc) deathError() error {
 // has the guest window reserved, the loader finished, and its initial thread
 // parked for good.
 func (p *Platform) bringUpStub() (*stubProc, error) {
+	t0 := time.Now()
 	sh, err := p.host.newStub()
 	if err != nil {
 		return nil, err
 	}
+	bringUpStats.hostNs.Add(uint64(time.Since(t0)))
 	sp := &stubProc{
 		p: p, pid: sh.pid, proc: sh.proc, main: sh.thread, level: sh.level,
 		threads: make(map[uint32]*thread),
@@ -129,9 +131,12 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	th0.ctx = nil // The initial thread never runs guest code.
 	sp.threads[sh.tid] = th0
 	p.dbg.register(sp)
+	t1 := time.Now()
 	if err := virtualAllocPlaceholder(sp.proc, uintptr(winBase), uintptr(winLimit-winBase)); err != nil {
 		return fail(fmt.Errorf("%w: %v", errWindowTaken, err))
 	}
+	bringUpStats.windowNs.Add(uint64(time.Since(t1)))
+	t2 := time.Now()
 	if err := ntResumeThread(sp.main); err != nil {
 		return fail(err)
 	}
@@ -147,6 +152,8 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	if err := p.dbg.reply(ev); err != nil {
 		return fail(err)
 	}
+	bringUpStats.loaderNs.Add(uint64(time.Since(t2)))
+	bringUpStats.stubs.Add(1)
 	return sp, nil
 }
 
@@ -205,6 +212,8 @@ func (sp *stubProc) newGuestThread() (*thread, error) {
 	if sp.dead.Load() {
 		return nil, sp.deathError()
 	}
+	start := time.Now()
+	defer func() { bringUpStats.threadNs.Add(uint64(time.Since(start))) }()
 	h, err := ntCreateThreadEx(sp.proc, sp.p.breakAddr, true)
 	if err != nil {
 		return nil, err

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -182,6 +183,8 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 		win:    newWindowMap(stubView{sp.proc}, winBase, winLimit),
 		blocks: make(map[uint64]*execBlock),
 	}
+	pagesStart := time.Now()
+	defer func() { bringUpStats.pagesNs.Add(uint64(time.Since(pagesStart))) }()
 	if err := as.setupInternal(); err != nil {
 		sp.destroy()
 		return nil, fmt.Errorf("map the engine pages of the stub: %w", err)

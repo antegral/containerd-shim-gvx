@@ -105,6 +105,23 @@ var stopStats struct {
 	waitNs   [stopKinds]atomic.Uint64
 }
 
+// bringUpStats adds up the time of each phase of a stub bring-up, in
+// nanoseconds, for the watch trace.
+var bringUpStats struct {
+	stubs                                         atomic.Uint64
+	hostNs, windowNs, loaderNs, pagesNs, threadNs atomic.Uint64
+}
+
+func bringUpLine() string {
+	n := bringUpStats.stubs.Load()
+	if n == 0 {
+		return "no stub"
+	}
+	avg := func(a *atomic.Uint64) float64 { return float64(a.Load()) / float64(n) / 1e6 }
+	return fmt.Sprintf("%d stubs, ms for each: host %.1f, window %.1f, loader %.1f, engine pages %.1f, first thread %.1f",
+		n, avg(&bringUpStats.hostNs), avg(&bringUpStats.windowNs), avg(&bringUpStats.loaderNs), avg(&bringUpStats.pagesNs), avg(&bringUpStats.threadNs))
+}
+
 func kindOf(ev debugEvent) stopKind {
 	switch {
 	case ev.State == dbgStateSingleStep:
@@ -127,7 +144,7 @@ func statsLine() string {
 	for k := stopKind(0); k < stopKinds; k++ {
 		fmt.Fprintf(&b, " %s %d %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6, stopStats.waitNs[k].Load()/1e6)
 	}
-	return strings.TrimSuffix(b.String(), ",")
+	return strings.TrimSuffix(b.String(), ",") + "; " + bringUpLine()
 }
 
 func tracef(format string, args ...any) {
