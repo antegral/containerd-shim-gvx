@@ -35,16 +35,22 @@ func TestStubPrintsHandshakeData(t *testing.T) {
 		`host page size: (\d+)\n` +
 		`stub pid: (\d+)\n` +
 		`protocol version: (\d+)\n` +
-		`syscall round trip: (\S+)\n$`)
+		`syscall round trip: (\S+)\n` +
+		`guest address range: 0x([0-9a-f]+)-0x([0-9a-f]+)\n$`)
 	m := re.FindStringSubmatch(stdout)
 	if m == nil {
-		t.Fatalf("rungv stub stdout = %q, want the five reported fields", stdout)
+		t.Fatalf("rungv stub stdout = %q, want the six reported fields", stdout)
 	}
 	if page, _ := strconv.Atoi(m[1]); page != 16384 {
 		t.Errorf("host page size = %s, want 16384", m[1])
 	}
 	if pid, _ := strconv.Atoi(m[2]); pid <= 0 {
 		t.Errorf("stub pid = %s, want a positive pid", m[2])
+	}
+	lo, _ := strconv.ParseUint(m[5], 16, 64)
+	hi, _ := strconv.ParseUint(m[6], 16, 64)
+	if lo == 0 || hi <= lo || lo%16384 != 0 || hi%16384 != 0 {
+		t.Errorf("guest address range = %#x-%#x, want page-aligned bounds with lo < hi", lo, hi)
 	}
 	rt, err := time.ParseDuration(m[4])
 	if err != nil || rt <= 0 {
