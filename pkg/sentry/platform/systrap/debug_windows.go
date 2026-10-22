@@ -56,7 +56,12 @@ const eventSlots = 2
 
 // traceEvents turns on a log of every stop on standard error. A test sets it
 // with GVX_SYSTRAP_TRACE=1 to learn why a guest stopped.
-var traceEvents = os.Getenv("GVX_SYSTRAP_TRACE") != ""
+var (
+	traceEvents = os.Getenv("GVX_SYSTRAP_TRACE") != ""
+	// traceAll also prints the stops of patched traps, which are system calls
+	// and the repairs that the engine makes. GVX_SYSTRAP_TRACE=2 sets it.
+	traceAll = os.Getenv("GVX_SYSTRAP_TRACE") == "2"
+)
 
 var (
 	traceLines atomic.Int64
@@ -66,7 +71,7 @@ var (
 )
 
 func tracef(format string, args ...any) {
-	if traceMuted.Load() || traceLines.Add(1) > 300 {
+	if traceMuted.Load() || traceLines.Add(1) > 400 {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "systrap: "+format+"\n", args...)

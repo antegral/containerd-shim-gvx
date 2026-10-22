@@ -158,11 +158,14 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
-	if traceEvents && !traceMuted.Load() {
-		tracef("thread %d: state %d code %#x addr %#x info %#x first %d, pc %#x sp %#x code bytes % x", th.tid, ev.State, ev.Code, ev.Addr, ev.Info, ev.FirstChance, th.ctx.pc(), th.ctx.sp(), as.codeBytes(th.ctx.pc(), 16))
+	if traceAll && !traceMuted.Load() {
+		th.traceStop(as, ev)
 	}
 	if out, ok := th.archEvent(as, ac, ev); ok {
 		return out
+	}
+	if traceEvents && !traceAll && !traceMuted.Load() {
+		th.traceStop(as, ev)
 	}
 	switch ev.State {
 	case dbgStateSingleStep:
@@ -196,6 +199,12 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
 	}
 	return fatal(fmt.Errorf("the stub reported exception %#x at %#x (pc %#x)", ev.Code, ev.Addr, th.ctx.pc()), unix.EFAULT)
+}
+
+// traceStop prints one stop for GVX_SYSTRAP_TRACE.
+func (th *thread) traceStop(as *addressSpace, ev debugEvent) {
+	tracef("thread %d: state %d code %#x addr %#x info %#x first %d, pc %#x sp %#x code bytes % x",
+		th.tid, ev.State, ev.Code, ev.Addr, ev.Info, ev.FirstChance, th.ctx.pc(), th.ctx.sp(), as.codeBytes(th.ctx.pc(), 16))
 }
 
 // stopAndPull parks the thread at an exception and copies its registers into
