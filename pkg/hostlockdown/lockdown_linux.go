@@ -60,6 +60,10 @@ const (
 	// landlockNetABI is the first ABI that restricts TCP bind and connect.
 	landlockNetABI = 4
 
+	// landlockSyncABI is the first ABI that has LANDLOCK_RESTRICT_SELF_TSYNC.
+	// Without the flag, each thread would get its own domain.
+	landlockSyncABI = 8
+
 	// rulesetSizeV1 and rulesetSizeV4 are the sizes of the ruleset attribute
 	// before and after the network fields.
 	rulesetSizeV1 = 8
@@ -122,8 +126,9 @@ func applyOSLockdown(opts Options) (Status, error) {
 	if err != nil {
 		return Status{}, fmt.Errorf("%w: Landlock is unavailable (Linux 5.13 or newer with Landlock enabled): %v", ErrUnsupported, err)
 	}
-	if abi < 1 {
-		return Status{}, fmt.Errorf("%w: Landlock ABI %d", ErrUnsupported, abi)
+	if abi < landlockSyncABI {
+		return Status{}, fmt.Errorf("%w: Landlock ABI %d, but the lockdown needs ABI %d (LANDLOCK_RESTRICT_SELF_TSYNC) to put all threads in one domain",
+			ErrUnsupported, abi, landlockSyncABI)
 	}
 
 	fs := handledFS(abi)
@@ -162,9 +167,6 @@ func applyOSLockdown(opts Options) (Status, error) {
 	// trace only a process in its own domain or in a child domain. The upstream
 	// systrap platform traces its stub processes from many threads.
 	if _, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(rulesetFD), unix.LANDLOCK_RESTRICT_SELF_TSYNC, 0); errno != 0 {
-		if errno == unix.EINVAL {
-			return Status{}, fmt.Errorf("%w: the kernel lacks LANDLOCK_RESTRICT_SELF_TSYNC, which one shared domain needs", ErrUnsupported)
-		}
 		return Status{}, fmt.Errorf("hostlockdown: landlock_restrict_self: %w", errno)
 	}
 

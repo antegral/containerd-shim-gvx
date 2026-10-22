@@ -169,7 +169,7 @@ On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTo
 
 On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(deny default)` Seatbelt profile through `sandbox_init`. The profile denies process creation and new host file opens. After `Apply`, `getaddrinfo` and reads of `/etc/resolv.conf` fail, so `pkg/netbackend` reads the DNS resolvers before the lockdown.
 
-On Linux (`lockdown_linux.go`), it sets `PR_SET_NO_NEW_PRIVS` and a Landlock domain on every thread. The domain denies every new file access outside the workspace, including `execve`, and blocks new TCP connections when the kernel supports Landlock ABI 4. It needs a Linux kernel with Landlock and the `LANDLOCK_RESTRICT_SELF_TSYNC` flag, and a build without cgo. A host without Landlock returns `ErrUnsupported`. Landlock does not restrict UDP.
+On Linux (`lockdown_linux.go`), it sets `PR_SET_NO_NEW_PRIVS` and a Landlock domain on every thread. The domain denies every new file access outside the workspace, including `execve`, and blocks new TCP connections when the kernel supports Landlock ABI 4. It needs Landlock ABI 8 (the `LANDLOCK_RESTRICT_SELF_TSYNC` flag) and a build without cgo. An older kernel returns `ErrUnsupported`, and `rungv` then refuses to run unless you pass `-lockdown=false`. Landlock does not restrict UDP.
 
 ### 3.6 Upstream Tracking and Three-Tier Isolation
 

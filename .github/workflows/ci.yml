@@ -109,8 +109,14 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
+            no_landlock: ""
+          # The arm64 image runs a kernel older than Landlock ABI 8. The
+          # lockdown refuses to start there, and the steps expect the refusal.
           - arch: arm64
             runner: ubuntu-24.04-arm
+            no_landlock: "1"
+    env:
+      GVX_ALLOW_NO_LANDLOCK: ${{ matrix.no_landlock }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -139,9 +145,16 @@ jobs:
           GVX_DEBUG_LOG: "1"
         run: |
           mkdir -p workspace
-          ./rungv run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
-          cat smoke.out
-          grep -q gvx-smoke-ok smoke.out
+          if ./rungv run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err; then
+            cat smoke.out
+            grep -q gvx-smoke-ok smoke.out
+          elif [ "$GVX_ALLOW_NO_LANDLOCK" = 1 ] && grep -q "LANDLOCK_RESTRICT_SELF_TSYNC" smoke.err; then
+            echo "::notice::The kernel lacks Landlock ABI 8. rungv refused to run the guest without the lockdown."
+            cat smoke.err
+          else
+            cat smoke.err
+            exit 1
+          fi
 
   darwin-arm64:
     name: test darwin/arm64

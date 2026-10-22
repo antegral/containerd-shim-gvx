@@ -40,13 +40,18 @@ func runChild(t *testing.T, name string, env ...string) (string, error) {
 	return string(out), err
 }
 
-// skipUnlessLockable skips a child that runs where the Linux lockdown cannot
-// apply: a cgo build, or a kernel without Landlock.
+// skipUnlessLockable fails a child that runs where the Linux lockdown cannot
+// apply, unless GVX_ALLOW_NO_LANDLOCK=1 names the host as a known case: a
+// kernel older than Landlock ABI 8, or a cgo build.
 func skipUnlessLockable(t *testing.T, err error) {
 	t.Helper()
-	if errors.Is(err, ErrUnsupported) {
+	if !errors.Is(err, ErrUnsupported) {
+		return
+	}
+	if os.Getenv("GVX_ALLOW_NO_LANDLOCK") == "1" {
 		t.Skipf("the host cannot apply the Linux lockdown: %v", err)
 	}
+	t.Fatalf("the host cannot apply the Linux lockdown: %v (set GVX_ALLOW_NO_LANDLOCK=1 to skip on a known host)", err)
 }
 
 func TestLinuxLockdownBlocksExecAndUnboundOpens(t *testing.T) {
