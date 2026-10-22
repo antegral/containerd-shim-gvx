@@ -125,24 +125,29 @@ func New() (*Platform, error) {
 // regionLister reports the first mapping that ends above addr.
 type regionLister func(addr uint64) (hostRegion, bool, error)
 
-// userRangeFromRegions returns the widest guest address range that starts above
-// every permanent host reservation and ends before the next mapping of the stub
-// task or at sysBase.
+// userRangeFromRegions returns the widest address range below sysBase that no
+// mapping of the stub task touches.
 //
 // WHY: macOS gives every process permanent PROT_NONE reservations. On Apple
 // silicon they cover the 385GB range from 0xfc0000000 to 0x7000000000, and
 // they survive mach_vm_deallocate. A guest mapping there fails on the host
 // after the Sentry accepted it, and the guest dies with SIGBUS. V8 picks random
 // mmap hints and hits the range in about one run in eight. The stub task also
-// holds ordinary mappings, such as malloc zones, which macOS 15 places near
-// 0x600000000000. A guest mapping over one of them would replace it. The
-// stub cannot allocate after its sandbox starts, so these mappings never
-// move. The Sentry has no way to describe a hole inside the user address
-// range, so the range starts above the last reservation and ends at the first
-// mapping above that. The layout differs between macOS releases and machines,
-// so the Platform reads it from the template task.
+// holds ordinary mappings, and the libmalloc nano zone reserves 512MB near
+// 0x600000000000 on a macOS 15 virtual machine. A guest mapping over one of them
+// would replace it. The stub cannot allocate after its sandbox starts, so these
+// mappings never move. The Sentry has no way to describe a hole inside the user
+// address range, so the guest uses one gap. The layout differs between macOS
+// releases and machines, so the Platform reads it from the template task.
 func userRangeFromRegions(list regionLister) (lo, hi uint64, err error) {
-	var regions []hostRegion
+	consider := func(a, b uint64) {
+		a = (a + blockSize - 1) &^ (blockSize - 1)
+		b = min(b, sysBase) &^ (blockSize - 1)
+		if b > a && b-a > hi-lo {
+			lo, hi = a, b
+		}
+	}
+	prev := uint64(userFloor)
 	for addr := uint64(userFloor); addr < sysBase; {
 		r, ok, err := list(addr)
 		if err != nil {
@@ -154,25 +159,13 @@ func userRangeFromRegions(list regionLister) (lo, hi uint64, err error) {
 		if r.size == 0 {
 			return 0, 0, fmt.Errorf("mach_vm_region returned an empty region at %#x", r.start)
 		}
-		regions = append(regions, r)
+		consider(prev, r.start)
+		prev = max(prev, r.start+r.size)
 		addr = r.start + r.size
 	}
-	lo = userFloor
-	for _, r := range regions {
-		if r.reserved && r.start+r.size > lo {
-			lo = r.start + r.size
-		}
-	}
-	lo = (lo + blockSize - 1) &^ (blockSize - 1)
-	hi = sysBase
-	for _, r := range regions {
-		if r.start >= lo {
-			hi = r.start &^ (blockSize - 1)
-			break
-		}
-	}
+	consider(prev, sysBase)
 	if hi <= lo {
-		return 0, 0, fmt.Errorf("the host leaves no guest address range between %#x and %#x", lo, hi)
+		return 0, 0, fmt.Errorf("the host leaves no guest address range between %#x and %#x", uint64(userFloor), uint64(sysBase))
 	}
 	return lo, hi, nil
 }

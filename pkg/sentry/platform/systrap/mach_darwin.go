@@ -237,9 +237,6 @@ const (
 // hostRegion is one mapping of a task.
 type hostRegion struct {
 	start, size uint64
-	// reserved is true for a region without any access right. The kernel keeps
-	// such regions as permanent reservations, and no mapping can replace them.
-	reserved bool
 }
 
 // vmRegion returns the first mapping of task that ends above addr. It reports
@@ -263,9 +260,6 @@ func vmRegion(task machPort, addr uint64) (r hostRegion, ok bool, err error) {
 	if err := kr("mach_vm_region", ret); err != nil {
 		return hostRegion{}, false, err
 	}
-	// The first two words of vm_region_basic_info_64 are the current and the
-	// maximum protection.
-	r.reserved = info[0] == 0 && info[1] == 0
 	return r, true, nil
 }
 

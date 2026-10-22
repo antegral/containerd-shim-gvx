@@ -1022,35 +1022,37 @@ func TestUserRangeFromRegions(t *testing.T) {
 		return func(addr uint64) (hostRegion, bool, error) {
 			for _, r := range regions {
 				if r.start+r.size > addr {
-					start := max(r.start, addr)
-					return hostRegion{start: start, size: r.size - (start - r.start), reserved: r.reserved}, true, nil
+					return r, true, nil
 				}
 			}
 			return hostRegion{}, false, nil
 		}
 	}
-	permanent := []hostRegion{{0xf_c000_0000, 1 * gb, true}, {0x10_0000_0000, 0x180 * gb, true}}
+	permanent := []hostRegion{{0xf_c000_0000, 1 * gb}, {0x10_0000_0000, 0x180 * gb}}
 	for _, c := range []struct {
 		name           string
 		regions        []hostRegion
 		wantLo, wantHi uint64
 	}{
 		{"no mapping", nil, userFloor, sysBase},
-		{"stub image below the floor", []hostRegion{{0x1_0000_0000, 0x1000_0000, false}}, userFloor, sysBase},
+		{"stub image below the floor", []hostRegion{{0x1_0000_0000, 0x1000_0000}}, userFloor, sysBase},
 		{"permanent reservation", permanent, 0x70_0000_0000, sysBase},
 		{"removable reservations below a permanent one",
-			append([]hostRegion{{0x9_3400_0000, 12 * gb, true}, {0xc_3540_0000, 12 * gb, true}}, permanent...),
+			append([]hostRegion{{0x9_3400_0000, 12 * gb}, {0xc_3540_0000, 12 * gb}}, permanent...),
 			0x70_0000_0000, sysBase},
-		{"a reserved region that straddles the floor", []hostRegion{{0x3_c000_0000, 2 * gb, true}}, 0x4_4000_0000, sysBase},
-		{"sysmsg blocks above sysBase do not count", []hostRegion{{sysBase, 0x1000_0000, false}}, userFloor, sysBase},
-		{"unaligned end rounds up to a host page", []hostRegion{{0x8_0000_0000, 0x1000, true}}, 0x8_0000_4000, sysBase},
-		// macOS 15 places malloc zones near 0x600000000000. They are ordinary
-		// mappings, so the range ends before them and does not start above them.
-		{"an ordinary mapping ends the range", append(append([]hostRegion{}, permanent...), hostRegion{0x6000_0000_0000, 0x100000, false}), 0x70_0000_0000, 0x6000_0000_0000},
-		{"an ordinary mapping below the reservations is ignored", append([]hostRegion{{0x5_0000_0000, 0x10_0000, false}}, permanent...), 0x70_0000_0000, sysBase},
-		{"the first ordinary mapping above the start wins",
-			append(append([]hostRegion{}, permanent...), hostRegion{0x2000_0000_0000, 0x4000, false}, hostRegion{0x6000_0000_0000, 0x4000, false}),
-			0x70_0000_0000, 0x2000_0000_0000},
+		{"a region that straddles the floor", []hostRegion{{0x3_c000_0000, 2 * gb}}, 0x4_4000_0000, sysBase},
+		{"sysmsg blocks above sysBase do not count", []hostRegion{{sysBase, 0x1000_0000}}, userFloor, sysBase},
+		{"unaligned end rounds up to a host page", []hostRegion{{0x8_0000_0000, 0x1000}}, 0x8_0000_4000, sysBase},
+		// The libmalloc nano zone of a macOS 15 virtual machine: the larger gap
+		// lies below it.
+		{"a mapping near 0x600000000000 splits the range",
+			append(append([]hostRegion{}, permanent...), hostRegion{0x6000_0000_0000, 0x2000_0000}),
+			0x70_0000_0000, 0x6000_0000_0000},
+		{"the larger gap wins above a mapping",
+			append(append([]hostRegion{}, permanent...), hostRegion{0x1000_0000_0000, 0x2000_0000}),
+			0x1000_2000_0000, sysBase},
+		{"an ordinary mapping below the reservations is ignored",
+			append([]hostRegion{{0x5_0000_0000, 0x10_0000}}, permanent...), 0x70_0000_0000, sysBase},
 	} {
 		lo, hi, err := userRangeFromRegions(listerFor(c.regions))
 		if err != nil {
@@ -1062,12 +1064,8 @@ func TestUserRangeFromRegions(t *testing.T) {
 		}
 	}
 
-	if _, _, err := userRangeFromRegions(listerFor([]hostRegion{{userFloor, sysBase - userFloor, true}})); err == nil {
-		t.Error("a reservation that spans the whole range must fail")
-	}
-	if _, _, err := userRangeFromRegions(listerFor([]hostRegion{{0x70_0000_0000, 0x4000, false}, {0x70_0000_4000, 0x4000, true}})); err != nil {
-		// A mapping at the very start leaves a range after the reserved region that follows it.
-		t.Errorf("mapping then reservation: %v", err)
+	if _, _, err := userRangeFromRegions(listerFor([]hostRegion{{userFloor, sysBase - userFloor}})); err == nil {
+		t.Error("a mapping that spans the whole range must fail")
 	}
 	boom := errors.New("task is gone")
 	if _, _, err := userRangeFromRegions(func(uint64) (hostRegion, bool, error) { return hostRegion{}, false, boom }); !errors.Is(err, boom) {

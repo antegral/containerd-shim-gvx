@@ -441,7 +441,7 @@ Execute these steps in `pkg/oci` before calling `hostlockdown.Apply()`:
 
 `hostfs` anchors the workspace mount using Go 1.25+ `os.OpenRoot(hostWorkspacePath)` before sandbox lockdown. On Windows (`inode_windows.go`), every file open invokes `NtCreateFile` with `OBJECT_ATTRIBUTES.RootDirectory` pinned to the `os.Root` handle and enforces `FILE_OPEN_REPARSE_POINT`. On macOS (`inode_darwin.go`), `os.OpenRoot` uses `openat(dirfd, ..., O_NOFOLLOW | O_SYMLINK)` so the XNU kernel never traverses symbolic links or firmlinks pointing outside `/workspace`.
 
-On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` and `unlink(2)` on open files via `SetFileInformationByHandle(FileRenameInfoEx)` with `FILE_RENAME_FLAG_POSIX_SEMANTICS`. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table atomically to `.gvx_meta`.
+On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` on open files via `NtSetInformationFile(FileRenameInformationEx)` with `FILE_RENAME_POSIX_SEMANTICS`, and `unlink(2)` via `FileDispositionInfoEx`. NTFS refuses to rename a directory that has an open descendant, and the guest then sees `EACCES`. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table atomically to `.gvx_meta`.
 
 ### 3.8 Host Self-Lockdown and Security Model: `pkg/hostlockdown`
 
@@ -451,7 +451,7 @@ On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELET
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go and scopes all `/workspace` opens to the `os.Root` handle. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT & macOS XNU) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux Landlock) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. |
 
 ```mermaid
 stateDiagram-v2
@@ -459,8 +459,10 @@ stateDiagram-v2
     PreInit --> HandlesOpen: Open Hypervisor (WHPX/HVF) or Pre-Spawn systrap Stub, .erofs Layers, Sockets, and /workspace os.Root
     HandlesOpen --> WinLockdown: Windows: In-Place SE_PRIVILEGE_REMOVED + Low Integrity + Deny-Only SID + JobObject + NoWin32k
     HandlesOpen --> MacLockdown: macOS: sandbox_init Seatbelt Profile (deny process-fork/exec/file-*) + RLIMIT_NPROC=0
+    HandlesOpen --> LinuxLockdown: Linux: PR_SET_NO_NEW_PRIVS + Landlock domain on every thread (deny exec and file access outside /workspace)
     WinLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
     MacLockdown --> GuestRunning: Enter Guest ELF Entrypoint (arm64 or amd64)
+    LinuxLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
 ```
 
 #### Windows Lockdown Sequence (`lockdown_windows.go`) (Procedural Module)
@@ -487,7 +489,19 @@ Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framew
 2. Call `sandbox_init_with_parameters` with the Seatbelt `deny default` profile to block `process-fork`, `process-exec*`, and new host file opens.
 3. Probe that each denial holds. `Apply` returns an error when a probe succeeds.
 
-`rungv` and `pkg/gvx` enable the lockdown by default. The option `-lockdown=false` opts out and prints a warning. The `systrap` stub applies its own, stricter profile in each forked task.
+`rungv` and `pkg/gvx` enable the lockdown by default. The option `-lockdown=false` opts out and prints a warning. The `systrap` stub applies its own, stricter profile in each forked task. The profile allows the MIG routine `mach_exception_raise`, because macOS 15 counts the delivery of a guest fault to a signal handler as that routine.
+
+#### Linux Lockdown Sequence (`lockdown_linux.go`) (Procedural Module)
+
+Execute these steps in `lockdown_linux.go` after opening the `systrap` platform, cached `.erofs` layer descriptors, network sockets, and the `/workspace` directory. The build must not use cgo, because the Go runtime runs one system call on every thread only without cgo.
+
+1. Query the Landlock ABI version with `landlock_create_ruleset`. Return `ErrUnsupported` when the kernel lacks Landlock.
+2. Create a ruleset that handles every file access right of the ABI. Handle TCP bind and connect from ABI 4 on, unless the options allow outbound traffic.
+3. Add one rule that allows read, or read and write, access below the workspace directory.
+4. Call `prctl(PR_SET_NO_NEW_PRIVS)` and `landlock_restrict_self` on every thread with `syscall.AllThreadsSyscall`.
+5. Probe that `fork` and `exec` of an existing program fails, that an open outside the workspace fails with `EACCES`, and that a TCP connect fails when the options block it.
+
+Landlock does not restrict UDP, and it does not stop `fork`. The Linux lockdown blocks the start of a new program and every new file access outside the workspace.
 
 ---
 
@@ -513,3 +527,26 @@ Within each milestone (`M1` through `M5`), engineers implement and verify `darwi
 | :--- | :--- | :--- | :--- |
 | **Bottom of Barbell: Host Primitive Unit Tests** | `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/hostlockdown`, `platform/{whpx,hvf,systrap}` | OS-specific (`*_darwin_test.go`, `*_windows_test.go`) | Verifies low-level OS syscalls (`__ulock_wait`, `WaitOnAddress`, `mach_vm_remap`, `MapViewOfFile3`, Seatbelt, JobObjects, in-place syscall patching, and 4KB Trampoline Islands) in isolation. |
 | **Top of Barbell: Unified Black-Box E2E Suite** | `e2e/` (`sandbox_e2e_test.go`) | 100% OS-agnostic (`//go:build darwin \|\| windows`) | Invokes `pkg/gvx` and `cmd/rungv` with identical assertions across Windows and macOS (`amd64` & `arm64`) and all backends (`hvf`, `whpx`, `systrap`). |
+
+### 4.2 Continuous Integration and Verification Status (Procedural Module)
+
+GitHub Actions runs the verification that the local host cannot run. The workflows live in `.github/workflows/`. Keep CI usage small: a new push cancels the older run, documentation-only changes skip it, and tests that pull images run once a week.
+
+| Workflow and Job | Runner | What It Verifies |
+| :--- | :--- | :--- |
+| `ci.yml` build, vet, and audit | `ubuntu-24.04` | Formatting of the packages that `gvx` owns, a build of every package for six targets and for `-tags pagesize_16k`, `go vet` of the packages that `gvx` wrote, and the upstream audit. |
+| `ci.yml` test linux | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages, the Linux lockdown without cgo, and a guest run on the upstream `systrap` platform with and without the lockdown. |
+| `ci.yml` test darwin/arm64 | `macos-15` | The owned packages through `scripts/codesign-exec.sh`, then the `systrap` engine, the SDK, and the CLI with `-tags pagesize_16k`. |
+| `ci.yml` test windows/amd64 | `windows-latest` | The owned packages, a report of the hypervisor state, and an attempt to boot a guest on `whpx`. |
+| `e2e-images.yml` | `macos-15` | The registry gates on the `systrap` engine, once a week. |
+| `diagnose.yml` | A chosen runner | A chosen test selection or script, started by hand. |
+
+A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests.
+
+| Platform | Verified By |
+| :--- | :--- |
+| `darwin/arm64` `hvf` | The Apple Silicon development host. A hosted runner has no hypervisor. |
+| `darwin/arm64` `systrap` | The development host and CI. |
+| `windows/amd64` and `windows/arm64` | CI builds both. CI runs `windows/amd64` tests, and `whpx` runs only where the runner has the Windows Hypervisor Platform. `windows/arm64` is compile-checked only. |
+| `darwin/amd64` | Compile-checked only. |
+| `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both. |
