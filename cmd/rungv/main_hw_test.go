@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 
+	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
@@ -63,6 +64,7 @@ func writeELF(t *testing.T, elfData []byte) string {
 }
 
 func TestRunELFReportsAutoBackend(t *testing.T) {
+	hvtest.Require(t)
 	elfData, err := testelf.BuildGuestELF64(runtime.GOARCH, 0, "elf-cli-ok\n")
 	if err != nil {
 		t.Fatalf("BuildGuestELF64 failed: %v", err)

@@ -20,6 +20,8 @@ package hostlockdown
 
 import (
 	"errors"
+	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -52,6 +54,12 @@ type Options struct {
 	// port here. Seatbelt can match remote ports but not remote addresses.
 	// Ignored when AllowOutboundNet is true.
 	OutboundUDPPorts []uint16
+
+	// ReadPaths lists extra host files and directories that the locked process
+	// may read. Only Linux supports it, because only Landlock restricts reads
+	// by path. Apply returns an error on another host when the list is not
+	// empty.
+	ReadPaths []string
 }
 
 // Status reports the containment primitives enforced by Apply. Apply sets a
@@ -111,6 +119,9 @@ func Apply(opts Options) (Status, error) {
 		if port == 0 {
 			return Status{}, errors.New("hostlockdown: OutboundUDPPorts contains port 0")
 		}
+	}
+	if len(opts.ReadPaths) > 0 && runtime.GOOS != "linux" {
+		return Status{}, fmt.Errorf("hostlockdown: ReadPaths needs Linux, not %s", runtime.GOOS)
 	}
 	st, err := applyOSLockdown(opts)
 	if err != nil {

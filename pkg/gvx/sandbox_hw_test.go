@@ -28,6 +28,7 @@ import (
 	"strings"
 	"testing"
 
+	"z.gfire.dev/gvx/internal/hvtest"
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
@@ -92,6 +93,7 @@ func TestSandboxRunStaticAndDynamicELF64(t *testing.T) {
 }
 
 func TestSandboxReportsPlatformName(t *testing.T) {
+	hvtest.Require(t)
 	want := "hvf"
 	if runtime.GOOS == "windows" {
 		want = "whpx"

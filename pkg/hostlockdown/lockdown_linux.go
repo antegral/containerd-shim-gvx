@@ -147,6 +147,11 @@ func applyOSLockdown(opts Options) (Status, error) {
 			return Status{}, err
 		}
 	}
+	for _, path := range opts.ReadPaths {
+		if err := allowRead(rulesetFD, path, fs); err != nil {
+			return Status{}, err
+		}
+	}
 
 	if err := allThreads(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); err != nil {
 		return Status{}, fmt.Errorf("hostlockdown: prctl(PR_SET_NO_NEW_PRIVS): %w", err)
@@ -189,6 +194,31 @@ func allowWorkspace(rulesetFD int, opts Options, handled uint64) error {
 	if _, _, errno := syscall.Syscall6(unix.SYS_LANDLOCK_ADD_RULE, uintptr(rulesetFD), unix.LANDLOCK_RULE_PATH_BENEATH,
 		uintptr(unsafe.Pointer(&rule)), 0, 0, 0); errno != 0 {
 		return fmt.Errorf("hostlockdown: landlock_add_rule for %q: %w", opts.WorkspacePath, errno)
+	}
+	return nil
+}
+
+// allowRead adds a rule that lets the process read path. A directory gets the
+// read rights of a tree. A file gets the file read right, because a rule may
+// not name directory rights for a file.
+func allowRead(rulesetFD int, path string, handled uint64) error {
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("hostlockdown: open read path %q: %w", path, err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("hostlockdown: stat read path %q: %w", path, err)
+	}
+	allowed := uint64(unix.LANDLOCK_ACCESS_FS_READ_FILE)
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		allowed |= unix.LANDLOCK_ACCESS_FS_READ_DIR
+	}
+	rule := unix.LandlockPathBeneathAttr{Allowed_access: allowed & handled, Parent_fd: int32(fd)}
+	if _, _, errno := syscall.Syscall6(unix.SYS_LANDLOCK_ADD_RULE, uintptr(rulesetFD), unix.LANDLOCK_RULE_PATH_BENEATH,
+		uintptr(unsafe.Pointer(&rule)), 0, 0, 0); errno != 0 {
+		return fmt.Errorf("hostlockdown: landlock_add_rule for %q: %w", path, errno)
 	}
 	return nil
 }

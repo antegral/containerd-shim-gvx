@@ -71,12 +71,21 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return nil, errors.Join(cause, sb.Close())
 	}
 
-	plat, platName, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
-	if err != nil {
-		return cleanup(err)
+	primeHost()
+	openPlat := func() error {
+		plat, platName, err := openPlatform(cfg.Platform, !cfg.DisableHostLockdown)
+		if err != nil {
+			return err
+		}
+		sb.plat = plat
+		sb.platName = platName
+		return nil
 	}
-	sb.plat = plat
-	sb.platName = platName
+	if !platformAfterLockdown {
+		if err := openPlat(); err != nil {
+			return cleanup(err)
+		}
+	}
 
 	if err := sb.initOCILayers(ctx); err != nil {
 		return cleanup(err)
@@ -106,6 +115,12 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 			return cleanup(fmt.Errorf("gvx: apply host lockdown: %w", err))
 		}
 		sb.lockdown = st
+	}
+
+	if platformAfterLockdown {
+		if err := openPlat(); err != nil {
+			return cleanup(err)
+		}
 	}
 
 	return sb, nil
@@ -192,6 +207,7 @@ func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 		WorkspacePath:     s.cfg.WorkspacePath,
 		WorkspaceReadOnly: s.cfg.WorkspaceReadOnly,
 		AllowOutboundNet:  s.cfg.NetworkMode == NetModeNAT,
+		ReadPaths:         lockdownReadPaths(),
 	}
 	if s.cfg.NetworkMode == NetModeWireGuard && s.wgPeerPort != 0 {
 		opts.OutboundUDPPorts = []uint16{s.wgPeerPort}
