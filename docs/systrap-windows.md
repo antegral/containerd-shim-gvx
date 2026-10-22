@@ -336,7 +336,7 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
 
-To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that a fault or an illegal instruction sends to the guest. A line has the exception code, the address, and the bytes at the program counter. The value `2` also prints every stop. The output has an upper bound of 400 lines.
+To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to the guest. A line has the exception code, the address, and the bytes at the program counter. The value `2` also prints every stop. The output has an upper bound of 400 lines.
 
 ## 12. Sources
 

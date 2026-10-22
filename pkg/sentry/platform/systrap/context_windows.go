@@ -352,12 +352,6 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, ev debugEvent, kin
 		at = hostarch.Read
 	}
 	sig, code := linux.Signal(linux.SIGSEGV), int32(segvMapErr)
-	defer func() {
-		if traceEvents && !traceMuted.Load() {
-			tracef("signal %d code %d to the guest at %#x", sig, code, addr)
-			th.traceStop(as, ev)
-		}
-	}()
 	if ev.Code == statusInPageError {
 		sig, code = linux.SIGBUS, busAdrErr
 	} else if as.mapped(addr) {
