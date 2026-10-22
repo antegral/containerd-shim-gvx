@@ -188,11 +188,8 @@ func (sp *stubProc) destroy() {
 	sp.markDead(errStubReleased)
 	sp.p.dbg.unregister(sp.pid)
 	for _, th := range threads {
-		if th.h != sp.main {
-			_ = windows.CloseHandle(th.h)
-		}
+		th.closeHandle()
 	}
-	_ = windows.CloseHandle(sp.main)
 	_ = windows.CloseHandle(sp.proc)
 	sp.p.host.release(sp.pid)
 }
@@ -221,7 +218,7 @@ func (sp *stubProc) newGuestThread() (*thread, error) {
 	sp.mu.Lock()
 	if sp.closed {
 		sp.mu.Unlock()
-		_ = windows.CloseHandle(h)
+		th.closeHandle()
 		return nil, errStubReleased
 	}
 	sp.threads[tid] = th

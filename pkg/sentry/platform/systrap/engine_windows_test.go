@@ -548,7 +548,9 @@ func TestAddressSpacesAreIndependent(t *testing.T) {
 			r := newRig(t, p)
 			r.program(gSyscall(uint64(200+i), uint64(i)))
 			si, _, err := r.run()
-			mustSyscall(t, si, err, uint64(200+i), r.ac)
+			if si != nil || err != nil || regNr(r.ac) != uint64(200+i) {
+				t.Errorf("address space %d: Switch = (%s, %v), number %d", i, describe(si), err, regNr(r.ac))
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -581,7 +583,10 @@ func TestParkedThreadDoesNotFreezeTheProcess(t *testing.T) {
 	go func() {
 		defer close(done)
 		si, _, err := b.run()
-		mustSyscall(t, si, err, 9, b.ac)
+		if si != nil || err != nil || regNr(b.ac) != 9 {
+			t.Errorf("thread B: Switch = (%s, %v), number %d", describe(si), err, regNr(b.ac))
+			return
+		}
 		if got := regAcc(b.ac); got != 6_000_000 {
 			t.Errorf("sum = %d, want 6000000", got)
 		}
@@ -614,9 +619,43 @@ func TestConcurrentThreads(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < calls; i++ {
 				si, _, err := th.run()
-				mustSyscall(t, si, err, uint64(300+i), th.ac)
+				if si != nil || err != nil || regNr(th.ac) != uint64(300+i) {
+					t.Errorf("call %d: Switch = (%s, %v), number %d", i, describe(si), err, regNr(th.ac))
+					return
+				}
 			}
 		}()
+	}
+	wg.Wait()
+}
+
+func TestForkStorm(t *testing.T) {
+	// Many processes start and exit at once. Some tasks release the address
+	// space first and the context second, the way the Sentry does when a
+	// process exits while a thread still holds its context.
+	p := newPlatform(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for round := 0; round < 4; round++ {
+				r := newRig(t, p)
+				r.program(gSyscall(uint64(400 + i)))
+				si, _, err := r.run()
+				if si != nil || err != nil || regNr(r.ac) != uint64(400+i) {
+					t.Errorf("task %d round %d: Switch = (%s, %v), number %d", i, round, describe(si), err, regNr(r.ac))
+					return
+				}
+				if i%2 == 0 {
+					r.as.Release()
+					r.ctx.Release()
+				} else {
+					r.ctx.Release()
+					r.as.Release()
+				}
+			}
+		}(i)
 	}
 	wg.Wait()
 }

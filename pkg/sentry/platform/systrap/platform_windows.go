@@ -23,6 +23,8 @@ import (
 	"runtime"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -117,7 +119,9 @@ func (p *Platform) MaxUserAddress() hostarch.Addr { return hostarch.Addr(p.userM
 func (p *Platform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	as, err := newAddressSpace(p)
 	if err != nil {
-		return nil, err
+		// The Sentry maps an unknown error of a system call to a panic. A
+		// failed fork or exec reports ENOMEM.
+		return nil, &platform.ContextError{Err: err, Errno: unix.ENOMEM}
 	}
 	return as, nil
 }

@@ -54,6 +54,11 @@ type thread struct {
 	// forced stop set. Callers hold mu.
 	stepping bool
 
+	// closeOnce makes sure that the handle closes once. The stub process and
+	// the context can both release the thread, and a second CloseHandle could
+	// close a new object that reuses the handle value.
+	closeOnce sync.Once
+
 	archThread
 }
 
@@ -166,6 +171,11 @@ func (th *thread) continueEvent(ev debugEvent) error {
 	return nil
 }
 
+// closeHandle closes the thread handle. It is safe to call more than once.
+func (th *thread) closeHandle() {
+	th.closeOnce.Do(func() { _ = windows.CloseHandle(th.h) })
+}
+
 // destroy terminates the thread and forgets it.
 func (th *thread) destroy() {
 	sp := th.sp
@@ -180,7 +190,7 @@ func (th *thread) destroy() {
 	if !sp.dead.Load() {
 		_ = ntTerminateThread(th.h)
 	}
-	_ = windows.CloseHandle(th.h)
+	th.closeHandle()
 }
 
 // start loads the guest registers of ac into the scratch record of a parked
