@@ -407,6 +407,9 @@ func Fallocate(fd int, mode uint32, off int64, length int64) error {
 		}
 		return nil
 	case FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE:
+		if true {
+			return ENOTSUP // experiment: keep the file dense
+		}
 		// NTFS caches in 4KB pages. A range that splits a page would zero live neighbours.
 		if off%winPageSize != 0 || (off+length)%winPageSize != 0 {
 			return ENOTSUP
