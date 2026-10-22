@@ -162,8 +162,12 @@ func (th *thread) dumpState() {
 		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d: get context: %v\n", th.tid, err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d running, stepping %v, pending events %d, pc %#x sp %#x\n",
-		th.tid, th.stepping, len(th.events), th.ctx.pc(), th.ctx.sp())
+	pc := th.ctx.pc()
+	var around [32]byte
+	var read uintptr
+	readErr := windows.ReadProcessMemory(th.sp.proc, uintptr(pc-16), &around[0], uintptr(len(around)), &read)
+	fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d running, stepping %v, pending events %d, pc %#x sp %#x, bytes from pc-16 (%v) % x\n",
+		th.tid, th.stepping, len(th.events), pc, th.ctx.sp(), readErr, around[:read])
 }
 
 // close stops the pump and closes the debug object. The kernel then kills
