@@ -192,7 +192,7 @@ func TestGrantsAccess(t *testing.T) {
 		{"other sid", "D:(A;;FA;;;S-1-5-5-0-999999)", rw, false},
 		{"inherit only entry", "D:(A;OICIIO;FA;;;S-1-5-5-0-123456)", rw, false},
 		{"deny entry", "D:(D;;FA;;;S-1-5-5-0-123456)", rw, false},
-		{"split entries", "D:(A;;FRFX;;;S-1-5-5-0-123456)(A;;FW;;;S-1-5-5-0-123456)(A;;SD;;;S-1-5-5-0-123456)(A;;DC;;;S-1-5-5-0-123456)", rw, true},
+		{"split entries", "D:(A;;FRFX;;;S-1-5-5-0-123456)(A;;FW;;;S-1-5-5-0-123456)(A;;SD;;;S-1-5-5-0-123456)(A;;0x40;;;S-1-5-5-0-123456)", rw, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

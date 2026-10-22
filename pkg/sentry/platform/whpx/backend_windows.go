@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -253,13 +254,17 @@ func (b *winBackend) setRegs(index uint32, rb *regBatch) error {
 		return err
 	}
 	// The batch call reports one status for all registers. Setting them one by
-	// one names the register that the hypervisor refuses. The processor is
+	// one names every register that the hypervisor refuses. The processor is
 	// already in an unknown state, so the extra calls cost nothing.
+	var refused []string
 	for i := range names {
 		if one := call(procSetVPRegisters, "WHvSetVirtualProcessorRegisters",
 			b.partition, uintptr(index), uintptr(unsafe.Pointer(&names[i])), 1, uintptr(unsafe.Pointer(&vals[i*regValueSize]))); one != nil {
-			return fmt.Errorf("%w (register name %#x is refused: %v)", err, names[i], one)
+			refused = append(refused, fmt.Sprintf("%#x", names[i]))
 		}
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("%w (registers refused one by one: %s)", err, strings.Join(refused, " "))
 	}
 	return err
 }
