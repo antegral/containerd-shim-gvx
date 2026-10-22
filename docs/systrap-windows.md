@@ -158,6 +158,7 @@ These numbers come from the engine tests and the stub probe on the hosted runner
 The cost of a system call is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each start a stub process, which costs 27 to 60 ms.
 
 The memory file of the Sentry is a temporary NTFS file. An earlier version marked it sparse when it tried to release pages. The first write to each hole of a sparse file waits for NTFS to allocate a cluster. Samples of the guest program counter showed the guest blocked at store instructions, and the `git add` row above shows the cost. 
+
 The `unix.Fallocate` shim now never sets the sparse flag. A dense memory file reserves its disk space when it grows. Twenty-four memory files of one gigabyte exhausted the disk of a hosted runner.
 
 ## 4. The Nirvana Hook Is a Recovery Net, Not a Security Layer
