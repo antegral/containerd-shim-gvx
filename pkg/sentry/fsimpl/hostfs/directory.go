@@ -1,0 +1,194 @@
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package hostfs
+
+import (
+	"errors"
+	"sync"
+
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
+)
+
+// fileDescription holds the members shared by the file description types. The
+// nesting lets dirFD embed both default implementations without ambiguity.
+type fileDescription struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
+}
+
+// dirFD implements vfs.FileDescriptionImpl for directories.
+//
+// A directory description lists the directory once, when the guest first reads
+// it or rewinds it. Every later read comes from that snapshot. POSIX leaves
+// the visibility of entries that change during iteration unspecified. The
+// snapshot keeps offsets stable while the guest deletes entries it already
+// read, as rm -rf does.
+type dirFD struct {
+	fileDescription
+	vfs.DirectoryFileDescriptionDefaultImpl
+
+	dentry *dentry
+
+	// mu protects the fields below.
+	mu       sync.Mutex
+	snapshot []vfs.Dirent
+	loaded   bool
+	off      int64
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *dirFD) Release(ctx context.Context) {}
+
+// Stat implements vfs.FileDescriptionImpl.Stat.
+func (fd *dirFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	d := fd.dentry
+	if err := d.refresh(); err != nil {
+		return linux.Statx{}, err
+	}
+	return d.inode.statxFor(d.inode.snapshot(), d.fs.devMinor), nil
+}
+
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
+func (fd *dirFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
+	d := fd.dentry
+	if err := d.setStat(ctx, auth.CredentialsFromContext(ctx), fd.vfsfd.Mount(), &opts, nil); err != nil {
+		return err
+	}
+	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
+	}
+	return nil
+}
+
+// StatFS implements vfs.FileDescriptionImpl.StatFS.
+func (fd *dirFD) StatFS(ctx context.Context) (linux.Statfs, error) {
+	return defaultStatFS(), nil
+}
+
+func direntType(kind hostKind) uint8 {
+	switch kind {
+	case hostKindDir:
+		return linux.DT_DIR
+	case hostKindSymlink:
+		return linux.DT_LNK
+	default:
+		return linux.DT_REG
+	}
+}
+
+// loadLocked lists the directory into fd.snapshot. The entries "." and ".."
+// come first, then the children by name.
+func (fd *dirFD) loadLocked() error {
+	d := fd.dentry
+	fs := d.fs
+	children, err := fs.ws.listDir(d.path())
+	if err != nil {
+		return translateHostError(err)
+	}
+	fs.mu.Lock()
+	parentIno := d.inode.ino
+	if d.parent != nil {
+		parentIno = d.parent.inode.ino
+	}
+	fs.mu.Unlock()
+	snap := make([]vfs.Dirent, 0, len(children)+2)
+	snap = append(snap,
+		vfs.Dirent{Name: ".", Type: linux.DT_DIR, Ino: d.inode.ino},
+		vfs.Dirent{Name: "..", Type: linux.DT_DIR, Ino: parentIno},
+	)
+	rel := d.path()
+	for _, c := range children {
+		ino := c.ino
+		switch {
+		case c.virtual:
+			ino = virtualInoFor(joinRelPath(rel, c.name))
+		case ino == 0:
+			// The platform layer did not report an inode number while
+			// listing, so ask for it. A miss means the entry vanished.
+			e, err := fs.ws.lookup(joinRelPath(rel, c.name))
+			if err != nil {
+				continue
+			}
+			ino = e.info.id.ino
+		}
+		snap = append(snap, vfs.Dirent{Name: c.name, Type: direntType(c.kind), Ino: ino})
+	}
+	for i := range snap {
+		snap[i].NextOff = int64(i + 1)
+	}
+	fd.snapshot = snap
+	fd.loaded = true
+	return nil
+}
+
+// IterDirents implements vfs.FileDescriptionImpl.IterDirents.
+func (fd *dirFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	if !fd.loaded {
+		if err := fd.loadLocked(); err != nil {
+			return err
+		}
+	}
+	for fd.off < int64(len(fd.snapshot)) {
+		if err := cb.Handle(fd.snapshot[fd.off]); err != nil {
+			return err
+		}
+		fd.off++
+	}
+	return nil
+}
+
+// Seek implements vfs.FileDescriptionImpl.Seek. Seeking to the start discards
+// the snapshot, so rewinddir observes the current directory.
+func (fd *dirFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	var newOff int64
+	switch whence {
+	case linux.SEEK_SET:
+		newOff = offset
+	case linux.SEEK_CUR:
+		newOff = fd.off + offset
+	default:
+		return 0, linuxerr.EINVAL
+	}
+	if newOff < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	if newOff == 0 {
+		fd.loaded = false
+		fd.snapshot = nil
+	}
+	fd.off = newOff
+	return newOff, nil
+}
+
+// Sync implements vfs.FileDescriptionImpl.Sync.
+func (fd *dirFD) Sync(ctx context.Context, opts vfs.SyncOptions) error {
+	var errs []error
+	if err := fd.dentry.fs.ws.syncDir(fd.dentry.path()); err != nil {
+		errs = append(errs, err)
+	}
+	if err := fd.dentry.fs.Sync(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	return translateHostError(errors.Join(errs...))
+}

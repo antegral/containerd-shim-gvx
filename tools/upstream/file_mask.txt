@@ -1,0 +1,92 @@
+# gvx Upstream Synchronization File Mask
+# Format: <DIRECTIVE> <GLOB_OR_PREFIX>
+# Directives:
+#   PROTECT - Owned by gvx (Tier 1 & Tier 2); never overwritten by upstream sync
+#   EXCLUDE - Non-code, CI, or Bazel build metadata masked out from upstream
+#   INCLUDE - Upstream gVisor go-branch files synced into the repository
+
+PROTECT AGENTS.md
+PROTECT README.md
+PROTECT LICENSE
+PROTECT UPSTREAM_COMMIT
+PROTECT entitlements.plist
+PROTECT .gitignore
+PROTECT skills-lock.json
+PROTECT .agents/**
+PROTECT docs/**
+PROTECT tools/upstream/**
+PROTECT third_party/**
+PROTECT scripts/**
+PROTECT cmd/rungv/**
+PROTECT pkg/gvx/**
+PROTECT pkg/oci/**
+PROTECT pkg/netbackend/**
+PROTECT pkg/hostlockdown/**
+PROTECT pkg/sentry/platform/whpx/**
+PROTECT pkg/sentry/platform/hvf/**
+PROTECT pkg/sentry/platform/systrap/*_windows*
+PROTECT pkg/sentry/platform/systrap/*_darwin*
+PROTECT pkg/sentry/platform/systrap/*_xplat*
+PROTECT pkg/sentry/fsimpl/hostfs/**
+PROTECT e2e/**
+PROTECT pkg/sync/*_windows*
+PROTECT pkg/sync/*_darwin*
+PROTECT pkg/memutil/*_windows*
+PROTECT pkg/memutil/*_darwin*
+PROTECT pkg/fd/*_windows*
+PROTECT pkg/fd/*_darwin*
+PROTECT pkg/sentry/pgalloc/*_windows*
+PROTECT pkg/sentry/pgalloc/*_darwin*
+PROTECT pkg/sentry/time/*_windows*
+PROTECT pkg/sentry/time/*_darwin*
+PROTECT pkg/sentry/hostcpu/*_windows*
+PROTECT pkg/sentry/hostcpu/*_darwin*
+PROTECT pkg/sentry/fsimpl/iouringfs/*_windows*
+PROTECT pkg/sentry/fsimpl/iouringfs/*_darwin*
+PROTECT pkg/ring0/*_windows*
+PROTECT pkg/ring0/*_darwin*
+PROTECT pkg/ring0/pagetables/*_windows*
+PROTECT pkg/ring0/pagetables/*_darwin*
+PROTECT pkg/rawfile/*_windows*
+PROTECT pkg/rawfile/*_darwin*
+PROTECT pkg/fdnotifier/*_windows*
+PROTECT pkg/fdnotifier/*_darwin*
+PROTECT pkg/flipcall/*_windows*
+PROTECT pkg/flipcall/*_darwin*
+PROTECT pkg/sentry/hostfd/*_windows*
+PROTECT pkg/sentry/hostfd/*_darwin*
+PROTECT pkg/aio/*_windows*
+PROTECT pkg/aio/*_darwin*
+PROTECT pkg/fdchannel/*_windows*
+PROTECT pkg/fdchannel/*_darwin*
+PROTECT pkg/abi/*_windows*
+PROTECT pkg/abi/*_darwin*
+PROTECT pkg/syserr/*_windows*
+PROTECT pkg/syserr/*_darwin*
+PROTECT pkg/sighandling/*_windows*
+PROTECT pkg/sighandling/*_darwin*
+PROTECT pkg/sentry/platform/*_windows*
+PROTECT pkg/sentry/platform/*_darwin*
+PROTECT pkg/sentry/platform/platforms/*_windows*
+PROTECT pkg/sentry/platform/platforms/*_darwin*
+PROTECT internal/**
+
+EXCLUDE .github/**
+EXCLUDE .buildkite/**
+EXCLUDE website/**
+EXCLUDE g3doc/**
+EXCLUDE images/**
+EXCLUDE **/BUILD
+EXCLUDE **/BUILD.bazel
+EXCLUDE WORKSPACE
+EXCLUDE *.bzl
+
+INCLUDE go.mod
+INCLUDE go.sum
+INCLUDE pkg/**
+INCLUDE runsc/**
+INCLUDE sandboxexec/**
+INCLUDE shim/**
+INCLUDE webhook/**
+INCLUDE test/**
+INCLUDE tools/**

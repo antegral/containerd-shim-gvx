@@ -1,0 +1,89 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kernel
+
+import (
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/sentry/platform"
+)
+
+// SignalPanic is used to panic the running threads. It is a signal which
+// cannot be used by the application: it must be caught and ignored by the
+// runtime (in order to catch possible races).
+const SignalPanic = linux.SIGUSR2
+
+// SignalDumpGoroutines is used to trigger a non-fatal stack dump of all
+// running goroutines.
+const SignalDumpGoroutines = linux.SIGUSR1
+
+// sendExternalSignal is called when an asynchronous signal is sent to the
+// sentry ("in sentry context"). On some platforms, it may also be called when
+// an asynchronous signal is sent to sandboxed application threads ("in
+// application context").
+//
+// context is used only for debugging to differentiate these cases.
+//
+// If the kernel has no init process, the signal is dropped.
+//
+// +checklocksexclude:k.tasks.mu
+// +checklocksexclude:k.globalInit.signalHandlers.mu
+func (k *Kernel) sendExternalSignal(info *linux.SignalInfo, context string) {
+	switch linux.Signal(info.Signo) {
+	case linux.SIGURG:
+		// Sent by the Go 1.14+ runtime for asynchronous goroutine preemption.
+
+	case platform.SignalInterrupt:
+		// Assume that a call to platform.Context.Interrupt() misfired.
+
+	case SignalPanic:
+		// SignalPanic is also specially handled in sentry setup to ensure that
+		// it causes a panic even after tasks exit, but SignalPanic may also
+		// be sent here if it is received while in app context.
+		panic("Signal-induced panic")
+
+	default:
+		if k.dumpGoroutinesSignal > 0 && linux.Signal(info.Signo) == k.dumpGoroutinesSignal {
+			log.TracebackAll("Received external dump signal %d in %s context", info.Signo, context)
+			return
+		}
+
+		log.Infof("Received external signal %d in %s context", info.Signo, context)
+		if k.globalInit == nil {
+			log.Warningf("Dropping external signal %d: sandbox has no init process", info.Signo)
+			return
+		}
+		k.globalInit.SendForcedSignal(info)
+	}
+}
+
+// SignalInfoPriv returns a SignalInfo equivalent to Linux's SEND_SIG_PRIV.
+func SignalInfoPriv(sig linux.Signal) *linux.SignalInfo {
+	return &linux.SignalInfo{
+		Signo: int32(sig),
+		Code:  linux.SI_KERNEL,
+	}
+}
+
+// SignalInfoNoInfo returns a SignalInfo equivalent to Linux's SEND_SIG_NOINFO.
+func SignalInfoNoInfo(sig linux.Signal, sender, receiver *Task) *linux.SignalInfo {
+	info := &linux.SignalInfo{
+		Signo: int32(sig),
+		Code:  linux.SI_USER,
+	}
+	info.SetPID(int32(receiver.tg.pidns.IDOfThreadGroup(sender.tg)))
+	info.SetUID(int32(sender.Credentials().RealKUID.In(receiver.UserNamespace()).OrOverflow()))
+	return info
+}

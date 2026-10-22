@@ -1,0 +1,114 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kernel
+
+import (
+	"maps"
+
+	"z.gfire.dev/gvx/pkg/abi/linux"
+)
+
+// SignalHandlers holds information about signal actions.
+//
+// +stateify savable
+type SignalHandlers struct {
+	// mu also protects the signal state of all tasks and thread
+	// groups using this SignalHandlers object. (See comment on
+	// ThreadGroup.signalHandlers.)
+	mu signalHandlersMutex `state:"nosave"`
+
+	// actions is the action to be taken upon receiving each signal.
+	//
+	// +checklocks:mu
+	actions map[linux.Signal]linux.SigAction
+}
+
+// NewSignalHandlers returns a new SignalHandlers specifying all default
+// actions.
+func NewSignalHandlers() *SignalHandlers {
+	return &SignalHandlers{
+		actions: make(map[linux.Signal]linux.SigAction),
+	}
+}
+
+// Fork returns a copy of sh for a new thread group.
+//
+// +checklocksexclude:sh.mu
+func (sh *SignalHandlers) Fork() *SignalHandlers {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	// Keep the copy writable even if the source map is nil.
+	actions := make(map[linux.Signal]linux.SigAction, len(sh.actions))
+	maps.Copy(actions, sh.actions)
+	return &SignalHandlers{actions: actions}
+}
+
+// Reset returns a copy of sh with non-ignored handlers reset to SIG_DFL
+// and all other action fields cleared. Used for CLONE_CLEAR_SIGHAND.
+//
+// +checklocksexclude:sh.mu
+func (sh *SignalHandlers) Reset() *SignalHandlers {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	actions := make(map[linux.Signal]linux.SigAction, len(sh.actions))
+	for sig, act := range sh.actions {
+		newHandler := uint64(linux.SIG_DFL)
+		if act.Handler == linux.SIG_IGN {
+			newHandler = linux.SIG_IGN
+		}
+		actions[sig] = linux.SigAction{
+			Handler: newHandler,
+		}
+	}
+	return &SignalHandlers{actions: actions}
+}
+
+// copyForExecLocked returns a copy of sh for a thread group undergoing execve.
+// Only ignored signals are retained, with all other action fields cleared.
+//
+// +checklocks:sh.mu
+func (sh *SignalHandlers) copyForExecLocked() *SignalHandlers {
+	actions := make(map[linux.Signal]linux.SigAction, len(sh.actions))
+	for sig, act := range sh.actions {
+		if act.Handler == linux.SIG_IGN {
+			actions[sig] = linux.SigAction{
+				Handler: linux.SIG_IGN,
+			}
+		}
+	}
+	return &SignalHandlers{actions: actions}
+}
+
+// IsIgnored returns true if the signal is ignored.
+//
+// +checklocksexclude:sh.mu
+func (sh *SignalHandlers) IsIgnored(sig linux.Signal) bool {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sa, ok := sh.actions[sig]
+	return ok && sa.Handler == linux.SIG_IGN
+}
+
+// dequeueAction returns the action for sig, resetting it to the default for
+// subsequent signals if SA_RESETHAND is set.
+//
+// +checklocks:sh.mu
+func (sh *SignalHandlers) dequeueAction(sig linux.Signal) linux.SigAction {
+	act := sh.actions[sig]
+	if act.Flags&linux.SA_RESETHAND != 0 {
+		delete(sh.actions, sig)
+	}
+	return act
+}

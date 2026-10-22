@@ -1,0 +1,365 @@
+// Copyright 2020 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package eventfd implements event fds.
+package eventfd
+
+import (
+	"fmt"
+	"math"
+	"sync"
+
+	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/context"
+	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/fdnotifier"
+	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/sentry/kernel/auth"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
+	"z.gfire.dev/gvx/pkg/usermem"
+	"z.gfire.dev/gvx/pkg/waiter"
+)
+
+// EventFileDescription implements vfs.FileDescriptionImpl for file-based event
+// notification (eventfd). Eventfds are usually internal to the Sentry but in
+// certain situations they may be converted into a host-backed eventfd.
+//
+// +stateify savable
+type EventFileDescription struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.NoLockFD
+
+	// queue is used to notify interested parties when the event object
+	// becomes readable or writable.
+	queue waiter.Queue
+
+	mu sync.Mutex `state:"nosave"`
+
+	// val is the current value of the event counter.
+	//
+	// +checklocks:mu
+	val uint64
+
+	// semMode specifies whether the event is in "semaphore" mode and is
+	// immutable after construction.
+	semMode bool
+
+	// hostfd is the backing host eventfd, or -1 if none is installed.
+	//
+	// +checklocks:mu
+	hostfd int
+
+	// sentryOwnedHostfd indicates that HostFD created hostfd rather than
+	// NewFromHost importing it. Only sentry-created host FDs support
+	// save/restore.
+	//
+	// +checklocks:mu
+	sentryOwnedHostfd bool
+
+	// hostfdState contains the counter bytes captured by beforeSave and
+	// consumed by afterLoad while ordinary Sentry execution is excluded.
+	// checklocks cannot express this checkpoint-owned lifecycle phase.
+	hostfdState [8]byte
+}
+
+var _ vfs.FileDescriptionImpl = (*EventFileDescription)(nil)
+
+// New creates a new event fd.
+func New(ctx context.Context, vfsObj *vfs.VirtualFilesystem, initVal uint64, semMode bool, flags uint32) (*vfs.FileDescription, error) {
+	vd := vfsObj.NewAnonVirtualDentry("[eventfd]")
+	defer vd.DecRef(ctx)
+	efd := &EventFileDescription{
+		val:     initVal,
+		semMode: semMode,
+		hostfd:  -1,
+	}
+	if err := efd.vfsfd.Init(efd, flags, auth.CredentialsFromContext(ctx), vd.Mount(), vd.Dentry(), &vfs.FileDescriptionOptions{
+		UseDentryMetadata: true,
+		DenyPRead:         true,
+		DenyPWrite:        true,
+		DenySpliceIn:      true,
+	}); err != nil {
+		return nil, err
+	}
+	return &efd.vfsfd, nil
+}
+
+// NewFromHost creates a new event fd from the given host fd.
+func NewFromHost(ctx context.Context, vfsObj *vfs.VirtualFilesystem, hostfd int, flags uint32) (*vfs.FileDescription, error) {
+	semMode := flags&linux.EFD_SEMAPHORE != 0
+	fd, err := New(ctx, vfsObj, 0, semMode, flags)
+	if err != nil {
+		return nil, err
+	}
+	efd := fd.Impl().(*EventFileDescription)
+	// New returned an unshared file. checklocks cannot recover that private
+	// ownership through the returned FileDescription and its Impl accessor.
+	efd.hostfd = hostfd // +checklocksignore
+	if err := fdnotifier.AddFD(int32(hostfd), &efd.queue); err != nil {
+		return nil, err
+	}
+	return fd, nil
+}
+
+// HostFD returns the host eventfd associated with this event. The descriptor
+// is borrowed, not duplicated; callers must retain a reference to the
+// associated vfs.FileDescription while using it.
+//
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) HostFD() (int, error) {
+	efd.mu.Lock()
+	defer efd.mu.Unlock()
+	if efd.hostfd >= 0 {
+		return efd.hostfd, nil
+	}
+
+	flags := linux.EFD_NONBLOCK
+	if efd.semMode {
+		flags |= linux.EFD_SEMAPHORE
+	}
+
+	fd, _, errno := unix.Syscall(unix.SYS_EVENTFD2, uintptr(efd.val), uintptr(flags), 0)
+	if errno != 0 {
+		return -1, errno
+	}
+
+	if err := fdnotifier.AddFD(int32(fd), &efd.queue); err != nil {
+		if closeErr := unix.Close(int(fd)); closeErr != nil {
+			log.Warningf("close(%d) eventfd failed: %v", fd, closeErr)
+		}
+		return -1, err
+	}
+
+	efd.hostfd = int(fd)
+	efd.sentryOwnedHostfd = true
+	return efd.hostfd, nil
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+//
+// +checklocksexclude:efd.mu
+func (efd *EventFileDescription) Release(context.Context) {
+	efd.mu.Lock()
+	defer efd.mu.Unlock()
+	if efd.hostfd >= 0 {
+		fdnotifier.RemoveFD(int32(efd.hostfd))
+		if closeErr := unix.Close(int(efd.hostfd)); closeErr != nil {
+			log.Warningf("close(%d) eventfd failed: %v", efd.hostfd, closeErr)
+		}
+		efd.hostfd = -1
+		efd.sentryOwnedHostfd = false
+	}
+}
+
+// Read implements vfs.FileDescriptionImpl.Read.
+//
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) Read(ctx context.Context, dst usermem.IOSequence, _ vfs.ReadOptions) (int64, error) {
+	if dst.NumBytes() < 8 {
+		return 0, unix.EINVAL
+	}
+	if err := efd.read(ctx, dst); err != nil {
+		return 0, err
+	}
+	return 8, nil
+}
+
+// Write implements vfs.FileDescriptionImpl.Write.
+//
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) Write(ctx context.Context, src usermem.IOSequence, _ vfs.WriteOptions) (int64, error) {
+	if src.NumBytes() != 8 {
+		return 0, unix.EINVAL
+	}
+	if err := efd.write(ctx, src); err != nil {
+		return 0, err
+	}
+	return 8, nil
+}
+
+// +checklocks:efd.mu
+func (efd *EventFileDescription) hostReadLocked(ctx context.Context, dst usermem.IOSequence) error {
+	var buf [8]byte
+	if _, err := unix.Read(efd.hostfd, buf[:]); err != nil {
+		if err == unix.EWOULDBLOCK {
+			return linuxerr.ErrWouldBlock
+		}
+		return err
+	}
+	_, err := dst.CopyOut(ctx, buf[:])
+	return err
+}
+
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) read(ctx context.Context, dst usermem.IOSequence) error {
+	efd.mu.Lock()
+	if efd.hostfd >= 0 {
+		defer efd.mu.Unlock()
+		return efd.hostReadLocked(ctx, dst)
+	}
+
+	// We can't complete the read if the value is currently zero.
+	if efd.val == 0 {
+		efd.mu.Unlock()
+		return linuxerr.ErrWouldBlock
+	}
+
+	// Update the value based on the mode the event is operating in.
+	var val uint64
+	if efd.semMode {
+		val = 1
+		// Consistent with Linux, this is done even if writing to memory fails.
+		efd.val--
+	} else {
+		val = efd.val
+		efd.val = 0
+	}
+
+	efd.mu.Unlock()
+
+	// Notify writers. We do this even if we were already writable because
+	// it is possible that a writer is waiting to write the maximum value
+	// to the event.
+	efd.queue.Notify(waiter.WritableEvents)
+
+	var buf [8]byte
+	hostarch.ByteOrder.PutUint64(buf[:], val)
+	_, err := dst.CopyOut(ctx, buf[:])
+	return err
+}
+
+// +checklocks:efd.mu
+func (efd *EventFileDescription) hostWriteLocked(val uint64) error {
+	var buf [8]byte
+	hostarch.ByteOrder.PutUint64(buf[:], val)
+	_, err := unix.Write(efd.hostfd, buf[:])
+	if err == unix.EWOULDBLOCK {
+		return linuxerr.ErrWouldBlock
+	}
+	return err
+}
+
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) write(ctx context.Context, src usermem.IOSequence) error {
+	var buf [8]byte
+	if _, err := src.CopyIn(ctx, buf[:]); err != nil {
+		return err
+	}
+	val := hostarch.ByteOrder.Uint64(buf[:])
+
+	return efd.Signal(val)
+}
+
+// Signal is an internal function to signal the event fd.
+//
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) Signal(val uint64) error {
+	if val == math.MaxUint64 {
+		return unix.EINVAL
+	}
+
+	efd.mu.Lock()
+
+	if efd.hostfd >= 0 {
+		defer efd.mu.Unlock()
+		return efd.hostWriteLocked(val)
+	}
+
+	// We only allow writes that won't cause the value to go over the max
+	// uint64 minus 1.
+	if val > math.MaxUint64-1-efd.val {
+		efd.mu.Unlock()
+		return linuxerr.ErrWouldBlock
+	}
+
+	efd.val += val
+	efd.mu.Unlock()
+
+	// Always trigger a notification.
+	efd.queue.Notify(waiter.ReadableEvents)
+
+	return nil
+}
+
+// Readiness implements waiter.Waitable.Readiness.
+//
+// +checklocksexclude:efd.mu
+func (efd *EventFileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
+	efd.mu.Lock()
+	defer efd.mu.Unlock()
+
+	if efd.hostfd >= 0 {
+		return fdnotifier.NonBlockingPoll(int32(efd.hostfd), mask)
+	}
+
+	ready := waiter.EventMask(0)
+	if efd.val > 0 {
+		ready |= waiter.ReadableEvents
+	}
+
+	if efd.val < math.MaxUint64-1 {
+		ready |= waiter.WritableEvents
+	}
+
+	return mask & ready
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+//
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) EventRegister(entry *waiter.Entry) error {
+	efd.queue.EventRegister(entry)
+
+	efd.mu.Lock()
+	defer efd.mu.Unlock()
+	if efd.hostfd >= 0 {
+		if err := fdnotifier.UpdateFD(int32(efd.hostfd)); err != nil {
+			efd.queue.EventUnregister(entry)
+			return err
+		}
+	}
+	return nil
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+//
+// +checklocksexclude:efd.mu
+// +checklocksexclude:efd.queue.mu
+func (efd *EventFileDescription) EventUnregister(entry *waiter.Entry) {
+	efd.queue.EventUnregister(entry)
+
+	efd.mu.Lock()
+	defer efd.mu.Unlock()
+	if efd.hostfd >= 0 {
+		if err := fdnotifier.UpdateFD(int32(efd.hostfd)); err != nil {
+			panic(fmt.Sprint("UpdateFD:", err))
+		}
+	}
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (efd *EventFileDescription) Epollable() bool {
+	return true
+}

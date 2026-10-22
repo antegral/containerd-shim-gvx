@@ -1,0 +1,106 @@
+# Tier 3 patch registry (SPEC section 2.2 and 2.3).
+#
+# Every upstream file that differs from the commit in UPSTREAM_COMMIT must appear here.
+# `tools/upstream -mode=retag` applies these rules. `-mode=audit` proves the tree obeys them.
+#
+# Directives:
+#   <path>                           widen //go:build to "linux || windows || darwin"
+#   expand <path>                    same as a bare path
+#   expr <path> <expression>         set //go:build to the given expression
+#   linux-only <file>                narrow //go:build so that only Linux targets compile the file
+#   linux-only <dir>/ [<expression>] same for every Go and assembly file directly in dir
+#   seam <path>                      register a content edit that is not a build constraint
+#
+# A linux-only rule edits a file only when a Windows or macOS target would compile it.
+# Each group below names the compile error that makes the fence necessary.
+
+# Pure-Go Sentry and Netstack core. SPEC 3.1 requires these files to build on all four
+# Priority-0 targets. Upstream gives them no //go:build line, so retag edits nothing today.
+# The audit still fails if any of them stops building on a target.
+pkg/sentry/kernel/kernel.go
+pkg/sentry/arch/arch.go
+pkg/ring0/ring0.go
+pkg/sentry/vfs/vfs.go
+pkg/sentry/fsimpl/tmpfs/tmpfs.go
+pkg/sentry/fsimpl/overlay/overlay.go
+pkg/tcpip/tcpip.go
+
+# Content seams: EROFS inline xattr, device node, and listxattr support (SPEC 3.6).
+# Upstream rejects any inode with xattrs, which breaks OCI layers that carry capabilities.
+seam pkg/erofs/erofs.go
+seam pkg/erofs/erofs_state_autogen.go
+seam pkg/sentry/fsimpl/erofs/erofs.go
+seam pkg/sentry/fsimpl/erofs/filesystem.go
+
+# pkg/hostarch: the opt-in 16KB page size (build tag pagesize_16k, SPEC section 1 and 3.3).
+# Upstream already reserves a tag for 64KB pages. Each 4KB file gains one more negated tag so that
+# exactly one of the three page-size files applies. The new gvx file hostarch_arm64_16k.go holds the 16KB constants.
+expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !pagesize_64k && !pagesize_16k
+expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !pagesize_64k && !pagesize_16k
+
+# pkg/memutil: upstream files build on Linux only; darwin has its own siblings.
+expr pkg/memutil/memutil_unsafe.go linux || darwin
+expr pkg/memutil/mmap.go linux || darwin
+
+# Host primitives that the _windows and _darwin siblings replace.
+linux-only pkg/sentry/hostcpu/hostcpu.go
+linux-only pkg/sentry/hostcpu/getcpu_amd64.s
+linux-only pkg/sentry/hostcpu/getcpu_arm64.s
+linux-only pkg/sentry/time/vdso.go
+linux-only pkg/sentry/time/vdso_amd64.s
+linux-only pkg/sentry/time/vdso_arm64.s
+linux-only pkg/sentry/platform/mmap_min_addr.go
+linux-only pkg/rawfile/blockingpoll_amd64.s
+linux-only pkg/rawfile/blockingpoll_arm64.s
+linux-only pkg/ring0/pagetables/pcids_aarch64.go
+linux-only pkg/ring0/pagetables/pcids_aarch64.s
+
+# pkg/coretag: undefined: unix.Gettid on darwin.
+linux-only pkg/coretag/
+# pkg/hostsyscall: raw Linux syscall stubs; every file is Linux-specific.
+linux-only pkg/hostsyscall/
+# pkg/p9: cannot use s.Rdev (int32) as uint64 on darwin.
+linux-only pkg/p9/
+# pkg/sigframe: imports pkg/hostsyscall.
+linux-only pkg/sigframe/
+# pkg/xdp: undefined: unix.XDPDesc.
+linux-only pkg/xdp/
+
+# pkg/tcpip link endpoints that need Linux file descriptors.
+# fdbased: mmap_nonlinux.go refers to endpoint, which only Linux files define.
+linux-only pkg/tcpip/link/fdbased/
+linux-only pkg/tcpip/link/sharedmem/
+
+# pkg/sentry/devices/tpuproxy: imports accel, which uses Linux ioctls.
+linux-only pkg/sentry/devices/tpuproxy/
+linux-only pkg/sentry/devices/tpuproxy/accel/
+
+# Upstream Linux-only platforms and their shared stub subpackages.
+# kvm and slimvm import pkg/hostsyscall; ptrace uses unix.SYS_RT_TGSIGQUEUEINFO.
+# slimvm exists for amd64 only, so its fence also keeps arm64 Linux builds clean.
+linux-only pkg/sentry/platform/kvm/
+linux-only pkg/sentry/platform/ptrace/
+linux-only pkg/sentry/platform/slimvm/ amd64
+# systrap: imports pkg/hostsyscall. The _windows, _darwin, and _xplat siblings supply the other hosts.
+linux-only pkg/sentry/platform/systrap/
+linux-only pkg/sentry/platform/systrap/sysmsg/
+linux-only pkg/sentry/platform/systrap/usertrap/
+
+# pkg/sentry/seccheck sink: undefined: unix.Writev on windows.
+linux-only pkg/sentry/seccheck/sinks/remote/
+
+# pkg/sentry/socket: hostinet uses syscall.NetlinkRIB; plugin/cgo uses syscall.EpollEvent.
+linux-only pkg/sentry/socket/hostinet/
+linux-only pkg/sentry/socket/plugin/cgo/
+linux-only pkg/sentry/socket/plugin/stack/
+
+# Linux container runtime trees. gvx keeps them so that `git merge upstream/go` stays
+# conflict-free. They use cgroups, namespaces, and unix sockets, so no Windows or macOS
+# target compiles them. SPEC 3.7: hostfs replaces fsimpl/gofer for /workspace on those hosts.
+linux-only runsc/**
+linux-only sandboxexec/**
+linux-only shim/**
+linux-only webhook/**
+linux-only pkg/shim/**
+linux-only tools/xdp/**
+linux-only pkg/sentry/fsimpl/gofer/
