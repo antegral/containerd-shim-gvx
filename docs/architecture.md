@@ -451,7 +451,7 @@ On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELET
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go and scopes all `/workspace` opens to the `os.Root` handle. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux Landlock) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. |
 
 ```mermaid
 stateDiagram-v2
@@ -459,7 +459,7 @@ stateDiagram-v2
     PreInit --> HandlesOpen: Open Hypervisor (WHPX/HVF) or Pre-Spawn systrap Stub, .erofs Layers, Sockets, and /workspace os.Root
     HandlesOpen --> WinLockdown: Windows: In-Place SE_PRIVILEGE_REMOVED + Low Integrity + Deny-Only SID + JobObject + NoWin32k
     HandlesOpen --> MacLockdown: macOS: sandbox_init Seatbelt Profile (deny process-fork/exec/file-*) + RLIMIT_NPROC=0
-    HandlesOpen --> LinuxLockdown: Linux: PR_SET_NO_NEW_PRIVS + Landlock domain on every thread (deny exec and file access outside /workspace)
+    HandlesOpen --> LinuxLockdown: Linux: PR_SET_NO_NEW_PRIVS + seccomp allowlist of the runsc Sentry on every thread (other calls kill the process)
     WinLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
     MacLockdown --> GuestRunning: Enter Guest ELF Entrypoint (arm64 or amd64)
     LinuxLockdown --> GuestRunning: Enter Guest ELF Entrypoint (amd64 or arm64)
@@ -491,17 +491,23 @@ Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framew
 
 `rungv` and `pkg/gvx` enable the lockdown by default. The option `-lockdown=false` opts out and prints a warning. The `systrap` stub applies its own, stricter profile in each forked task. The profile allows the MIG routine `mach_exception_raise`, because macOS 15 counts the delivery of a guest fault to a signal handler as that routine.
 
-#### Linux Lockdown Sequence (`lockdown_linux.go`) (Procedural Module)
+#### Linux Lockdown Sequence (`lockdown_linux.go` and `syscallfilter_linux.go`) (Procedural Module)
 
-Execute these steps in `lockdown_linux.go` after opening the cached `.erofs` layer descriptors, network sockets, and the `/workspace` directory. Open the `systrap` platform after the lockdown, so that its first stub starts inside the domain. The build must not use cgo. The Go runtime runs one system call on every thread only without cgo, and the upstream `systrap` platform hangs while it starts in a cgo build.
+Execute these steps after the `systrap` platform, the cached `.erofs` layer descriptors, the network sockets, and the `/workspace` directory exist. The lockdown reuses the seccomp allowlist of the gVisor Sentry in `runsc/boot/filter`. `pkg/hostlockdown` must not import the Sentry. Therefore `pkg/gvx` builds the program and passes it in `Options.InstallSyscallFilter`.
 
-1. Query the Landlock ABI version with `landlock_create_ruleset`. Return `ErrUnsupported` when the ABI is lower than 8, because older kernels lack `LANDLOCK_RESTRICT_SELF_TSYNC`.
-2. Create a ruleset that handles every file access right of the ABI. Handle TCP bind and connect from ABI 4 on, unless the options allow outbound traffic.
-3. Add one rule that allows read, or read and write, access below the workspace directory. Add one read rule for each path in `Options.ReadPaths`. `pkg/gvx` lists `/proc/self`, which the `systrap` platform reads when it starts.
-4. Call `prctl(PR_SET_NO_NEW_PRIVS)` on every thread with `syscall.AllThreadsSyscall`. Call `landlock_restrict_self` once with `LANDLOCK_RESTRICT_SELF_TSYNC`, so that every thread joins one domain. A thread may trace only a process in its own domain or a child domain, and `systrap` traces its stubs from many threads.
-5. Probe that `fork` and `exec` of an existing program fails, that an open outside the workspace fails with `EACCES`, and that a TCP connect fails when the options block it.
+1. Build the rules with `config.Rules`. Pass the `SeccompInfo` of the `systrap` platform. Enable the host network rules for `-net=nat`. Enable the host filesystem rules when a workspace exists.
+2. Merge the embedder rules of `gvx`: `fcntl` with close-on-exec, `renameat`, `sched_getaffinity`, sockets with protocol 0 for NAT, and `sendto` with `recvfrom` for WireGuard.
+3. Add a last rule set that returns `EPERM` for `execve`, `execveat`, `clone`, `openat`, and `socket`. It applies only when no allow rule matched. Every other call outside the allowlist kills the process.
+4. Install the program on every thread with `seccomp(SECCOMP_FILTER_FLAG_TSYNC)`. The call sets `PR_SET_NO_NEW_PRIVS` first.
+5. Probe the result. `execve` and `clone` must fail with `EPERM`. An `openat` relative to the working directory must fail with `EPERM`. A TCP `socket` must fail unless the options allow outbound traffic.
 
-Landlock does not restrict UDP, and it does not stop `fork`. The Linux lockdown blocks the start of a new program and every new file access outside the workspace.
+#### Linux Lockdown Limits (Descriptive Module)
+
+Seccomp reads no path. A workspace needs `openat` relative to a directory descriptor, and that call can open an absolute path. gVisor closes this gap with a mount namespace and `chroot`. A library cannot create them without privilege, because the Go runtime runs many threads. `Status.UnboundFileOpenBlocked` is therefore false on Linux when a workspace exists.
+
+Seccomp cannot read a socket address. The filter cannot pin the WireGuard peer port the way the Seatbelt profile does. The `EPERM` rule set keeps the process alive where `runsc` kills it. Code in the embedding process then sees an error from `os/exec`, `os.Open`, or `net.Dial`. The Go runtime also opens cgroup files once a second to adjust `GOMAXPROCS`, and it accepts a failure.
+
+The upstream `systrap` platform hangs while it starts in a cgo build. `New` returns `ErrPlatformUnavailable` there, and race builds use cgo. Build with `CGO_ENABLED=0`. A missing rule kills the process. Run `scripts/seccomp-audit.sh` to list the calls that the allowlist lacks. It builds with the tag `gvx_seccomp_log`, which logs those calls and allows them.
 
 ---
 
@@ -526,7 +532,7 @@ Within each milestone (`M1` through `M5`), engineers implement and verify `darwi
 | Test Layer | Package Scope | Build Constraints | Behavioral Contract Verified |
 | :--- | :--- | :--- | :--- |
 | **Bottom of Barbell: Host Primitive Unit Tests** | `pkg/sync`, `pkg/memutil`, `pkg/fd`, `pkg/hostlockdown`, `platform/{whpx,hvf,systrap}` | OS-specific (`*_darwin_test.go`, `*_windows_test.go`) | Verifies low-level OS syscalls (`__ulock_wait`, `WaitOnAddress`, `mach_vm_remap`, `MapViewOfFile3`, Seatbelt, JobObjects, in-place syscall patching, and 4KB Trampoline Islands) in isolation. |
-| **Top of Barbell: Unified Black-Box E2E Suite** | `e2e/` (`sandbox_e2e_test.go`) | 100% OS-agnostic (`//go:build darwin \|\| windows`) | Invokes `pkg/gvx` and `cmd/rungv` with identical assertions across Windows and macOS (`amd64` & `arm64`) and all backends (`hvf`, `whpx`, `systrap`). |
+| **Top of Barbell: Unified Black-Box E2E Suite** | `e2e/` (`sandbox_e2e_test.go`) | 100% OS-agnostic (`//go:build darwin \|\| windows \|\| linux`) | Invokes `pkg/gvx` and `cmd/rungv` with identical assertions across Windows, macOS, and Linux (`amd64` & `arm64`) and all backends (`hvf`, `whpx`, `systrap`). `-platform=auto` selects `systrap` on Linux. |
 
 ### 4.2 Continuous Integration and Verification Status (Procedural Module)
 
@@ -535,7 +541,7 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 | Workflow and Job | Runner | What It Verifies |
 | :--- | :--- | :--- |
 | `ci.yml` build, vet, and audit | `ubuntu-24.04` | Formatting of the packages that `gvx` owns, a build of every package for six targets and for `-tags pagesize_16k`, `go vet` of the packages that `gvx` wrote, and the upstream audit. |
-| `ci.yml` test linux | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages, the Linux lockdown without cgo, and a guest run on the upstream `systrap` platform with and without the lockdown. |
+| `ci.yml` test linux | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages. Without cgo: `pkg/hostlockdown`, `pkg/gvx`, and the whole `e2e` suite with the seccomp lockdown on. Guest runs on the upstream `systrap` platform with and without the lockdown. |
 | `ci.yml` test darwin/arm64 | `macos-15` | The owned packages through `scripts/codesign-exec.sh`, then the `systrap` engine, the SDK, and the CLI with `-tags pagesize_16k`. |
 | `ci.yml` test windows/amd64 | `windows-latest` | The owned packages, a report of the hypervisor state, and an attempt to boot a guest on `whpx`. |
 | `e2e-images.yml` | `macos-15` | The registry gates on the `systrap` engine, once a week. |

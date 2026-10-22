@@ -40,7 +40,7 @@ Run an unmodified OCI image or ELF binary from the CLI via `cmd/rungv`, or embed
 Use these steps to compile `rungv` and run an unmodified OCI image on Windows or macOS:
 
 > [!IMPORTANT]
-> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On Linux, build with `CGO_ENABLED=0`. The upstream systrap platform hangs in a cgo build, and the host lockdown restricts every thread. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
+> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On Linux, build with `CGO_ENABLED=0`. The upstream systrap platform hangs in a cgo build. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
 
 1. Build `rungv` with the standard Go 1.25+ toolchain (and apply ad-hoc signing on macOS for `hvf`).
 2. Run an unmodified OCI image (`nginx:alpine`) with `-p 8080:80` port forwarding and `-net=nat` networking.
@@ -169,7 +169,7 @@ On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTo
 
 On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(deny default)` Seatbelt profile through `sandbox_init`. The profile denies process creation and new host file opens. After `Apply`, `getaddrinfo` and reads of `/etc/resolv.conf` fail, so `pkg/netbackend` reads the DNS resolvers before the lockdown.
 
-On Linux (`lockdown_linux.go`), it sets `PR_SET_NO_NEW_PRIVS` and a Landlock domain on every thread. The domain denies every new file access outside the workspace, including `execve`, and blocks new TCP connections when the kernel supports Landlock ABI 4. It needs Landlock ABI 8 (the `LANDLOCK_RESTRICT_SELF_TSYNC` flag) and a build without cgo. An older kernel returns `ErrUnsupported`, and `rungv` then refuses to run unless you pass `-lockdown=false`. Landlock does not restrict UDP.
+On Linux (`lockdown_linux.go` and `pkg/gvx/syscallfilter_linux.go`), it installs the seccomp allowlist of the gVisor Sentry on every thread. A call outside the allowlist kills the process. The calls `execve`, `clone`, `openat`, and `socket` return `EPERM` instead, so that code in the embedding process sees an error. Seccomp reads no path. With a workspace, an `openat` relative to a directory descriptor can still open an absolute path, and `UnboundFileOpenBlocked` reports false. gVisor closes this gap with a mount namespace and `chroot`, which a library cannot create without privilege. Build with `CGO_ENABLED=0`. The upstream `systrap` platform hangs at startup in a cgo build, and `New` returns `ErrPlatformUnavailable`.
 
 ### 3.6 Upstream Tracking and Three-Tier Isolation
 
