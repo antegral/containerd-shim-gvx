@@ -210,8 +210,8 @@ type siteInfo struct {
 	reg  uint8
 }
 
-// patchPage replaces the instructions that Windows cannot run with BRK. page
-// is a copy of the original frame.
+// patchPage replaces the instructions that Windows cannot run with BRK or
+// NOP. page is a copy of the original frame.
 func (as *addressSpace) patchPage(_ context.Context, _ platform.MemoryManager, _ uint64, page []byte) (map[uint16]siteInfo, error) {
 	sites := make(map[uint16]siteInfo)
 	for _, s := range scanARM64(page) {
@@ -232,9 +232,13 @@ func (as *addressSpace) patchPage(_ context.Context, _ platform.MemoryManager, _
 	}
 	for off := 0; off+4 <= len(page); off += 4 {
 		w := binary.LittleEndian.Uint32(page[off:])
-		if w&^arm64RegMask == arm64ICIVAU {
+		switch {
+		case w&^arm64RegMask == arm64ICIVAU:
 			binary.LittleEndian.PutUint32(page[off:], brkWord(brkICIVAU))
 			sites[uint16(off)] = siteInfo{kind: siteICIVAU, reg: uint8(w & arm64RegMask)}
+		case isDataCacheMaintenance(w):
+			// No stop is needed: the operation has no effect to emulate.
+			binary.LittleEndian.PutUint32(page[off:], arm64NOP)
 		}
 	}
 	return sites, nil
