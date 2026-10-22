@@ -246,6 +246,10 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		tracef("pid %d thread %d: no FS repair, trampoline: %v", th.sp.pid, th.tid, err)
 		return false
 	}
+	if traceEvents {
+		tracef("pid %d thread %d: FS repair at pc %#x, fault at %#x, access %d, %v after the last repair at %#x",
+			th.sp.pid, th.tid, pc, ev.Info[1], ev.Info[0], now.Sub(th.fsFix.at), th.fsFix.pc)
+	}
 	if th.fsFix.pc == pc && now.Sub(th.fsFix.at) < fsRepairWindow {
 		th.fsFix.n++
 	} else {
