@@ -150,12 +150,13 @@ These numbers come from the engine tests and the stub probe on the hosted runner
 | Create and release 25 address spaces (`TestAddressSpaceChurn`) | 0.4 to 0.5 s | 0.8 s |
 | FS base repairs during 1.5 billion loop iterations | 9 to 12 | not applicable |
 | One `fork` in a shell loop | 33 ms | 27 ms |
-| One `fork` and `exec` of `/bin/true` | 89 ms | 58 ms |
+| One `fork` and `exec` of `/bin/true`, without the pool | 89 ms | 58 ms |
+| One `fork` and `exec` of `/bin/true`, with the pool | 50 ms | 31 ms |
 | One system call in a `dd` loop | 141 µs | 80 µs |
 | `git add` of 200 small files, sparse memory file | 8 to 12 s | 12 to 19 s |
 | `git add` of 200 small files, dense memory file | 1.3 s | 0.8 s |
 
-The cost of a system call is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each start a stub process, which costs 27 to 60 ms.
+The cost of a system call is the cost of the debug path. A fast path would pay the event round trip of section 3.2 instead. A `fork` and an `exec` each need a stub process. A stub that starts on demand costs 10 to 20 ms, and the pool of section 6.1 hides it.
 
 The memory file of the Sentry is a temporary NTFS file. An earlier version marked it sparse when it tried to release pages. The first write to each hole of a sparse file waits for NTFS to allocate a cluster. Samples of the guest program counter showed the guest blocked at store instructions, and the `git add` row above shows the cost. 
 
@@ -204,6 +205,8 @@ The `init` function of the package runs the host loop when the environment varia
 The host creates each stub with `CreateProcessAsUser`. It uses a copy of its own token without privileges at Low integrity, and it adds the Win32k and handle mitigations when Windows accepts them. It puts the stub in a job that allows one process, kills on close, and blocks all window operations. It attaches the stub to the debug object of the Sentry, because the lockdown can remove the right to debug a process from the Sentry. It duplicates the process and thread handles into the Sentry, and it keeps the job handle until the Sentry releases the stub.
 
 A stub reaches the ready state in four steps. The Sentry reserves the guest window as one placeholder while the stub is suspended. It resumes the initial thread, and the loader runs. The loader raises the initial breakpoint of a debuggee. The Sentry suspends the initial thread there, replies, and never resumes it. The stub is then fully initialized and idle.
+
+The platform keeps two ready stubs in a pool. One goroutine fills the pool while the guests run, and a fork or an exec takes a stub from it. A bring-up takes 20 ms on `arm64` and 10 ms on `amd64`, and the loader needs most of that time. The pool hides that time when the guest does other work between two forks. When the pool is empty, the call starts a stub itself. `Close` terminates the stubs that no guest took.
 
 ### 6.2 Address Space
 
@@ -336,6 +339,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39809735687`, `39811366093` | both | Stub design: initialized stub, start trap, park and resume, `x18` and `TPIDR_EL0` across stops, Low-integrity token, job, Win32k, second stub on one debug object. |
 | `39864134146`, `39864138530` | both | Cost of `fork`, `exec`, and system calls from the host side. |
 | `39866441714`, `39866444969`, `39869493336`, `39869496938` | both | `git add` with the sparse and with the dense memory file. |
+| `39872809703`, `39872813269` | both | Cost of `fork` and `exec` with the stub pool. |
 | `39870353585` | both | The registry gates on the systrap engine: Alpine, nginx with port forwarding, Python, Node, the POSIX torture script, `git` workloads, and the Node modules torture. All pass in 207 s (`amd64`) and 281 s (`arm64`). |
 | `39845577561`, `39846215053` | `arm64` | Node 22 gates: SIGILL at `dc civac`, then both gates pass with the `nop` replacement. |
 | `39853085199`, `39854000516` | `amd64` | Shell pipeline hang on an AMD EPYC 9V74 runner: 12 of 12 runs. The state dump shows a `call` at the end of a page. |
