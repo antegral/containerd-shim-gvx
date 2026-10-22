@@ -767,7 +767,10 @@ func (e *env) mapFile(fd *vfs.FileDescription, length uint64, writable bool) (me
 }
 
 func TestMappedPagesWriteBackAndStayCoherent(t *testing.T) {
-	e := newEnv(t)
+	forEachChunkMode(t, testMappedPagesWriteBackAndStayCoherent)
+}
+
+func testMappedPagesWriteBackAndStayCoherent(t *testing.T, e *env) {
 	content := bytes.Repeat([]byte("a"), 3*hostarch.PageSize+100)
 	e.writeFile("m", content)
 	fd := e.mustOpen("m", linux.O_RDWR)
@@ -785,14 +788,22 @@ func TestMappedPagesWriteBackAndStayCoherent(t *testing.T) {
 		t.Fatalf("translation perms = %v, want write", ts[0].Perms)
 	}
 	view := func(off, length uint64) []byte {
-		bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: off, End: off + length}, rw)
-		if err != nil {
-			t.Fatalf("MapInternal: %v", err)
+		for _, tr := range ts {
+			if off < tr.Source.Start || off+length > tr.Source.End {
+				continue
+			}
+			start := tr.Offset + off - tr.Source.Start
+			bs, err := tr.File.MapInternal(memmap.FileRange{Start: start, End: start + length}, rw)
+			if err != nil {
+				t.Fatalf("MapInternal: %v", err)
+			}
+			if bs.NumBlocks() != 1 {
+				t.Fatalf("MapInternal returned %d blocks", bs.NumBlocks())
+			}
+			return bs.Head().ToSlice()
 		}
-		if bs.NumBlocks() != 1 {
-			t.Fatalf("MapInternal returned %d blocks", bs.NumBlocks())
-		}
-		return bs.Head().ToSlice()
+		t.Fatalf("no translation covers [%d, %d): %v", off, off+length, ts)
+		return nil
 	}
 	copy(view(0, 8), "mapped!!")
 
@@ -834,7 +845,10 @@ func TestMappedPagesWriteBackAndStayCoherent(t *testing.T) {
 }
 
 func TestTruncateInvalidatesMappings(t *testing.T) {
-	e := newEnv(t)
+	forEachChunkMode(t, testTruncateInvalidatesMappings)
+}
+
+func testTruncateInvalidatesMappings(t *testing.T, e *env) {
 	e.writeFile("m", bytes.Repeat([]byte("z"), 4*hostarch.PageSize))
 	fd := e.mustOpen("m", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
@@ -885,7 +899,10 @@ func TestSyncReportsHostFlushFailure(t *testing.T) {
 }
 
 func TestMappedWriteBackFailureSurfacesAtSyncAndClose(t *testing.T) {
-	e := newEnv(t)
+	forEachChunkMode(t, testMappedWriteBackFailureSurfacesAtSyncAndClose)
+}
+
+func testMappedWriteBackFailureSurfacesAtSyncAndClose(t *testing.T, e *env) {
 	e.writeFile("w", bytes.Repeat([]byte("q"), hostarch.PageSize))
 	fd := e.mustOpen("w", linux.O_RDWR)
 	defer fd.DecRef(e.ctx)
@@ -894,7 +911,7 @@ func TestMappedWriteBackFailureSurfacesAtSyncAndClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: 0, End: 4}, hostarch.ReadWrite)
+	bs, err := ts[0].File.MapInternal(memmap.FileRange{Start: ts[0].Offset, End: ts[0].Offset + 4}, hostarch.ReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -99,6 +99,7 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return cleanup(err)
 	}
 	sb.memFile = mf
+	sb.attachChunkMemory()
 
 	if !cfg.DisableHostLockdown {
 		st, err := hostlockdown.Apply(sb.lockdownOptions())

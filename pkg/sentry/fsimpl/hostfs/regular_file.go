@@ -16,6 +16,7 @@ package hostfs
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -419,6 +420,44 @@ const (
 type cacheChunk struct {
 	buf   []byte
 	dirty bool
+
+	// mem and fr locate the chunk in shared memory. They are zero when buf is
+	// Go heap memory.
+	mem ChunkMemory
+	fr  memmap.FileRange
+}
+
+// release returns shared memory to its owner. The memory stays valid for the
+// mappings that still hold a reference.
+func (ch *cacheChunk) release() {
+	if ch.mem != nil {
+		ch.mem.DecRef(ch.fr)
+		ch.mem = nil
+	}
+}
+
+// newChunk allocates the memory of one chunk. With ChunkMemory, the chunk
+// lives in a memory file, which a platform can map into a guest process by
+// file descriptor. Without it, the chunk lives on the Go heap.
+func (c *fileData) newChunk() (*cacheChunk, error) {
+	mem := c.ino.fs.ws.chunkMemory()
+	if mem == nil {
+		return &cacheChunk{buf: newChunkBuf()}, nil
+	}
+	fr, err := mem.AllocateChunk(chunkSize)
+	if err != nil {
+		return nil, err
+	}
+	bs, err := mem.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		mem.DecRef(fr)
+		return nil, err
+	}
+	if bs.NumBlocks() != 1 || bs.NumBytes() != chunkSize {
+		mem.DecRef(fr)
+		return nil, fmt.Errorf("hostfs: the chunk memory maps %d blocks of %d bytes, want one block of %d", bs.NumBlocks(), bs.NumBytes(), chunkSize)
+	}
+	return &cacheChunk{buf: bs.Head().ToSlice(), mem: mem, fr: fr}, nil
 }
 
 // newChunkBuf allocates one chunk aligned to chunkAlign. Go heap memory never
@@ -503,6 +542,9 @@ func (c *fileData) release() {
 
 // dropLocked frees every chunk and the attached handle.
 func (c *fileData) dropLocked() {
+	for _, ch := range c.chunks {
+		ch.release()
+	}
 	c.chunks = nil
 	c.active.Store(false)
 	if c.mh != nil {
@@ -606,6 +648,7 @@ func (c *fileData) truncated(size int64) {
 		base := int64(idx) << chunkShift
 		switch {
 		case base >= size:
+			ch.release()
 			delete(c.chunks, idx)
 		case base+chunkSize > size:
 			clear(ch.buf[size-base:])
@@ -623,11 +666,14 @@ func (c *fileData) chunkLocked(idx uint64) (*cacheChunk, error) {
 	if c.mh == nil {
 		return nil, linuxerr.ENODEV
 	}
-	buf := newChunkBuf()
-	if _, err := c.mh.f.ReadAt(buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
+	ch, err := c.newChunk()
+	if err != nil {
 		return nil, err
 	}
-	ch := &cacheChunk{buf: buf}
+	if _, err := c.mh.f.ReadAt(ch.buf, int64(idx<<chunkShift)); err != nil && !errors.Is(err, io.EOF) {
+		ch.release()
+		return nil, err
+	}
 	c.chunks[idx] = ch
 	return ch, nil
 }
@@ -738,16 +784,41 @@ func (c *fileData) Translate(ctx context.Context, required, optional memmap.Mapp
 		c.markDirtyLocked(mr.Start, mr.End)
 		perms.Write = true
 	}
-	ts := []memmap.Translation{{
-		Source: mr,
-		File:   &c.mf,
-		Offset: mr.Start,
-		Perms:  perms,
-	}}
+	ts := c.translationsLocked(mr, perms)
 	if beyondEOF {
 		return ts, &memmap.BusError{Err: io.EOF}
 	}
 	return ts, nil
+}
+
+// translationsLocked describes where the pages of mr live. Heap chunks form one
+// translation, and the heap file maps file offsets to chunk memory. Chunks in
+// shared memory need one translation each, because the allocator places chunks
+// apart. Every chunk of mr exists when this runs.
+func (c *fileData) translationsLocked(mr memmap.MappableRange, perms hostarch.AccessType) []memmap.Translation {
+	if c.chunks[mr.Start>>chunkShift].mem == nil {
+		return []memmap.Translation{{
+			Source: mr,
+			File:   &c.mf,
+			Offset: mr.Start,
+			Perms:  perms,
+		}}
+	}
+	var ts []memmap.Translation
+	for off := mr.Start; off < mr.End; {
+		idx := off >> chunkShift
+		ch := c.chunks[idx]
+		base := idx << chunkShift
+		end := min(mr.End, base+chunkSize)
+		ts = append(ts, memmap.Translation{
+			Source: memmap.MappableRange{Start: off, End: end},
+			File:   ch.mem,
+			Offset: ch.fr.Start + (off - base),
+			Perms:  perms,
+		})
+		off = end
+	}
+	return ts
 }
 
 // dataMemmapFile exposes the chunks of a fileData as a memmap.File. Offsets

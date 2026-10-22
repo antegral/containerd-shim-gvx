@@ -39,9 +39,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 const (
@@ -170,6 +172,10 @@ type Workspace struct {
 	stop     chan struct{}
 	done     chan struct{}
 
+	// chunkMem holds the shared memory for the chunks of mapped files, or nil
+	// when chunks live on the Go heap.
+	chunkMem atomic.Pointer[chunkMemoryHolder]
+
 	// beforeMetaRename lets tests stop a flush between the temporary file
 	// write and the rename, which models a crash.
 	beforeMetaRename func() error
@@ -178,6 +184,34 @@ type Workspace struct {
 type workspaceOptions struct {
 	coalesce         time.Duration
 	beforeMetaRename func() error
+}
+
+// ChunkMemory supplies the memory for the chunks of mapped files. A platform
+// that runs guest code in another process maps guest pages by file descriptor,
+// so it cannot use Go heap memory. The Linux systrap platform is one.
+type ChunkMemory interface {
+	memmap.File
+
+	// AllocateChunk returns a zeroed range of length bytes. The caller holds
+	// one reference, which it drops with DecRef.
+	AllocateChunk(length uint64) (memmap.FileRange, error)
+}
+
+type chunkMemoryHolder struct{ m ChunkMemory }
+
+// SetChunkMemory makes mem back the chunks that files create from now on. Call
+// it once before the first mapping, and only with memory that outlives every
+// mapping.
+func (w *Workspace) SetChunkMemory(mem ChunkMemory) {
+	w.chunkMem.Store(&chunkMemoryHolder{m: mem})
+}
+
+// chunkMemory returns the shared chunk memory, or nil.
+func (w *Workspace) chunkMemory() ChunkMemory {
+	if h := w.chunkMem.Load(); h != nil {
+		return h.m
+	}
+	return nil
 }
 
 // OpenWorkspace opens hostPath via os.OpenRoot prior to hostlockdown.Apply()
