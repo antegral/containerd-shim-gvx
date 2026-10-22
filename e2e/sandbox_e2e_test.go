@@ -169,8 +169,13 @@ func runTool(t *testing.T, bin string, args ...string) (stdout, stderr string, c
 
 // requireRegistry skips the calling test when Docker Hub is unreachable.
 // GVX_E2E_REQUIRE_NETWORK=1 turns the skip into a failure for CI runs.
+// GVX_E2E_OFFLINE=1 skips without a probe, so the per-push CI jobs spend no
+// time on registry pulls. The weekly image workflow leaves it unset.
 func requireRegistry(t *testing.T) {
 	t.Helper()
+	if os.Getenv("GVX_E2E_OFFLINE") == "1" {
+		t.Skip("registry tests are off (GVX_E2E_OFFLINE=1)")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, oci.DefaultRegistryBaseURL+"/v2/", nil)

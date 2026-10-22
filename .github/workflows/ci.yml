@@ -1,0 +1,151 @@
+name: ci
+
+# The jobs cost little: they run on push to main and on pull requests, cancel
+# superseded runs, skip documentation-only changes, and reuse the Go caches.
+# Tests that pull real images run in e2e-images.yml, once a week or on demand.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+  # Packages that gvx owns. The upstream gVisor trees have their own tests,
+  # which the project does not run.
+  OWNED: >-
+    ./cmd/... ./internal/... ./tools/upstream/... ./pkg/gvx/... ./pkg/oci/...
+    ./pkg/netbackend/... ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/...
+    ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/...
+    ./pkg/sync/... ./pkg/sentry/pgalloc/... ./pkg/sentry/time/...
+    ./pkg/sentry/hostcpu/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/...
+    ./pkg/sentry/platform/whpx/...
+
+jobs:
+  build:
+    name: build, vet, and audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting of the packages that gvx owns
+        run: |
+          unformatted=$(gofmt -l cmd e2e internal tools/upstream pkg/gvx pkg/oci pkg/netbackend \
+            pkg/hostlockdown pkg/syserr pkg/sentry/platform/hvf pkg/sentry/platform/whpx \
+            pkg/sentry/fsimpl/hostfs)
+          test -z "$unformatted" || { echo "$unformatted"; exit 1; }
+      - name: Build every package for the six targets
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
+            echo "::group::build $target"
+            GOOS=${target%/*} GOARCH=${target#*/} go build ./...
+            echo "::endgroup::"
+          done
+          echo "::group::build darwin/arm64 with pagesize_16k"
+          GOOS=darwin GOARCH=arm64 go build -tags pagesize_16k ./...
+          echo "::endgroup::"
+      - name: Vet the packages that gvx owns for the six targets
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
+            echo "::group::vet $target"
+            GOOS=${target%/*} GOARCH=${target#*/} go vet $OWNED ./e2e/...
+            echo "::endgroup::"
+          done
+          GOOS=darwin GOARCH=arm64 go vet -tags pagesize_16k ./pkg/sentry/platform/... ./pkg/gvx/... ./e2e/...
+      - name: Cache the pinned upstream archive
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/gvx/upstream
+          key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
+      - name: Audit the upstream diff
+        run: go run ./tools/upstream -mode=audit -max-ratio=0.05
+
+  linux:
+    name: test linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test the packages that gvx owns
+        run: go test -race -count=1 $OWNED
+
+  darwin-arm64:
+    name: test darwin/arm64
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      # A hosted runner is a virtual machine, so it cannot create a nested VM.
+      # Tests that need Hypervisor.framework skip. The 16KB build runs the
+      # same suites on the systrap engine, which needs no hypervisor.
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+      GVX_E2E_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test the packages that gvx owns
+        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED
+      - name: Test the systrap engine and the SDK with 16KB pages
+        run: |
+          go test -race -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
+            ./pkg/sentry/platform/systrap/... ./pkg/gvx/... ./cmd/...
+      - name: Run the systrap end-to-end tests that need no registry
+        run: |
+          go test -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
+            -run 'TestE2ESystrap|TestE2ERungvSystrap' ./e2e
+
+  windows-amd64:
+    name: test windows/amd64
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test the packages that gvx owns
+        shell: bash
+        run: go test -count=1 $OWNED
+      - name: Report the hypervisor state of the runner
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform | Format-List FeatureName, State
+          Get-CimInstance Win32_ComputerSystem | Format-List Model, HypervisorPresent
+          Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
+      - name: Build rungv and a guest, then try to run it
+        shell: bash
+        # The hosted runner may lack the Windows Hypervisor Platform. The step
+        # reports the outcome and does not fail the job. The unit tests above
+        # cover the code that does not need a hypervisor.
+        continue-on-error: true
+        run: |
+          go build -o rungv.exe ./cmd/rungv
+          go run ./internal/testelf/cmd/mkelf -o smoke.elf
+          ./rungv.exe stub || true
+          ./rungv.exe run -platform=auto -net=none -bin=smoke.elf | tee smoke.out
+          grep -q gvx-smoke-ok smoke.out

@@ -380,6 +380,7 @@ func TestInterruptEndsAWaitForAVCPU(t *testing.T) {
 }
 
 func TestCloseDestroysVCPUsAndTheVM(t *testing.T) {
+	requireHypervisor(t)
 	for i := range 8 {
 		p, err := New()
 		if err != nil {
@@ -407,6 +408,7 @@ func TestCloseDestroysVCPUsAndTheVM(t *testing.T) {
 }
 
 func TestPlatformsShareOneVMUntilTheLastCloses(t *testing.T) {
+	requireHypervisor(t)
 	a, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -432,6 +434,7 @@ func TestPlatformsShareOneVMUntilTheLastCloses(t *testing.T) {
 }
 
 func TestUseAfterCloseFailsExplicitly(t *testing.T) {
+	requireHypervisor(t)
 	p, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -463,6 +466,7 @@ func TestUseAfterCloseFailsExplicitly(t *testing.T) {
 }
 
 func TestCloseStopsAGuestThatIsRunning(t *testing.T) {
+	requireHypervisor(t)
 	p, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -479,6 +483,7 @@ func TestCloseStopsAGuestThatIsRunning(t *testing.T) {
 }
 
 func TestCloseRacingWithSwitchNeverHangs(t *testing.T) {
+	requireHypervisor(t)
 	for i := range 60 {
 		p, err := New()
 		if err != nil {

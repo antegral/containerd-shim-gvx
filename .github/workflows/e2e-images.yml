@@ -1,0 +1,39 @@
+name: e2e-images
+
+# These tests pull real images from Docker Hub, so they run once a week and on
+# demand instead of on every push. The hosted macOS runner has no hypervisor.
+# The jobs run the systrap variants of the gates, which need none.
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-images
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  darwin-arm64-systrap:
+    name: systrap gates on darwin/arm64
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GVX_ALLOW_NO_HYPERVISOR: "1"
+      GVX_E2E_REQUIRE_NETWORK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run the registry gates on the systrap engine
+        run: |
+          go test -count=1 -timeout 80m -tags pagesize_16k \
+            -exec "$PWD/scripts/codesign-exec.sh" \
+            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
+            ./e2e
