@@ -149,11 +149,17 @@ func (th *thread) dumpState() {
 		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d parked, pending events %d\n", th.tid, len(th.events))
 		return
 	}
+	if th.ctx == nil {
+		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d is the initial thread of the stub\n", th.tid)
+		return
+	}
 	if err := ntSuspendThread(th.h); err != nil {
+		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d: suspend: %v\n", th.tid, err)
 		return
 	}
 	defer func() { _ = ntResumeThread(th.h) }()
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
+		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d: get context: %v\n", th.tid, err)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d running, stepping %v, pending events %d, pc %#x sp %#x\n",
