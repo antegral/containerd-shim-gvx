@@ -13,7 +13,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Priority-0 Dual-OS & Dual-Arch** | Targets `windows/amd64`, `windows/arm64`, `darwin/arm64`, and `darwin/amd64` from one codebase. | Compiles and runs native `linux/amd64` and `linux/arm64` ELF64 workloads on Windows and macOS. |
 | **Zero Runtime Elevation** | Runs under a standard user account and locks down the host process before guest entry. | Requires no UAC prompts, no `sudo`/`root`, no kernel drivers/kexts, and no background daemons. |
 | **Hardware 4KB Paging (`whpx` & `hvf`)** | Uses `WinHvPlatform.dll` (Windows) and `Hypervisor.framework` (macOS) with 4KB EPT and Stage-1/Stage-2 tables. | Bypasses the Windows 64KB `VirtualAlloc` limit and the Apple Silicon 16KB host page limit. |
-| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` across Linux, macOS (`darwinsystrap`), and Windows (`winsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. | Executes ELF64 binaries, JIT runtimes (V8, JVM), and Rosetta 2 / Prism cross-arch workloads when hardware virtualization is disabled. |
+| **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows returns `ErrUnavailable`. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
 | **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
 | **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Modifies less than 5% of upstream gVisor and builds via `go build` on Go 1.25+. |
@@ -154,7 +154,7 @@ gvx/ (Fork of google/gvisor@go)
  │       │       ├── systrap_darwin_amd64.go # [NEW] Returns ErrUnavailable
  │       │       └── stub/                  # [NEW] C and assembly sources and the signed arm64 stub binary
  │       └── fsimpl/
- │           └── hostfs/                    # [NEW] Secure os.Root + .gvx_meta host mount (Windows & macOS)
+ │           └── hostfs/                    # [NEW] Secure os.Root + .gvx_meta host mount (Windows, macOS, and Linux)
  │               ├── hostfs.go
  │               ├── inode_windows.go
  │               ├── inode_darwin.go

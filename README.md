@@ -229,7 +229,7 @@ This table maps each implementation milestone to its deliverables and verificati
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | Boot static `busybox` (`PID 1`) via `platform/whpx` (Windows) and `platform/hvf` (macOS) on `amd64` and `arm64` and reach an interactive `busybox ash` prompt. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | Implement `clone`, `futex`, signals, TLS (`ARCH_SET_FS` & `TPIDR_EL0`), VDSO, `pkg/netbackend` (`-net=nat -p` & `-net=wg`), and `pkg/oci`. Boot `alpine:3.20` and `nginx:alpine`. |
 | **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | Pass POSIX rename and unlink tests (`git rebase`, `bun install`) on `/workspace` and verify `pkg/hostlockdown` blocks child process spawning on Windows and macOS. |
-| **M5** | **Unified `systrap` Fallback Engine (`winsystrap` & `darwinsystrap`)** | Implement lazy page-trap `arm64asm`/`x86asm` syscall patchers, trampoline islands, `sysmsg` stub subprocesses, and Status: macOS `arm64` runs real guests and needs `pagesize_16k`. Windows returns `*ErrUnavailable`. The Rosetta 2 cross-arch engine on macOS is dropped. |
+| **M5** | **Unified `systrap` Fallback Engine (`darwinsystrap`; `winsystrap` is not implemented)** | Lazy page-trap `arm64asm` syscall patcher, trampoline islands, and `sysmsg` stub subprocesses. Status: macOS `arm64` runs real guests and needs `pagesize_16k`. Windows returns `*ErrUnavailable`. The Rosetta 2 and Prism cross-arch engines are dropped. |
 
 ---
 
