@@ -186,6 +186,7 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/oci"}, "pkg/erofs", "SPEC section 3.6 compiles layer tarballs with the upstream erofs ABI"},
 	{[]string{"pkg/oci"}, "github.com/klauspost/compress/*", "zstd-compressed OCI layers"},
 	{[]string{"pkg/oci"}, "github.com/cespare/xxhash/*", "content-addressed layer cache keys"},
+	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "the Windows layer cache opens files with full sharing and renames with POSIX semantics"},
 }
 
 // boundaryTestExceptions apply to _test.go files only.

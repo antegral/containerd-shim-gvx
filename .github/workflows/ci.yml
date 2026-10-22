@@ -118,6 +118,30 @@ jobs:
           go-version-file: go.mod
       - name: Test the packages that gvx owns
         run: go test -race -count=1 $OWNED
+      - name: Test the Linux lockdown
+        # The lockdown restricts every thread, which the Go runtime allows only
+        # without cgo. The race detector needs cgo, so this step runs apart.
+        run: CGO_ENABLED=0 go test -count=1 -v ./pkg/hostlockdown/
+      - name: Build rungv and a guest
+        run: |
+          CGO_ENABLED=0 go build -o rungv ./cmd/rungv
+          go run ./internal/testelf/cmd/mkelf -o smoke.elf
+      - name: Run the guest on the upstream systrap platform without the lockdown
+        env:
+          GVX_DEBUG_LOG: "1"
+        run: |
+          ./rungv stub
+          ./rungv run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          cat smoke.out
+          grep -q gvx-smoke-ok smoke.out
+      - name: Run the guest under the host lockdown
+        env:
+          GVX_DEBUG_LOG: "1"
+        run: |
+          mkdir -p workspace
+          ./rungv run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          cat smoke.out
+          grep -q gvx-smoke-ok smoke.out
 
   darwin-arm64:
     name: test darwin/arm64

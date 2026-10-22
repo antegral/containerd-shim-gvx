@@ -195,7 +195,7 @@ func (c *LayerCache) HasLayer(digest string) (string, bool) {
 // integrity record, unless this process already verified the same file.
 func (c *LayerCache) openVerifiedLayer(hexStr string) (*os.File, error) {
 	p := filepath.Join(c.dir, hexStr+c.layerSuffix())
-	f, err := os.Open(p)
+	f, err := openShared(p)
 	if err != nil {
 		return nil, fmt.Errorf("oci: open cached EROFS layer %q: %w", p, err)
 	}
@@ -216,7 +216,7 @@ func (c *LayerCache) openVerifiedLayer(hexStr string) (*os.File, error) {
 		return f, nil
 	}
 
-	record, err := os.ReadFile(c.sumPath(hexStr))
+	record, err := readFileShared(c.sumPath(hexStr))
 	if err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("%w: read integrity record of %q: %w", ErrCacheCorrupt, p, err)
@@ -365,7 +365,7 @@ func (c *LayerCache) compileAndStore(spec layerSpec, src io.Reader) (string, Com
 		return "", CompileStats{}, err
 	}
 	target := filepath.Join(c.dir, hexKey+c.layerSuffix())
-	if err := os.Rename(tmpPath, target); err != nil {
+	if err := replaceFile(tmpPath, target); err != nil {
 		return "", CompileStats{}, fmt.Errorf("oci: rename cached layer %q: %w", target, err)
 	}
 	committed = true
@@ -397,7 +397,7 @@ func writeFileAtomic(dir, name string, data []byte) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("oci: close %q: %w", name, err)
 	}
-	if err := os.Rename(tmpPath, filepath.Join(dir, name)); err != nil {
+	if err := replaceFile(tmpPath, filepath.Join(dir, name)); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("oci: publish %q: %w", name, err)
 	}
@@ -530,7 +530,7 @@ func (c *LayerCache) LoadCachedImage(baseURL, repository, reference, targetArch 
 	baseURL, repository, reference, targetArch = normalizePullArgs(baseURL, repository, reference, targetArch)
 	digest := reference
 	if !isDigestRef(reference) {
-		raw, err := os.ReadFile(c.tagRecordPath(baseURL, repository, reference, targetArch))
+		raw, err := readFileShared(c.tagRecordPath(baseURL, repository, reference, targetArch))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil, ErrNotCached
@@ -552,7 +552,7 @@ func (c *LayerCache) LoadCachedImage(baseURL, repository, reference, targetArch 
 
 // loadImageByDigest loads and re-verifies the record of a manifest digest.
 func (c *LayerCache) loadImageByDigest(baseURL, repository, digest, arch string) (*ResolvedImage, error) {
-	raw, err := os.ReadFile(c.imageRecordPath(baseURL, repository, digest, arch))
+	raw, err := readFileShared(c.imageRecordPath(baseURL, repository, digest, arch))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrNotCached
@@ -648,7 +648,7 @@ func (c *LayerCache) ImportCachedImage(src *LayerCache, baseURL, repository, ref
 		}
 	}
 
-	rawRec, err := os.ReadFile(src.imageRecordPath(baseURL, repository, img.ManifestDigest, targetArch))
+	rawRec, err := readFileShared(src.imageRecordPath(baseURL, repository, img.ManifestDigest, targetArch))
 	if err != nil {
 		return nil, fmt.Errorf("oci: read source image record: %w", err)
 	}
@@ -671,7 +671,7 @@ func (c *LayerCache) importLayer(src *LayerCache, hexStr string) error {
 		return err
 	}
 	defer in.Close()
-	record, err := os.ReadFile(src.sumPath(hexStr))
+	record, err := readFileShared(src.sumPath(hexStr))
 	if err != nil {
 		return fmt.Errorf("oci: read integrity record of %s: %w", hexStr, err)
 	}
@@ -708,7 +708,7 @@ func (c *LayerCache) importLayer(src *LayerCache, hexStr string) error {
 	if err := writeFileAtomic(c.dir, hexStr+c.sumSuffix(), record); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpPath, filepath.Join(c.dir, hexStr+c.layerSuffix())); err != nil {
+	if err := replaceFile(tmpPath, filepath.Join(c.dir, hexStr+c.layerSuffix())); err != nil {
 		return fmt.Errorf("oci: publish layer %s: %w", hexStr, err)
 	}
 	committed = true

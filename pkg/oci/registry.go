@@ -541,7 +541,7 @@ func loadDockerConfigAuth(rawTargetURL string) (dockerCredential, bool) {
 	if cfgPath == "" {
 		return dockerCredential{}, false
 	}
-	raw, err := os.ReadFile(cfgPath)
+	raw, err := readFileShared(cfgPath)
 	if err != nil {
 		return dockerCredential{}, false
 	}
