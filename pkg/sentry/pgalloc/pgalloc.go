@@ -1105,9 +1105,7 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
 	if err := f.decommitFile(fr); err != nil {
-		if err != unix.ENOTSUP {
-			log.Warningf("Failed to decommit %v: %v", fr, err)
-		}
+		log.Warningf("Failed to decommit %v: %v", fr, err)
 		// Zero the pages manually. This won't reduce memory usage, but at
 		// least ensures that the pages will be zeroed when reallocated.
 		f.manuallyZero(fr)
