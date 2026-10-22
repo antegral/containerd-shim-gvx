@@ -65,16 +65,24 @@ func (s *Sandbox) syscallFilter() func() error {
 }
 
 // rejectedRules lists the calls that return EPERM when no allow rule matches.
+// The list is short on purpose, because every call here keeps the process
+// alive where the Sentry of runsc dies. Each call has a reason:
+//   - hostlockdown probes execve, execveat, clone, openat, and socket.
+//   - The Go runtime opens cgroup files once a second to adjust GOMAXPROCS and
+//     treats a failure as "no limit". Code in the embedding process may call
+//     os/exec, os.Open, or net.Dial, and expects an error from each.
+//
+// The calls open, creat, fork, vfork, clone3, and openat2 stay outside the
+// list, so they kill the process. The Go standard library does not call them
+// in a build without cgo.
 func rejectedRules() seccomp.SyscallRules {
 	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
 		unix.SYS_EXECVE:   seccomp.MatchAll{},
 		unix.SYS_EXECVEAT: seccomp.MatchAll{},
 		unix.SYS_CLONE:    seccomp.MatchAll{},
-		unix.SYS_CLONE3:   seccomp.MatchAll{},
 		unix.SYS_OPENAT:   seccomp.MatchAll{},
-		unix.SYS_OPENAT2:  seccomp.MatchAll{},
 		unix.SYS_SOCKET:   seccomp.MatchAll{},
-	}).Merge(archRejectedRules())
+	})
 }
 
 // embedderRules lists the host calls that gvx makes beyond the Sentry of runsc.
