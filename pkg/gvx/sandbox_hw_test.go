@@ -277,7 +277,7 @@ func TestSandboxWorkspaceAndPortForward(t *testing.T) {
 
 func TestSandboxWorkspaceAndPortForwardUnderSystrap(t *testing.T) {
 	systraptest.Require(t)
-	workspaceAndPortForward(t, PlatformSystrap, systrapStaticBase)
+	workspaceAndPortForward(t, PlatformSystrap, systrapBase())
 }
 
 // workspaceAndPortForward runs a guest HTTP server on platform, links the
@@ -367,23 +367,29 @@ func workspaceAndPortForward(t *testing.T, platform PlatformType, base uint64) {
 
 // staticBase returns the link address of a static test ELF that the backend of
 // PlatformAuto can load. A hardware backend accepts the classic 0x400000. A host
-// without a hypervisor falls back to the macOS systrap engine, which needs a
-// higher address.
+// without a hypervisor falls back to the systrap platform.
 func staticBase() uint64 {
 	if hvtest.Available() {
 		return 0x400000
 	}
-	return systrapStaticBase
+	return systrapBase()
 }
 
-// systrapStaticBase is a link address that the macOS systrap engine allows.
-// Its guest addresses start above the host reservations, which end at 0x7000000000
-// on Apple silicon, so the address sits at 16TB.
-const systrapStaticBase = 0x1000_0000_0000
+// systrapBase returns a link address that the systrap platform of the host
+// allows. The macOS engine places guest addresses above the host reservations,
+// which end at 0x7000000000 on Apple silicon, so it needs an address at 16TB.
+// The upstream Linux platform accepts the classic 0x400000, and the amd64 HTTP
+// server guest needs an address below 4GB.
+func systrapBase() uint64 {
+	if runtime.GOOS == "linux" {
+		return 0x400000
+	}
+	return 0x1000_0000_0000
+}
 
 func TestSandboxRunsStaticAndDynamicELF64UnderSystrap(t *testing.T) {
 	systraptest.Require(t)
-	staticELF, err := testelf.BuildGuestELF64At(runtime.GOARCH, systrapStaticBase, 0, "systrap-static\n")
+	staticELF, err := testelf.BuildGuestELF64At(runtime.GOARCH, systrapBase(), 0, "systrap-static\n")
 	if err != nil {
 		t.Fatalf("BuildGuestELF64At failed: %v", err)
 	}

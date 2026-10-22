@@ -109,14 +109,10 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-24.04
-            no_landlock: ""
-          # The arm64 image runs a kernel older than Landlock ABI 8. The
-          # lockdown refuses to start there, and the steps expect the refusal.
           - arch: arm64
             runner: ubuntu-24.04-arm
-            no_landlock: "1"
     env:
-      GVX_ALLOW_NO_LANDLOCK: ${{ matrix.no_landlock }}
+      GVX_E2E_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -124,13 +120,17 @@ jobs:
           go-version-file: go.mod
       - name: Test the packages that gvx owns
         run: go test -race -count=1 $OWNED
-      - name: Test the Linux lockdown
-        # The lockdown restricts every thread, which the Go runtime allows only
-        # without cgo. The race detector needs cgo, so this step runs apart.
-        run: CGO_ENABLED=0 go test -count=1 -v ./pkg/hostlockdown/
+      # The upstream systrap platform hangs while it starts in a cgo build, and
+      # the race detector needs cgo. The steps below build without cgo.
+      - name: Test the Linux lockdown and the end-to-end suite without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./pkg/hostlockdown/ ./pkg/gvx/ ./e2e/
       - name: Build rungv and a guest
+        env:
+          CGO_ENABLED: "0"
         run: |
-          CGO_ENABLED=0 go build -o rungv ./cmd/rungv
+          go build -o rungv ./cmd/rungv
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
       - name: Run the guest on the upstream systrap platform without the lockdown
         env:
@@ -140,21 +140,14 @@ jobs:
           ./rungv run -platform=systrap -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
           cat smoke.out
           grep -q gvx-smoke-ok smoke.out
-      - name: Run the guest under the host lockdown
+      - name: Run the guest under the seccomp lockdown
         env:
           GVX_DEBUG_LOG: "1"
         run: |
           mkdir -p workspace
-          if ./rungv run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err; then
-            cat smoke.out
-            grep -q gvx-smoke-ok smoke.out
-          elif [ "$GVX_ALLOW_NO_LANDLOCK" = 1 ] && grep -q "LANDLOCK_RESTRICT_SELF_TSYNC" smoke.err; then
-            echo "::notice::The kernel lacks Landlock ABI 8. rungv refused to run the guest without the lockdown."
-            cat smoke.err
-          else
-            cat smoke.err
-            exit 1
-          fi
+          ./rungv run -platform=auto -net=none -workspace=workspace -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; exit 1; }
+          cat smoke.out
+          grep -q gvx-smoke-ok smoke.out
 
   darwin-arm64:
     name: test darwin/arm64
