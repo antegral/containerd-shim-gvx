@@ -225,17 +225,25 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	fs := ac.StateData().Regs.Fs_base
 	pc := th.ctx.pc()
 	if fs == 0 || ev.Info[0] == avExecute {
+		if traceEvents && ev.Info[0] != avExecute && ev.Info[1] < 0x10000 {
+			tracef("pid %d thread %d: no FS repair, the guest FS base is zero, fault at %#x, pc %#x", th.sp.pid, th.tid, ev.Info[1], pc)
+		}
 		return false
 	}
 	now := time.Now()
 	if th.fsFix.pc == pc && now.Sub(th.fsFix.at) < fsRepairWindow && th.fsFix.n >= fsRepairLimit {
+		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x within %v", th.sp.pid, th.tid, th.fsFix.n, pc, fsRepairWindow)
 		return false
 	}
 	code := as.codeBytes(pc, 15)
 	if !hasFSPrefix(code) {
+		if traceEvents && ev.Info[1] < 0x10000 {
+			tracef("pid %d thread %d: no FS repair, no FS prefix at pc %#x, fault at %#x, code % x", th.sp.pid, th.tid, pc, ev.Info[1], code)
+		}
 		return false
 	}
 	if err := th.goThroughTrampoline(fs); err != nil {
+		tracef("pid %d thread %d: no FS repair, trampoline: %v", th.sp.pid, th.tid, err)
 		return false
 	}
 	if th.fsFix.pc == pc && now.Sub(th.fsFix.at) < fsRepairWindow {
