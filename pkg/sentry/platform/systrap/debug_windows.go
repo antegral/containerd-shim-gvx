@@ -71,7 +71,11 @@ var (
 )
 
 func tracef(format string, args ...any) {
-	if traceMuted.Load() || traceLines.Add(1) > 400 {
+	limit := int64(400)
+	if traceAll {
+		limit = 200000
+	}
+	if traceMuted.Load() || traceLines.Add(1) > limit {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "systrap: "+format+"\n", args...)
@@ -84,7 +88,72 @@ func newDebugger() (*debugger, error) {
 	}
 	d := &debugger{obj: obj, procs: make(map[uint32]*stubProc), done: make(chan struct{})}
 	go d.run()
+	if traceAll {
+		go d.watch()
+	}
 	return d, nil
+}
+
+// watch prints the state of every stub process every three seconds, so that a
+// trace of a hung guest shows which thread waits for what. GVX_SYSTRAP_TRACE=2
+// starts it.
+func (d *debugger) watch() {
+	tick := time.NewTicker(3 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-tick.C:
+			d.dumpState()
+		}
+	}
+}
+
+// dumpState prints one line for each stub process and each thread. A thread
+// that runs is suspended for the time that the call reads its registers.
+func (d *debugger) dumpState() {
+	d.mu.Lock()
+	procs := make([]*stubProc, 0, len(d.procs))
+	for _, sp := range d.procs {
+		procs = append(procs, sp)
+	}
+	d.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "systrap: watch: %d stub processes, %d foreign events\n", len(procs), d.foreign.Load())
+	for _, sp := range procs {
+		sp.mu.Lock()
+		threads := make([]*thread, 0, len(sp.threads))
+		for _, th := range sp.threads {
+			threads = append(threads, th)
+		}
+		sp.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "systrap: watch: pid %d dead %v dropped %d unknown %d threads %d\n",
+			sp.pid, sp.dead.Load(), sp.droppedEvents.Load(), sp.unknownThread.Load(), len(threads))
+		for _, th := range threads {
+			th.dumpState()
+		}
+	}
+}
+
+func (th *thread) dumpState() {
+	if !th.mu.TryLock() {
+		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d busy, pending events %d\n", th.tid, len(th.events))
+		return
+	}
+	defer th.mu.Unlock()
+	if th.parked {
+		fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d parked, pending events %d\n", th.tid, len(th.events))
+		return
+	}
+	if err := ntSuspendThread(th.h); err != nil {
+		return
+	}
+	defer func() { _ = ntResumeThread(th.h) }()
+	if err := th.getContext(th.ctx.gprFlags()); err != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "systrap: watch:   thread %d running, stepping %v, pending events %d, pc %#x sp %#x\n",
+		th.tid, th.stepping, len(th.events), th.ctx.pc(), th.ctx.sp())
 }
 
 // close stops the pump and closes the debug object. The kernel then kills

@@ -135,6 +135,9 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 			}
 			out := c.handleEvent(ctx, mm, as, th, ac, ev)
 			if out.done {
+				if traceAll && !traceMuted.Load() {
+					tracef("pid %d thread %d: switch returns, signal %v, error %v", th.sp.pid, th.tid, out.si != nil, out.err)
+				}
 				// The stop copied the general-purpose registers. The vector
 				// registers stay in the parked thread until PullFullState.
 				c.fpInThread = true
@@ -200,8 +203,8 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 
 // traceStop prints one stop for GVX_SYSTRAP_TRACE.
 func (th *thread) traceStop(as *addressSpace, ev debugEvent) {
-	tracef("thread %d: state %d code %#x addr %#x info %#x first %d, pc %#x sp %#x code bytes % x",
-		th.tid, ev.State, ev.Code, ev.Addr, ev.Info, ev.FirstChance, th.ctx.pc(), th.ctx.sp(), as.codeBytes(th.ctx.pc(), 16))
+	tracef("pid %d thread %d: state %d code %#x addr %#x info %#x first %d, pc %#x sp %#x code bytes % x",
+		th.sp.pid, th.tid, ev.State, ev.Code, ev.Addr, ev.Info, ev.FirstChance, th.ctx.pc(), th.ctx.sp(), as.codeBytes(th.ctx.pc(), 16))
 }
 
 // stopAndPull parks the thread at an exception and copies its registers into
