@@ -7,6 +7,8 @@
 *.dll
 *.so
 *.dylib
+# The Sentry embeds these vDSO images with go:embed. The build fails without them.
+!/pkg/sentry/loader/vdsodata/*.so
 
 # Test binary, built with `go test -c`
 *.test
@@ -20,6 +22,8 @@ profile.cov
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
+/upstream/
+/.upstream/
 
 # Go workspace file
 go.work
@@ -31,3 +35,5 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+/rungv
+/rungv.exe

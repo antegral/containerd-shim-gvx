@@ -20,7 +20,7 @@ Execute these numbered steps at the start of every task before editing repositor
 | Task Category | Required Skill (`.agents/skills/`) | Scope of Enforcement |
 | :--- | :--- | :--- |
 | **Umbrella Engineering** | [`just-good-practices`](.agents/skills/just-good-practices/SKILL.md) | Incremental implementation, guard clauses, and boundary error translation. |
-| **Go Implementation** | [`go-practices`](.agents/skills/go-practices/SKILL.md) | Go 1.25+ standard library usage, context ordering, `%w` / `errors.Join`, and `gojgp`. |
+| **Go Implementation** | [`go-practices`](.agents/skills/go-practices/SKILL.md) | Go 1.25+ standard library usage, context ordering, and `%w` / `errors.Join` (`gojgp` lint disabled). |
 | **API & Signatures** | [`api-design`](.agents/skills/api-design/SKILL.md) | Explicit resource ownership, typed options, and constructor dependency injection. |
 | **Code Health** | [`code-health`](.agents/skills/code-health/SKILL.md) | Shallow control flow, domain naming, and separation of pure logic from I/O. |
 | **Testing** | [`testing-practices`](.agents/skills/testing-practices/SKILL.md) | Hermetic fixtures, `testing/synctest`, and behavioral boundary assertions. |
@@ -35,8 +35,8 @@ Execute these numbered steps at the start of every task before editing repositor
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/platform/dbt`, `pkg/sentry/fsimpl/hostfs`, `e2e`, `tools/upstream`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
-| **Tier 2: Sibling `_windows.go` & `_darwin.go` Files** | `pkg/sync/*_{windows,darwin}.go`, `pkg/memutil/*_{windows,darwin}.go`, `pkg/fd/*_{windows,darwin}.go`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go` | Place alongside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
+| **Tier 1: Additive Packages** | `cmd/rungv`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/fsimpl/hostfs`, `e2e`, `tools/upstream`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
+| **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin}.go`, `pkg/memutil/*_{windows,darwin}.go`, `pkg/fd/*_{windows,darwin}.go`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Place alongside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip` | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below `5.0%`. |
 
 ---
@@ -49,12 +49,12 @@ Every subsystem that allocates host kernel handles, virtual memory arenas, or CP
 
 `pgalloc.MemoryFile` owns the backing shared memory created via `CreateFileMappingW` and `MapViewOfFile3` on Windows or `mmap(MAP_ANON)` and `mach_vm_remap` on macOS. `platform/whpx` (`WHvMapGpaRange`) and `platform/hvf` (`hv_vm_map`) map 4KB slices from `MemoryFile` into guest physical memory; `AddressSpace.Unmap()` unmaps GPA ranges before `MemoryFile` releases the backing pages.
 
-`platform/dbt` owns the guest virtual arena (`[guestArenaBase, guestArenaEnd)`) and decodes instructions using `golang.org/x/arch/x86/x86asm` (`amd64`) and `golang.org/x/arch/arm64/arm64asm` (`arm64`). Its fault handler (`AddVectoredExceptionHandler` on Windows; Mach/signal handler on macOS) inspects the faulting address first. It defers to the Go runtime for any fault outside `[guestArenaBase, guestArenaEnd)`.
+`platform/systrap` (`winsystrap` on Windows; `darwinsystrap` on macOS) owns the guest virtual arena (`[guestArenaBase, guestArenaEnd)`), shared `sysmsg` context pages, and 4KB Trampoline Islands. It disassembles executable pages on lazy execute faults using `golang.org/x/arch/x86/x86asm` (`amd64`) and `golang.org/x/arch/arm64/arm64asm` (`arm64`) to patch `syscall` (`0F 05`) and `svc #0` (`0xD4000001`) instructions in-place. Its fault handler (`AddVectoredExceptionHandler` and Nirvana Hook on Windows; Mach exception port and signal handler on macOS) inspects the faulting address first and defers to the Go runtime for any fault outside `[guestArenaBase, guestArenaEnd)`.
 
 ### 3.2 Host Handle and Lockdown Ordering
 
 > [!CAUTION]
-> Do not spawn child processes, open unbound host paths, or call `win32k` APIs after `hostlockdown.Apply()` returns. Windows Job Objects (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`) and macOS Seatbelt (`sandbox_init` with `deny process-fork` and `deny file-*`) reject or terminate violating calls immediately. Open all host handles (`whpx`/`hvf` VM, cached `.erofs` layers, `/workspace` `os.Root`, `-p` host listeners, and the `-net=wg` UDP socket) before calling `hostlockdown.Apply()`.
+> Do not spawn child processes, open unbound host paths, or call `win32k` APIs after `hostlockdown.Apply()` returns. Windows Job Objects (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`) and macOS Seatbelt (`sandbox_init` with `deny process-fork` and `deny file-*`) reject or terminate violating calls immediately. Open all host handles (`whpx`/`hvf` VM, pre-spawned `systrap` stub subprocess and `sysmsg` shared memory, cached `.erofs` layers, `/workspace` `os.Root`, `-p` host listeners, and the `-net=wg` UDP socket) before calling `hostlockdown.Apply()`.
 
 `pkg/fd.HostHandle` wraps every Windows `syscall.Handle` and macOS file descriptor with explicit `Close()` ownership. `pkg/oci` compiles multi-arch (`amd64`/`arm64`) OCI `.tar` layers in memory into cached `<sha256>.erofs` files without extracting files onto NTFS or APFS. `pkg/netbackend` routes `pkg/tcpip` traffic through either L4 Go `net` NAT and `-p` port forwarders (`-net=nat`) or an L3 in-memory `wireguard-go` tunnel (`-net=wg`). `pkg/sentry/fsimpl/hostfs` opens all workspace files relative to the pinned `os.Root` handle (`NtCreateFile` on Windows; `openat` on macOS). It enforces `FILE_OPEN_REPARSE_POINT` or `O_NOFOLLOW` and persists POSIX metadata to `.gvx_meta`.
 
@@ -62,7 +62,7 @@ Every subsystem that allocates host kernel handles, virtual memory arenas, or CP
 
 ## 4. Mandatory ASD-STE100 Documentation and Zero-Slop Standard
 
-All documentation (`README.md`, `AGENTS.md`, `docs/*.md`), code comments, and commit messages must obey **ASD-STE100**, **S1000D**, **ATA iSpec 2200**, and **MIL-STD-38784**. Refer to [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) for the complete lexicon and formatting rules.
+All documentation (`README.md`, `AGENTS.md`, `docs/*.md`), code comments, and commit messages must obey **ASD-STE100**, **S1000D**, **ATA iSpec 2200**, and **MIL-STD-38784**. Write all documentation, code comments, and commit messages in English. Refer to [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) for the complete lexicon and formatting rules.
 
 | ASD-STE100 / Deslop Rule | Mandatory Quantitative Constraint |
 | :--- | :--- |
@@ -75,23 +75,26 @@ All documentation (`README.md`, `AGENTS.md`, `docs/*.md`), code comments, and co
 | **S1000D Module Separation** | Separate Descriptive, Procedural, and Reference modules; never mix conceptual theory and numbered CLI steps in one block. |
 | **Pre-Procedure Safety Alerts** | Place `> [!CAUTION]`, `> [!WARNING]`, and `> [!IMPORTANT]` **immediately before** the procedure or code block they govern (`<= 3` controlled sentences). |
 | **Universal Heading Rule** | Never place two headings back-to-back without a 2-to-4 sentence scope lead or summary table. |
+| **English Only** | Write every code comment, documentation file, and commit message in English. Apply every rule in this table to that English text; never use Korean or another language. |
 
 ---
 
 ## 5. Build, Audit, and Verification Procedure (Procedural Module)
 
-Keep `e2e/` black-box tests 100% OS-agnostic across Windows and macOS (`pkg/gvx` and `cmd/rungv`), and isolate OS-specific unit tests to `*_darwin_test.go` and `*_windows_test.go`. Run these commands before completing any code or documentation task.
+Keep `e2e/` black-box tests 100% OS-agnostic across Windows and macOS (`pkg/gvx` and `cmd/rungv`), and isolate OS-specific unit tests to `*_darwin_test.go` and `*_windows_test.go`. Do not run `gojgp` lint on this repository; `gojgp` lint is disabled due to upstream gVisor code patterns. Run these commands before completing any code or documentation task.
 
-1. Format source files, run native unit and `e2e/` tests on `darwin/arm64`, and execute the `gojgp` static analyzer.
+> [!IMPORTANT]
+> Run `go test` through `scripts/codesign-exec.sh` on macOS. An unsigned test binary cannot verify TLS certificates. It skips the network image tests without a failure.
+
+1. Format source files and run native unit and `e2e/` tests on `darwin/arm64` with `scripts/codesign-exec.sh`.
 2. Cross-compile all packages across the four Priority-0 targets (`darwin/arm64`, `darwin/amd64`, `windows/amd64`, `windows/arm64`).
 3. Run the upstream diff audit tool to verify that modified upstream files remain below 5.0%.
 4. Execute the mechanical `ripgrep` checks from Section 9.2 of [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) against `README.md`, `AGENTS.md`, and `docs/`.
 
 ```bash
-# 1. Format, test natively on the active host (darwin/arm64 first), and run static analysis
+# 1. Format and test natively on the active host (darwin/arm64 first; gojgp lint is disabled)
 go fmt ./...
-go test -race ./...
-gojgp check
+go test -race -exec "$PWD/scripts/codesign-exec.sh" ./...
 
 # 2. Compile check across all four Priority-0 targets
 GOOS=darwin  GOARCH=arm64 go build ./...
