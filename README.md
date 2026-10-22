@@ -1,6 +1,6 @@
 # `gvx`
 
-`gvx` ports Google's gVisor user-space Linux kernel (Sentry) to 64-bit Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`, `darwin/amd64`) as co-equal Priority-0 targets. It executes unmodified Linux ELF64 binaries and multi-arch OCI container images inside one unprivileged host process via the `rungv` CLI or `pkg/gvx` SDK. Callers get isolated Linux execution on Windows and Mac with millisecond startup, no Linux virtual machine, no kernel drivers, and no administrator or `root` privileges.
+`gvx` ports Google's gVisor user-space Linux kernel (Sentry) to 64-bit Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`, `darwin/amd64`) as co-equal Priority-0 targets. It also supports Linux (`linux/amd64`, `linux/arm64`) officially. It executes unmodified Linux ELF64 binaries and multi-arch OCI container images inside one unprivileged host process via the `rungv` CLI or `pkg/gvx` SDK. Callers get isolated Linux execution on Windows and Mac with millisecond startup, no Linux virtual machine, no kernel drivers, and no administrator or `root` privileges.
 
 ---
 
@@ -40,7 +40,7 @@ Run an unmodified OCI image or ELF binary from the CLI via `cmd/rungv`, or embed
 Use these steps to compile `rungv` and run an unmodified OCI image on Windows or macOS:
 
 > [!IMPORTANT]
-> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
+> On Windows, enable the "Windows Hypervisor Platform" feature for `whpx`. On Linux, build with `CGO_ENABLED=0`, because the host lockdown restricts every thread. On macOS, sign the binary with the `com.apple.security.hypervisor` entitlement (`entitlements.plist`) for `hvf`. The `systrap` backend on macOS `arm64` needs the build tag `pagesize_16k`.
 
 1. Build `rungv` with the standard Go 1.25+ toolchain (and apply ad-hoc signing on macOS for `hvf`).
 2. Run an unmodified OCI image (`nginx:alpine`) with `-p 8080:80` port forwarding and `-net=nat` networking.
@@ -55,6 +55,9 @@ codesign --sign - --entitlements entitlements.plist --force ./rungv
 
 # Or build on Windows (amd64 or arm64)
 go build -o rungv.exe ./cmd/rungv
+
+# Or build on Linux (amd64 or arm64); the guest runs on the upstream systrap platform
+CGO_ENABLED=0 go build -o rungv ./cmd/rungv
 
 # Track A: Zero-config L4 NAT mode with -p port forwarding and OCI Tar-to-EROFS caching
 ./rungv run -net=nat -p=8080:80 -image=nginx:alpine -workspace=./my-project
@@ -136,7 +139,7 @@ Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path s
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
-`systrap` is implemented for macOS `arm64` only, and it needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). A Linux `ET_EXEC` image at `0x400000` does not load. On Windows, `New()` returns `*ErrUnavailable`. On macOS `amd64`, the project dropped the Rosetta 2 engine: a syscall-number Seatbelt filter on a translated process panicked the host kernel, and a stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
+`systrap` is implemented for macOS `arm64` only, and it needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). A Linux `ET_EXEC` image at `0x400000` does not load. On Windows, `New()` returns `*ErrUnavailable`. On macOS `amd64`, the project dropped the Rosetta 2 engine. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
 
 ### 3.2 Dual-Track Netstack and Port Forwarding (`pkg/netbackend`)
 
@@ -165,6 +168,8 @@ After opening the hypervisor handle, cached `.erofs` layers, `-p` / `-net=wg` so
 On Windows (`lockdown_windows.go`), it removes privileges in place via `AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED)` and lowers the primary token to `Low Integrity`. It also binds a `SE_GROUP_USE_FOR_DENY_ONLY` token to vCPU threads, enforces `JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 1`, and sets `DisallowWin32kSystemCalls = 1`. These Windows steps are compile-checked only.
 
 On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(deny default)` Seatbelt profile through `sandbox_init`. The profile denies process creation and new host file opens. After `Apply`, `getaddrinfo` and reads of `/etc/resolv.conf` fail, so `pkg/netbackend` reads the DNS resolvers before the lockdown.
+
+On Linux (`lockdown_linux.go`), it sets `PR_SET_NO_NEW_PRIVS` and a Landlock domain on every thread. The domain denies every new file access outside the workspace, including `execve`, and blocks new TCP connections when the kernel supports Landlock ABI 4. It needs Linux 5.13 or newer and a build without cgo. A host without Landlock returns `ErrUnsupported`. Landlock does not restrict UDP.
 
 ### 3.6 Upstream Tracking and Three-Tier Isolation
 
@@ -211,6 +216,8 @@ go run ./tools/upstream -mode=audit -max-ratio=0.05
 # Run the systrap engine tests on macOS arm64
 go test -race -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/platform/systrap/...
 ```
+
+GitHub Actions verifies every change. The workflow `ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner has no hypervisor, so it runs the `systrap` suites with `-tags pagesize_16k`. The workflow `e2e-images.yml` pulls real images once a week.
 
 ### 5.2 Implementation Roadmap (`M1` to `M5`)
 

@@ -20,6 +20,9 @@ on:
       tags:
         description: "Value of go test -tags (empty for none)"
         default: ""
+      script:
+        description: "Bash script to run instead of go test (empty runs go test)"
+        default: ""
 
 permissions:
   contents: read
@@ -46,7 +49,12 @@ jobs:
           PACKAGES: ${{ inputs.packages }}
           RUN: ${{ inputs.run }}
           TAGS: ${{ inputs.tags }}
+          SCRIPT: ${{ inputs.script }}
         run: |
+          if [ -n "$SCRIPT" ]; then
+            bash -c "$SCRIPT"
+            exit $?
+          fi
           args=(-count=1 -v)
           [ -n "$RUN" ] && args+=(-run "$RUN")
           [ -n "$TAGS" ] && args+=(-tags "$TAGS")

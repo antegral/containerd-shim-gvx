@@ -1,6 +1,6 @@
 # Agent Operating Manual (`AGENTS.md`)
 
-This manual defines the startup protocol, subsystem boundaries, upstream sync rules, and **ASD-STE100** writing gates for the `gvx` repository. `gvx` targets both Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`, `darwin/amd64`) as co-equal Priority-0 platforms.
+This manual defines the startup protocol, subsystem boundaries, upstream sync rules, and **ASD-STE100** writing gates for the `gvx` repository. `gvx` targets both Windows (`windows/amd64`, `windows/arm64`) and macOS (`darwin/arm64`, `darwin/amd64`) as co-equal Priority-0 platforms. It also supports Linux (`linux/amd64`, `linux/arm64`) officially. CI verifies every platform.
 
 > [!IMPORTANT]
 > Read [`docs/architecture.md`](docs/architecture.md) first at the start of every session before planning, writing code, or reviewing changes. Identify the target milestone (`M1` through `M5`) and verify the owning package boundary in [`docs/architecture.md`](docs/architecture.md) before modifying any file.
@@ -12,9 +12,9 @@ This manual defines the startup protocol, subsystem boundaries, upstream sync ru
 Execute these numbered steps at the start of every task before editing repository files.
 
 1. Read [`docs/architecture.md`](docs/architecture.md) to verify the subsystem architecture, syscall contracts, and milestone boundaries.
-2. Inspect the target package and its build constraints (`//go:build windows`, `//go:build darwin`, and `amd64`/`arm64` files).
+2. Inspect the target package and its build constraints (`//go:build windows`, `//go:build darwin`, `//go:build linux`, and `amd64`/`arm64` files).
 3. Activate the matching engineering skills under `.agents/skills/` from the routing table below.
-4. Implement and verify `darwin/arm64` code paths natively first in each milestone before adding `windows/{amd64,arm64}` and `darwin/amd64` bindings.
+4. Implement and verify `darwin/arm64` code paths natively first in each milestone before adding `windows/{amd64,arm64}` and `darwin/amd64` bindings. Run the new code on `windows/amd64` through CI as soon as it builds.
 5. Verify that the planned diff touches less than 5.0% of upstream gVisor files outside `_windows.go` and `_darwin.go` packages.
 
 | Task Category | Required Skill (`.agents/skills/`) | Scope of Enforcement |
@@ -87,20 +87,23 @@ Keep `e2e/` black-box tests 100% OS-agnostic across Windows and macOS (`pkg/gvx`
 > Run `go test` through `scripts/codesign-exec.sh` on macOS. An unsigned test binary cannot verify TLS certificates. It skips the network image tests without a failure.
 
 1. Format source files and run native unit and `e2e/` tests on `darwin/arm64` with `scripts/codesign-exec.sh`.
-2. Cross-compile all packages across the four Priority-0 targets (`darwin/arm64`, `darwin/amd64`, `windows/amd64`, `windows/arm64`).
+2. Cross-compile all packages across the four Priority-0 targets (`darwin/arm64`, `darwin/amd64`, `windows/amd64`, `windows/arm64`) and both Linux targets (`linux/amd64`, `linux/arm64`).
 3. Run the upstream diff audit tool to verify that modified upstream files remain below 5.0%.
 4. Execute the mechanical `ripgrep` checks from Section 9.2 of [`.agents/skills/deslop/SKILL.md`](.agents/skills/deslop/SKILL.md) against `README.md`, `AGENTS.md`, and `docs/`.
+5. Push the change and read the CI result. CI runs the tests that the local host cannot run.
 
 ```bash
 # 1. Format and test natively on the active host (darwin/arm64 first; gojgp lint is disabled)
 go fmt ./...
 go test -race -exec "$PWD/scripts/codesign-exec.sh" ./...
 
-# 2. Compile check across all four Priority-0 targets
+# 2. Compile check across the four Priority-0 targets and both Linux targets
 GOOS=darwin  GOARCH=arm64 go build ./...
 GOOS=darwin  GOARCH=amd64 go build ./...
 GOOS=windows GOARCH=amd64 go build ./...
 GOOS=windows GOARCH=arm64 go build ./...
+GOOS=linux   GOARCH=amd64 go build ./...
+GOOS=linux   GOARCH=arm64 go build ./...
 
 # 3. Verify upstream diff budget (< 5.0% touched upstream files)
 go run ./tools/upstream -mode=audit -max-ratio=0.05
@@ -108,3 +111,16 @@ go run ./tools/upstream -mode=audit -max-ratio=0.05
 # 4. Verify zero em-dashes, spaced en-dashes, or prose arrows in documentation (must return 0 matches)
 rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md docs/ 2>/dev/null
 ```
+
+### 5.1 Continuous Integration (Descriptive Module)
+
+The workflow `.github/workflows/ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner is a virtual machine without a hypervisor, so it runs the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand.
+
+Keep CI usage low. Do not add jobs that repeat work, and do not run registry tests on every push. Use these environment variables in CI only:
+
+| Variable | Effect |
+| :--- | :--- |
+| `GVX_ALLOW_NO_HYPERVISOR=1` | Skips the tests that need a hypervisor when `hv_vm_create` or `WHvCreatePartition` fails. |
+| `GVX_E2E_OFFLINE=1` | Skips the tests that pull from a registry. |
+| `GVX_E2E_REQUIRE_NETWORK=1` | Fails, and does not skip, when the registry is unreachable. |
+| `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. |

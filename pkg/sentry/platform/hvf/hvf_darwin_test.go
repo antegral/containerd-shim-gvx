@@ -74,28 +74,6 @@ func (s *stubMemoryManager) FindVMAByName(hostarch.AddrRange, string) (hostarch.
 	return 0, 0, nil
 }
 
-// allowNoHypervisorEnv names the variable that lets a test host without
-// Hypervisor.framework skip the tests that need a VM. CI runners are virtual
-// machines that cannot create a nested VM. A developer machine leaves it unset,
-// so a missing entitlement fails the test instead of hiding behind a skip.
-const allowNoHypervisorEnv = "GVX_ALLOW_NO_HYPERVISOR"
-
-// requireHypervisor skips a test that calls New itself when the host has no
-// hypervisor and the environment allows that. See allowNoHypervisorEnv.
-func requireHypervisor(t testing.TB) {
-	t.Helper()
-	p, err := New()
-	if err != nil {
-		if os.Getenv(allowNoHypervisorEnv) == "1" {
-			t.Skipf("no hypervisor on this host (%s=1): %v", allowNoHypervisorEnv, err)
-		}
-		t.Fatalf("New failed: %v", err)
-	}
-	if err := p.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-}
-
 func newTestPlatform(t testing.TB) *Platform {
 	t.Helper()
 	p, err := New()
