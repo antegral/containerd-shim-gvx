@@ -19,8 +19,8 @@ package systrap
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"sync/atomic"
-	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -50,9 +50,11 @@ const (
 
 	// trampStride is the distance between two trampolines in the code pages.
 	trampStride = 32
-	// fsRepairWindow and fsRepairLimit bound the repairs at one pc.
-	fsRepairWindow = 2 * time.Millisecond
-	fsRepairLimit  = 4
+	// fsRepairLimit is the number of consecutive repairs at one pc with the
+	// same registers that the engine allows. A repair that works changes the
+	// registers when the instruction runs, so identical registers mean that
+	// the repair brought no progress.
+	fsRepairLimit = 8
 
 	// slotBase is the offset of the data slots, and slotStride is the size of
 	// one slot: the guest rax, then the guest rip. The code pages hold
@@ -78,13 +80,14 @@ type archThread struct {
 	// slot is the trampoline slot plus one. Zero means that the thread has none.
 	slot int
 	// fsFix tracks the last FS base repair. Windows resets the base at every
-	// context switch, so a loop can fault at the same pc many times. Several
-	// repairs at one pc within a short time mean that the fault is not a lost
-	// FS base.
+	// context switch, so a loop can fault at the same pc many times. A loop
+	// that waits in the kernel on each pass, for example on a page of a file
+	// view, faults at the same pc after each pass. Several repairs at one pc
+	// with identical registers mean that the fault is not a lost FS base.
 	fsFix struct {
-		pc uint64
-		at time.Time
-		n  int
+		pc  uint64
+		sum uint64
+		n   int
 	}
 }
 
@@ -230,9 +233,9 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		}
 		return false
 	}
-	now := time.Now()
-	if th.fsFix.pc == pc && now.Sub(th.fsFix.at) < fsRepairWindow && th.fsFix.n >= fsRepairLimit {
-		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x within %v", th.sp.pid, th.tid, th.fsFix.n, pc, fsRepairWindow)
+	sum := th.ctx.registerSum()
+	if th.fsFix.pc == pc && th.fsFix.sum == sum && th.fsFix.n >= fsRepairLimit {
+		tracef("pid %d thread %d: no FS repair, %d repairs at pc %#x without progress", th.sp.pid, th.tid, th.fsFix.n, pc)
 		return false
 	}
 	code := as.codeBytes(pc, 15)
@@ -246,18 +249,26 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 		tracef("pid %d thread %d: no FS repair, trampoline: %v", th.sp.pid, th.tid, err)
 		return false
 	}
-	if traceEvents {
-		tracef("pid %d thread %d: FS repair at pc %#x, fault at %#x, access %d, %v after the last repair at %#x",
-			th.sp.pid, th.tid, pc, ev.Info[1], ev.Info[0], now.Sub(th.fsFix.at), th.fsFix.pc)
+	if traceAll {
+		tracef("pid %d thread %d: FS repair at pc %#x, fault at %#x, access %d", th.sp.pid, th.tid, pc, ev.Info[1], ev.Info[0])
 	}
-	if th.fsFix.pc == pc && now.Sub(th.fsFix.at) < fsRepairWindow {
+	if th.fsFix.pc == pc && th.fsFix.sum == sum {
 		th.fsFix.n++
 	} else {
 		th.fsFix.n = 1
 	}
-	th.fsFix.pc, th.fsFix.at = pc, now
+	th.fsFix.pc, th.fsFix.sum = pc, sum
 	th.sp.fsRepairs.Add(1)
 	return true
+}
+
+// registerSum returns a hash of the flags and the general-purpose registers in
+// the record. Two stops with the same pc and the same hash made no progress
+// between them.
+func (c *hostContext) registerSum() uint64 {
+	h := fnv.New64a()
+	h.Write(c.buf[ctxOffEFlags:ctxOffRip])
+	return h.Sum64()
 }
 
 // hasFSPrefix reports whether the instruction at the start of code carries an

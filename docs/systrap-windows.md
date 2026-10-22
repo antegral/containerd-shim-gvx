@@ -258,7 +258,7 @@ mov rax, [rip+d1]     ; load the guest rax from the slot
 jmp [rip+d2]          ; jump to the guest rip from the slot
 ```
 
-A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address, and if it has an FS prefix, runs the trampoline again. Four repairs at one address within two milliseconds count as a real fault. The engine allows 512 threads in one stub.
+A guest access through `%fs` can still fault when Windows resets the base during a long run. The Sentry reads the instruction at the faulting address, and if it has an FS prefix, runs the trampoline again. Eight repairs in a row at one address with identical registers count as a real fault, because a repair that works changes the registers. A loop that waits in the kernel on each pass, for example on a page of a file view, can need a repair on each pass. The engine allows 512 threads in one stub.
 
 ### 6.7 Confinement
 
