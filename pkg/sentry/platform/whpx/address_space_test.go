@@ -36,6 +36,7 @@ func translate(as *AddressSpace, va uint64) (gpa uint64, opts hostarch.AccessTyp
 }
 
 func TestMapHostBuildsExactPageTableEntries(t *testing.T) {
+	requireGuestPageSize(t)
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
 	as := newTestAS(t, p)

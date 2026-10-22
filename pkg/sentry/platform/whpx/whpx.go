@@ -124,11 +124,26 @@ func New() (*Platform, error) {
 // run the partition, including every non-Windows host, returns an error that
 // wraps ErrUnsupported or the failing call.
 func NewWithOptions(opts Options) (*Platform, error) {
+	if err := checkPageSize(hostarch.PageSize); err != nil {
+		return nil, err
+	}
 	be, err := newBackend()
 	if err != nil {
 		return nil, err
 	}
 	return newPlatform(be, opts)
+}
+
+// checkPageSize verifies that the Sentry page size equals the page size of the
+// partition. The shared page table package builds entries of the Sentry page
+// size, so a build with the pagesize_16k tag would map 16KB entries over 4KB
+// guest pages.
+func checkPageSize(sentryPage int) error {
+	if sentryPage != pageSize {
+		return fmt.Errorf("%w: the Sentry page size is %d bytes and the partition maps %d-byte pages",
+			ErrUnsupported, sentryPage, pageSize)
+	}
+	return nil
 }
 
 // checkHost verifies that the host can run the partition.

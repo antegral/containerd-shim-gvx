@@ -172,7 +172,7 @@ On macOS (`lockdown_darwin.go`), it sets `RLIMIT_NPROC = 0` and activates a `(de
 
 `tools/upstream` widens `//go:build linux` tags on allowlisted Sentry files after each `git merge upstream/go`, and it fences Linux-only files from the new targets. `-mode=audit` compares the tree with the pinned upstream archive and checks the SPEC import boundaries.
 
-The audit charges 20 of 2485 upstream files (0.80%) against the `< 5.0%` ceiling. It reports 587 Linux fences separately. Counted together with the fences, the modified share is 24%, so the strict reading of the ceiling is not met.
+The audit charges 22 of 2485 upstream files (0.89%) against the `< 5.0%` ceiling. It reports 604 Linux fences separately. Counted together with the fences, the modified share is 25%, so the strict reading of the ceiling is not met.
 
 ---
 

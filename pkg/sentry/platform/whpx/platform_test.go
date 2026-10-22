@@ -74,6 +74,7 @@ func TestNewPlatformFailsClosed(t *testing.T) {
 }
 
 func TestNewPlatformMapsTheKernelRegion(t *testing.T) {
+	requireGuestPageSize(t)
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
 	if p.ConcurrencyCount() != p.vpCount || p.vpCount < 1 || p.vpCount > maxVPs {
@@ -182,5 +183,27 @@ func TestCloseReportsBackendErrors(t *testing.T) {
 	fb.closeErr = errors.New("delete partition boom")
 	if err := p.Close(); !errors.Is(err, fb.closeErr) {
 		t.Errorf("Close returned %v", err)
+	}
+}
+
+// requireGuestPageSize skips a test that reads 4KB entries from the shared
+// page table package. Under the pagesize_16k build tag that package builds
+// 16KB entries, and NewWithOptions refuses the configuration.
+func requireGuestPageSize(t *testing.T) {
+	t.Helper()
+	if hostarch.PageSize != pageSize {
+		t.Skipf("the Sentry page size is %d bytes and whpx maps %d-byte pages", hostarch.PageSize, pageSize)
+	}
+}
+
+func TestCheckPageSizeRejectsOtherSizes(t *testing.T) {
+	if err := checkPageSize(pageSize); err != nil {
+		t.Fatalf("checkPageSize(%d) = %v, want nil", pageSize, err)
+	}
+	for _, size := range []int{1024, 16384, 65536} {
+		err := checkPageSize(size)
+		if !errors.Is(err, ErrUnsupported) {
+			t.Errorf("checkPageSize(%d) = %v, want ErrUnsupported", size, err)
+		}
 	}
 }
