@@ -71,6 +71,9 @@ func init() {
 	if os.Getenv("GVX_DEBUG_LOG") == "" && os.Getenv("GVX_STRACE") == "" {
 		log.SetTarget(&log.Writer{Next: io.Discard})
 	}
+	if os.Getenv("GVX_DEBUG_LOG") == "2" {
+		log.SetLevel(log.Debug)
+	}
 	if os.Getenv("GVX_STRACE") != "" {
 		strace.Initialize()
 		strace.EnableAll(strace.SinkTypeLog)
