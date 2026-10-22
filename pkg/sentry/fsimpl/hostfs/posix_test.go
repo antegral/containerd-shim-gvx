@@ -744,12 +744,20 @@ func TestDentryCachePruningKeepsOpenFiles(t *testing.T) {
 type recordingSpace struct {
 	mu          sync.Mutex
 	invalidated []hostarch.AddrRange
+
+	// onInvalidate runs inside Invalidate, before the call returns. Tests use
+	// it to observe the state of the file cache at that moment.
+	onInvalidate func()
 }
 
 func (s *recordingSpace) Invalidate(ar hostarch.AddrRange, opts memmap.InvalidateOpts) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.invalidated = append(s.invalidated, ar)
+	hook := s.onInvalidate
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 }
 
 func (e *env) mapFile(fd *vfs.FileDescription, length uint64, writable bool) (memmap.Mappable, *recordingSpace, hostarch.AddrRange) {

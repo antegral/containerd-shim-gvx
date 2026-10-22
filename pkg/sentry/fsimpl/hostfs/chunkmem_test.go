@@ -15,17 +15,28 @@
 package hostfs
 
 import (
+	"sync/atomic"
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/pgalloc"
 	"z.gfire.dev/gvx/pkg/sentry/usage"
+	"z.gfire.dev/gvx/pkg/sentry/vfs"
 )
 
 // testChunkMemory backs chunks with a pgalloc.MemoryFile, the way pkg/gvx does
-// on Linux.
-type testChunkMemory struct{ *pgalloc.MemoryFile }
+// on Linux. It counts the references that hostfs drops.
+type testChunkMemory struct {
+	*pgalloc.MemoryFile
+	releases *atomic.Int64
+}
+
+func (m testChunkMemory) DecRef(fr memmap.FileRange) {
+	m.releases.Add(1)
+	m.MemoryFile.DecRef(fr)
+}
 
 func (m testChunkMemory) AllocateChunk(length uint64) (memmap.FileRange, error) {
 	return m.Allocate(length, pgalloc.AllocOpts{Kind: usage.Anonymous})
@@ -38,7 +49,7 @@ func newTestChunkMemory(t *testing.T) ChunkMemory {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
 	t.Cleanup(mf.Destroy)
-	return testChunkMemory{mf}
+	return testChunkMemory{MemoryFile: mf, releases: new(atomic.Int64)}
 }
 
 // forEachChunkMode runs fn twice: with chunks on the Go heap, which the
@@ -92,4 +103,49 @@ func TestChunkMemoryTranslationsSpanChunks(t *testing.T) {
 		}
 	}
 	m.RemoveMapping(e.ctx, ms, ar, 0, false)
+}
+
+// TestTruncateInvalidatesBeforeItReleasesChunkMemory checks the order that
+// makes shared chunk memory safe. A mapping may hold a translation that it has
+// not yet referenced, so hostfs must stop the mapping before it drops its own
+// reference. Invalidate also calls into the memory manager, so it must run
+// without the data lock.
+func TestTruncateInvalidatesBeforeItReleasesChunkMemory(t *testing.T) {
+	mem := newTestChunkMemory(t).(testChunkMemory)
+	e := newEnv(t)
+	e.ws.SetChunkMemory(mem)
+	e.writeFile("t", make([]byte, 3*chunkSize))
+	fd := e.mustOpen("t", 2)
+	defer fd.DecRef(e.ctx)
+	m, ms, ar := e.mapFile(fd, 3*chunkSize, true)
+	data := &fd.Impl().(*regularFD).dentry.inode.data
+	if _, err := m.Translate(e.ctx,
+		memmap.MappableRange{Start: 0, End: 3 * chunkSize},
+		memmap.MappableRange{Start: 0, End: 3 * chunkSize}, hostarch.ReadWrite); err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+
+	var releasesAtInvalidate int64 = -1
+	var dataLockHeld bool
+	ms.onInvalidate = func() {
+		releasesAtInvalidate = mem.releases.Load()
+		if data.dataMu.TryLock() {
+			data.dataMu.Unlock()
+		} else {
+			dataLockHeld = true
+		}
+	}
+	if err := fd.SetStat(e.ctx, vfs.SetStatOptions{Stat: linux.Statx{Mask: linux.STATX_SIZE, Size: chunkSize / 2}}); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if releasesAtInvalidate != 0 {
+		t.Errorf("hostfs released %d chunks before it invalidated the mappings, want 0", releasesAtInvalidate)
+	}
+	if dataLockHeld {
+		t.Error("Invalidate ran with the data lock held")
+	}
+	if got := mem.releases.Load(); got != 2 {
+		t.Errorf("hostfs released %d chunks after truncating to half a chunk, want 2", got)
+	}
+	m.RemoveMapping(e.ctx, ms, ar, 0, true)
 }

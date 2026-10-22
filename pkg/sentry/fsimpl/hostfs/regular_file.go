@@ -634,28 +634,38 @@ func (c *fileData) writeThrough(off int64, p []byte) {
 	}
 }
 
-// truncated adjusts the cache after the host file changed size.
+// truncated adjusts the cache after the host file changed size. It drops the
+// chunks beyond the new size only after it invalidated the mappings. A mapping
+// translated a chunk earlier and took its own reference when it did, so the
+// memory outlives the chunk. Invalidate calls into the memory manager, which
+// holds its own locks while it calls Translate, so dataMu must be free here.
 func (c *fileData) truncated(size int64) {
 	if !c.active.Load() {
 		return
 	}
 	c.mapsMu.Lock()
 	defer c.mapsMu.Unlock()
+
 	c.dataMu.Lock()
-	defer c.dataMu.Unlock()
 	c.size = size
+	var dropped []*cacheChunk
 	for idx, ch := range c.chunks {
 		base := int64(idx) << chunkShift
 		switch {
 		case base >= size:
-			ch.release()
+			dropped = append(dropped, ch)
 			delete(c.chunks, idx)
 		case base+chunkSize > size:
 			clear(ch.buf[size-base:])
 		}
 	}
+	c.dataMu.Unlock()
+
 	pgend, _ := hostarch.PageRoundUp(uint64(size))
 	c.mappings.Invalidate(memmap.MappableRange{Start: pgend, End: math.MaxUint64}, memmap.InvalidateOpts{})
+	for _, ch := range dropped {
+		ch.release()
+	}
 }
 
 // chunkLocked returns the chunk idx, loading it from the host file when absent.
