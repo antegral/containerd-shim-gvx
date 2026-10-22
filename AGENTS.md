@@ -114,7 +114,7 @@ rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md docs/ 2>/dev/null
 
 ### 5.1 Continuous Integration (Descriptive Module)
 
-The workflow `.github/workflows/ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner is a virtual machine without a hypervisor, so it runs the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand.
+The workflow `.github/workflows/ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, and `windows/amd64`. A hosted macOS runner is a virtual machine without a hypervisor, so it runs the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand. On Linux, run `scripts/seccomp-audit.sh` when a change adds a host call, because a call outside the seccomp allowlist kills the process.
 
 Keep CI usage low. Do not add jobs that repeat work, and do not run registry tests on every push. Use these environment variables in CI only:
 

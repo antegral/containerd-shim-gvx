@@ -2,7 +2,9 @@ name: e2e-images
 
 # These tests pull real images from Docker Hub, so they run once a week and on
 # demand instead of on every push. The hosted macOS runner has no hypervisor.
-# The jobs run the systrap variants of the gates, which need none.
+# The macOS job runs the systrap variants of the gates, which need none. The
+# Linux jobs run every gate on the upstream systrap platform with the seccomp
+# lockdown, because Linux has no hypervisor backend.
 on:
   schedule:
     - cron: "17 3 * * 0"
@@ -37,3 +39,27 @@ jobs:
             -exec "$PWD/scripts/codesign-exec.sh" \
             -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
             ./e2e
+
+  linux-systrap:
+    name: gates on linux/${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      GVX_E2E_REQUIRE_NETWORK: "1"
+      # The upstream systrap platform hangs while it starts in a cgo build.
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run the registry gates on the upstream systrap platform
+        run: go test -count=1 -timeout 50m ./e2e
