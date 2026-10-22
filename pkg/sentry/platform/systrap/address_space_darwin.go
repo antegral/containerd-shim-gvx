@@ -593,7 +593,7 @@ func absDiff(a, b uint64) uint64 {
 // newIsland reserves a sealed VMA within reach of near through the memory
 // manager and maps a private page of slots there.
 func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager, near uint64) error {
-	minAddr, maxAddr := as.p.userMin, uint64(sysBase)
+	minAddr, maxAddr := as.p.userMin, as.p.userMax
 	var lastErr error
 	for try := 0; try < 128; try++ {
 		off := (uint64(rand.Int64N(islandReach-(4<<20))) + 2<<20) &^ (blockSize - 1)

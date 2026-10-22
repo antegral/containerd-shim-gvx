@@ -234,29 +234,39 @@ const (
 	vmRegionBasicInfoWords64 = 9
 )
 
+// hostRegion is one mapping of a task.
+type hostRegion struct {
+	start, size uint64
+	// reserved is true for a region without any access right. The kernel keeps
+	// such regions as permanent reservations, and no mapping can replace them.
+	reserved bool
+}
+
 // vmRegion returns the first mapping of task that ends above addr. It reports
 // ok as false when no mapping lies at or above addr.
-func vmRegion(task machPort, addr uint64) (start, size uint64, ok bool, err error) {
+func vmRegion(task machPort, addr uint64) (r hostRegion, ok bool, err error) {
 	var info [16]int32
 	count := uint32(vmRegionBasicInfoWords64)
 	var object uint32
-	start = addr
-	r := machCalls.vmRegion.call(
-		uintptr(task), uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&size)),
+	r.start = addr
+	ret := machCalls.vmRegion.call(
+		uintptr(task), uintptr(unsafe.Pointer(&r.start)), uintptr(unsafe.Pointer(&r.size)),
 		vmRegionBasicInfo64, uintptr(unsafe.Pointer(&info[0])),
 		uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&object)))
-	runtime.KeepAlive(&start)
-	runtime.KeepAlive(&size)
+	runtime.KeepAlive(&r)
 	runtime.KeepAlive(&info)
 	runtime.KeepAlive(&count)
 	runtime.KeepAlive(&object)
-	if kernReturn(int32(r)) == kernInvalidAddress {
-		return 0, 0, false, nil
+	if kernReturn(int32(ret)) == kernInvalidAddress {
+		return hostRegion{}, false, nil
 	}
-	if err := kr("mach_vm_region", r); err != nil {
-		return 0, 0, false, err
+	if err := kr("mach_vm_region", ret); err != nil {
+		return hostRegion{}, false, err
 	}
-	return start, size, true, nil
+	// The first two words of vm_region_basic_info_64 are the current and the
+	// maximum protection.
+	r.reserved = info[0] == 0 && info[1] == 0
+	return r, true, nil
 }
 
 // vmProtect changes the current or the maximum protection of a range.

@@ -47,7 +47,7 @@ const (
 	// 12GB. The constant leaves room for their ASLR slide. It also keeps
 	// ET_EXEC guests, which link at 0x400000, out of an address space that
 	// cannot hold them. The Platform raises the real limit above every
-	// reservation of the host kernel. See userMinFromRegions.
+	// reservation of the host kernel. See userRangeFromRegions.
 	userFloor = 0x4_0000_0000
 
 	// sysBase is the first address of the per-thread sysmsg blocks in a stub
@@ -85,9 +85,9 @@ type Platform struct {
 	pool *pagePool
 	host *stubHost
 
-	// userMin is the lowest guest address. No host reservation lies in
-	// [userMin, sysBase), so every guest mapping in that range succeeds.
-	userMin uint64
+	// userMin and userMax bound the guest address range. No host mapping lies
+	// in [userMin, userMax), so every guest mapping in that range succeeds.
+	userMin, userMax uint64
 
 	// images caches the headers of the files that guests map as code.
 	images imageCache
@@ -113,52 +113,68 @@ func New() (*Platform, error) {
 		_ = pool.close()
 		return nil, err
 	}
-	userMin, err := host.userMin()
+	userMin, userMax, err := host.userRange()
 	if err != nil {
 		_ = host.close()
 		_ = pool.close()
 		return nil, err
 	}
-	return &Platform{pool: pool, host: host, userMin: userMin}, nil
+	return &Platform{pool: pool, host: host, userMin: userMin, userMax: userMax}, nil
 }
 
 // regionLister reports the first mapping that ends above addr.
-type regionLister func(addr uint64) (start, size uint64, ok bool, err error)
+type regionLister func(addr uint64) (hostRegion, bool, error)
 
-// userMinFromRegions returns the lowest address from which the range up to
-// sysBase holds no mapping of the stub task.
+// userRangeFromRegions returns the widest guest address range that starts above
+// every permanent host reservation and ends before the next mapping of the stub
+// task or at sysBase.
 //
 // WHY: macOS gives every process permanent PROT_NONE reservations. On Apple
 // silicon they cover the 385GB range from 0xfc0000000 to 0x7000000000, and
 // they survive mach_vm_deallocate. A guest mapping there fails on the host
 // after the Sentry accepted it, and the guest dies with SIGBUS. V8 picks random
-// mmap hints and hits the range in about one run in eight. The Sentry has no
-// way to describe a hole inside the user address range, so the range starts
-// above the last reservation. The reservations differ between macOS releases
-// and machines, so the Platform reads them from the template task.
-func userMinFromRegions(list regionLister) (uint64, error) {
-	min := uint64(userFloor)
-	addr := min
-	for addr < sysBase {
-		start, size, ok, err := list(addr)
+// mmap hints and hits the range in about one run in eight. The stub task also
+// holds ordinary mappings, such as malloc zones, which macOS 15 places near
+// 0x600000000000. A guest mapping over one of them would replace it. The
+// stub cannot allocate after its sandbox starts, so these mappings never
+// move. The Sentry has no way to describe a hole inside the user address
+// range, so the range starts above the last reservation and ends at the first
+// mapping above that. The layout differs between macOS releases and machines,
+// so the Platform reads it from the template task.
+func userRangeFromRegions(list regionLister) (lo, hi uint64, err error) {
+	var regions []hostRegion
+	for addr := uint64(userFloor); addr < sysBase; {
+		r, ok, err := list(addr)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		if !ok || start >= sysBase {
+		if !ok || r.start >= sysBase {
 			break
 		}
-		if end := start + size; end > min {
-			min = end
+		if r.size == 0 {
+			return 0, 0, fmt.Errorf("mach_vm_region returned an empty region at %#x", r.start)
 		}
-		if size == 0 {
-			return 0, fmt.Errorf("mach_vm_region returned an empty region at %#x", start)
+		regions = append(regions, r)
+		addr = r.start + r.size
+	}
+	lo = userFloor
+	for _, r := range regions {
+		if r.reserved && r.start+r.size > lo {
+			lo = r.start + r.size
 		}
-		addr = start + size
 	}
-	if min >= sysBase {
-		return 0, fmt.Errorf("the host reserves the whole range from %#x to %#x", uint64(userFloor), uint64(sysBase))
+	lo = (lo + blockSize - 1) &^ (blockSize - 1)
+	hi = sysBase
+	for _, r := range regions {
+		if r.start >= lo {
+			hi = r.start &^ (blockSize - 1)
+			break
+		}
 	}
-	return (min + blockSize - 1) &^ (blockSize - 1), nil
+	if hi <= lo {
+		return 0, 0, fmt.Errorf("the host leaves no guest address range between %#x and %#x", lo, hi)
+	}
+	return lo, hi, nil
 }
 
 // Close terminates every stub task and frees the Sentry-side memory. It is
@@ -186,7 +202,7 @@ func (*Platform) MapUnit() uint64 { return blockSize }
 func (p *Platform) MinUserAddress() hostarch.Addr { return hostarch.Addr(p.userMin) }
 
 // MaxUserAddress implements platform.Platform.MaxUserAddress.
-func (*Platform) MaxUserAddress() hostarch.Addr { return sysBase }
+func (p *Platform) MaxUserAddress() hostarch.Addr { return hostarch.Addr(p.userMax) }
 
 // NewAddressSpace implements platform.Platform.NewAddressSpace. The platform
 // patches syscalls always, so the DisableSyscallPatching option has no effect.

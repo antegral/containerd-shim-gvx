@@ -365,10 +365,11 @@ func (h *stubHost) commandLocked(cmd uint32, arg, cookie uint64) (int32, error) 
 	return atomic.LoadInt32(&ctl.Result), nil
 }
 
-// userMin returns the lowest guest address that is free of host reservations.
-// It reads the layout of the template task, which every stub task inherits.
-func (h *stubHost) userMin() (uint64, error) {
-	return userMinFromRegions(func(addr uint64) (uint64, uint64, bool, error) {
+// userRange returns the guest address range that no host mapping of the stub
+// task touches. It reads the layout of the template task, which every stub
+// task inherits.
+func (h *stubHost) userRange() (lo, hi uint64, err error) {
+	return userRangeFromRegions(func(addr uint64) (hostRegion, bool, error) {
 		return vmRegion(h.tmpl.task, addr)
 	})
 }

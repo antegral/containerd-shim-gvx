@@ -1015,53 +1015,65 @@ func TestProbeReportsStub(t *testing.T) {
 	}
 }
 
-// TestUserMinFromRegions covers the pure walk over the template layout.
-func TestUserMinFromRegions(t *testing.T) {
+// TestUserRangeFromRegions covers the pure walk over the template layout.
+func TestUserRangeFromRegions(t *testing.T) {
 	const gb = 1 << 30
-	type region struct{ start, size uint64 }
-	listerFor := func(regions []region) regionLister {
-		return func(addr uint64) (uint64, uint64, bool, error) {
+	listerFor := func(regions []hostRegion) regionLister {
+		return func(addr uint64) (hostRegion, bool, error) {
 			for _, r := range regions {
 				if r.start+r.size > addr {
-					return max(r.start, addr), r.size - (max(r.start, addr) - r.start), true, nil
+					start := max(r.start, addr)
+					return hostRegion{start: start, size: r.size - (start - r.start), reserved: r.reserved}, true, nil
 				}
 			}
-			return 0, 0, false, nil
+			return hostRegion{}, false, nil
 		}
 	}
+	permanent := []hostRegion{{0xf_c000_0000, 1 * gb, true}, {0x10_0000_0000, 0x180 * gb, true}}
 	for _, c := range []struct {
-		name    string
-		regions []region
-		want    uint64
+		name           string
+		regions        []hostRegion
+		wantLo, wantHi uint64
 	}{
-		{"no reservation", nil, userFloor},
-		{"stub image below the floor", []region{{0x1_0000_0000, 0x1000_0000}}, userFloor},
-		{"permanent reservation", []region{{0xf_c000_0000, 1 * gb}, {0x10_0000_0000, 0x180 * gb}}, 0x70_0000_0000},
+		{"no mapping", nil, userFloor, sysBase},
+		{"stub image below the floor", []hostRegion{{0x1_0000_0000, 0x1000_0000, false}}, userFloor, sysBase},
+		{"permanent reservation", permanent, 0x70_0000_0000, sysBase},
 		{"removable reservations below a permanent one",
-			[]region{{0x9_3400_0000, 12 * gb}, {0xc_3540_0000, 12 * gb}, {0xf_c000_0000, 1 * gb}, {0x10_0000_0000, 0x180 * gb}},
-			0x70_0000_0000},
-		{"region that straddles the floor", []region{{0x3_c000_0000, 2 * gb}}, 0x4_4000_0000},
-		{"sysmsg blocks above sysBase do not count", []region{{sysBase, 0x1000_0000}}, userFloor},
-		{"unaligned end rounds up to a host page", []region{{0x8_0000_0000, 0x1000}}, 0x8_0000_4000},
+			append([]hostRegion{{0x9_3400_0000, 12 * gb, true}, {0xc_3540_0000, 12 * gb, true}}, permanent...),
+			0x70_0000_0000, sysBase},
+		{"a reserved region that straddles the floor", []hostRegion{{0x3_c000_0000, 2 * gb, true}}, 0x4_4000_0000, sysBase},
+		{"sysmsg blocks above sysBase do not count", []hostRegion{{sysBase, 0x1000_0000, false}}, userFloor, sysBase},
+		{"unaligned end rounds up to a host page", []hostRegion{{0x8_0000_0000, 0x1000, true}}, 0x8_0000_4000, sysBase},
+		// macOS 15 places malloc zones near 0x600000000000. They are ordinary
+		// mappings, so the range ends before them and does not start above them.
+		{"an ordinary mapping ends the range", append(append([]hostRegion{}, permanent...), hostRegion{0x6000_0000_0000, 0x100000, false}), 0x70_0000_0000, 0x6000_0000_0000},
+		{"an ordinary mapping below the reservations is ignored", append([]hostRegion{{0x5_0000_0000, 0x10_0000, false}}, permanent...), 0x70_0000_0000, sysBase},
+		{"the first ordinary mapping above the start wins",
+			append(append([]hostRegion{}, permanent...), hostRegion{0x2000_0000_0000, 0x4000, false}, hostRegion{0x6000_0000_0000, 0x4000, false}),
+			0x70_0000_0000, 0x2000_0000_0000},
 	} {
-		got, err := userMinFromRegions(listerFor(c.regions))
+		lo, hi, err := userRangeFromRegions(listerFor(c.regions))
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
 			continue
 		}
-		if got != c.want {
-			t.Errorf("%s: userMin = %#x, want %#x", c.name, got, c.want)
+		if lo != c.wantLo || hi != c.wantHi {
+			t.Errorf("%s: range = [%#x, %#x), want [%#x, %#x)", c.name, lo, hi, c.wantLo, c.wantHi)
 		}
 	}
 
-	if _, err := userMinFromRegions(listerFor([]region{{userFloor, sysBase - userFloor}})); err == nil {
+	if _, _, err := userRangeFromRegions(listerFor([]hostRegion{{userFloor, sysBase - userFloor, true}})); err == nil {
 		t.Error("a reservation that spans the whole range must fail")
 	}
+	if _, _, err := userRangeFromRegions(listerFor([]hostRegion{{0x70_0000_0000, 0x4000, false}, {0x70_0000_4000, 0x4000, true}})); err != nil {
+		// A mapping at the very start leaves a range after the reserved region that follows it.
+		t.Errorf("mapping then reservation: %v", err)
+	}
 	boom := errors.New("task is gone")
-	if _, err := userMinFromRegions(func(uint64) (uint64, uint64, bool, error) { return 0, 0, false, boom }); !errors.Is(err, boom) {
+	if _, _, err := userRangeFromRegions(func(uint64) (hostRegion, bool, error) { return hostRegion{}, false, boom }); !errors.Is(err, boom) {
 		t.Errorf("a lister error must propagate, got %v", err)
 	}
-	if _, err := userMinFromRegions(func(addr uint64) (uint64, uint64, bool, error) { return addr, 0, true, nil }); err == nil {
+	if _, _, err := userRangeFromRegions(func(addr uint64) (hostRegion, bool, error) { return hostRegion{start: addr}, true, nil }); err == nil {
 		t.Error("an empty region must fail instead of looping")
 	}
 }
@@ -1083,7 +1095,8 @@ func TestGuestRangeHasNoHostHoles(t *testing.T) {
 		t.Fatalf("MinUserAddress = %#x lies inside the host reservation at 0x455e0c0000", lo)
 	}
 	r := newRig(t, p)
-	targets := []uint64{lo, lo + 0x1_0000_0000, (lo + sysBase) / 2 &^ (blockSize - 1), sysBase - 0x4000_0000}
+	hi := uint64(p.MaxUserAddress())
+	targets := []uint64{lo, lo + 0x1_0000_0000, (lo + hi) / 2 &^ (blockSize - 1), hi - blockSize}
 	for _, va := range targets {
 		r.mapPage(va, hostarch.ReadWrite)
 	}
