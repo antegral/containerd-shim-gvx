@@ -80,7 +80,52 @@ func rejectedRules() seccomp.SyscallRules {
 // embedderRules lists the host calls that gvx makes beyond the Sentry of runsc.
 // The Sentry in runsc runs in its own process with a gofer and the control
 // server. The Sentry in gvx runs in the host process and reaches the host
-// through Go packages.
+// through Go packages, so these calls come from pkg/fd, os.Root, and the net
+// package. Each rule is as narrow as the call allows.
 func embedderRules(cfg Config) seccomp.SyscallRules {
-	return seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{})
+	rules := seccomp.MakeSyscallRules(map[uintptr]seccomp.SyscallRule{
+		// pkg/fd marks a duplicated descriptor close-on-exec.
+		unix.SYS_FCNTL: seccomp.Or{
+			seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(unix.F_SETFD),
+				seccomp.EqualTo(unix.FD_CLOEXEC),
+			},
+			seccomp.PerArg{
+				seccomp.AnyValue{},
+				seccomp.EqualTo(unix.F_DUPFD_CLOEXEC),
+			},
+		},
+	})
+	if cfg.WorkspacePath != "" {
+		// os.Root.Rename calls renameat. The host filesystem rules of runsc
+		// have only renameat2.
+		rules.Add(unix.SYS_RENAMEAT, seccomp.PerArg{
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+			seccomp.NonNegativeFD{},
+			seccomp.AnyValue{},
+		})
+	}
+	switch cfg.NetworkMode {
+	case NetModeNAT:
+		// The net package opens sockets with protocol 0, but hostinet allows
+		// only sockets with an explicit protocol.
+		for _, family := range []uintptr{unix.AF_INET, unix.AF_INET6} {
+			for _, typ := range []uintptr{unix.SOCK_STREAM, unix.SOCK_DGRAM} {
+				rules.Add(unix.SYS_SOCKET, seccomp.PerArg{
+					seccomp.EqualTo(family),
+					seccomp.EqualTo(typ | unix.SOCK_NONBLOCK | unix.SOCK_CLOEXEC),
+					seccomp.EqualTo(0),
+				})
+			}
+		}
+	case NetModeWireGuard:
+		// The pre-bound UDP socket of wireguard-go sends and receives
+		// datagrams. Seccomp cannot read the peer address, so the filter cannot
+		// pin the peer port the way the Seatbelt profile does.
+		rules.Add(unix.SYS_SENDTO, seccomp.MatchAll{})
+		rules.Add(unix.SYS_RECVFROM, seccomp.MatchAll{})
+	}
+	return rules
 }
