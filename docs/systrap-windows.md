@@ -319,7 +319,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
 | Workspace files | A file without a host handle maps through a copy. A writable shared mapping of such a file fails with `ENODEV`. |
 | Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. |
-| JIT engines | Node 22 (V8) passes its two gates on `windows/arm64`. A JVM and the `amd64` runs of V8 are untested. |
+| JIT engines | Node 22 (V8) passes its two gates on both runners. A JVM is untested. |
 | Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |
 | Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
 
@@ -336,6 +336,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39809735687`, `39811366093` | both | Stub design: initialized stub, start trap, park and resume, `x18` and `TPIDR_EL0` across stops, Low-integrity token, job, Win32k, second stub on one debug object. |
 | `39864134146`, `39864138530` | both | Cost of `fork`, `exec`, and system calls from the host side. |
 | `39866441714`, `39866444969`, `39869493336`, `39869496938` | both | `git add` with the sparse and with the dense memory file. |
+| `39870353585` | both | The registry gates on the systrap engine: Alpine, nginx with port forwarding, Python, Node, the POSIX torture script, `git` workloads, and the Node modules torture. All pass in 207 s (`amd64`) and 281 s (`arm64`). |
 | `39845577561`, `39846215053` | `arm64` | Node 22 gates: SIGILL at `dc civac`, then both gates pass with the `nop` replacement. |
 | `39853085199`, `39854000516` | `amd64` | Shell pipeline hang on an AMD EPYC 9V74 runner: 12 of 12 runs. The state dump shows a `call` at the end of a page. |
 | `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Seventeen runs on two other models (EPYC 7763 and 9V45) also pass. |
