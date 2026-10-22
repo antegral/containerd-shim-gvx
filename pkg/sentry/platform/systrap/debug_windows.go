@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,9 +64,13 @@ var (
 	// and the repairs that the engine makes. GVX_SYSTRAP_TRACE=2 sets it.
 	traceAll = os.Getenv("GVX_SYSTRAP_TRACE") == "2"
 	// traceWatch prints the state of every stub process every three seconds.
-	// GVX_SYSTRAP_TRACE=2 and GVX_SYSTRAP_TRACE=3 set it. The value 3 prints
-	// nothing else, so it does not change the timing of the guest.
-	traceWatch = traceAll || os.Getenv("GVX_SYSTRAP_TRACE") == "3"
+	// GVX_SYSTRAP_TRACE=2, 3, and 4 set it. The value 3 prints nothing else,
+	// so it does not change the timing of the guest.
+	traceWatch = traceAll || os.Getenv("GVX_SYSTRAP_TRACE") == "3" || traceSample
+	// traceSample samples the pc of the running threads every five
+	// milliseconds, and prints the hottest addresses when the platform closes.
+	// GVX_SYSTRAP_TRACE=4 sets it.
+	traceSample = os.Getenv("GVX_SYSTRAP_TRACE") == "4"
 )
 
 var (
@@ -145,6 +150,9 @@ func newDebugger() (*debugger, error) {
 	go d.run()
 	if traceWatch {
 		go d.watch()
+	}
+	if traceSample {
+		go d.sample()
 	}
 	return d, nil
 }
@@ -321,4 +329,96 @@ func (d *debugger) dispatch(ev debugEvent) {
 // call also unfreezes the other threads of the process.
 func (d *debugger) reply(ev debugEvent) error {
 	return ntDebugContinue(d.obj, ev.PID, ev.TID, dbgContinue)
+}
+
+// pcSamples counts the samples by pc, for GVX_SYSTRAP_TRACE=4.
+var pcSamples struct {
+	sync.Mutex
+	n     map[uint64]int
+	total int
+	// bytes holds the instruction bytes at the first sample of each pc.
+	bytes map[uint64][]byte
+}
+
+// sample records the pc of every running thread every five milliseconds.
+func (d *debugger) sample() {
+	pcSamples.n = make(map[uint64]int)
+	pcSamples.bytes = make(map[uint64][]byte)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-d.done:
+			return
+		case <-tick.C:
+		}
+		d.mu.Lock()
+		procs := make([]*stubProc, 0, len(d.procs))
+		for _, sp := range d.procs {
+			procs = append(procs, sp)
+		}
+		d.mu.Unlock()
+		for _, sp := range procs {
+			sp.mu.Lock()
+			threads := make([]*thread, 0, len(sp.threads))
+			for _, th := range sp.threads {
+				threads = append(threads, th)
+			}
+			sp.mu.Unlock()
+			for _, th := range threads {
+				th.samplePC()
+			}
+		}
+	}
+}
+
+func (th *thread) samplePC() {
+	if !th.mu.TryLock() {
+		return
+	}
+	defer th.mu.Unlock()
+	if th.parked || th.ctx == nil {
+		return
+	}
+	if err := ntSuspendThread(th.h); err != nil {
+		return
+	}
+	defer func() { _ = ntResumeThread(th.h) }()
+	if err := th.getContext(th.ctx.gprFlags()); err != nil {
+		return
+	}
+	pc := th.ctx.pc()
+	pcSamples.Lock()
+	defer pcSamples.Unlock()
+	pcSamples.total++
+	pcSamples.n[pc]++
+	if _, ok := pcSamples.bytes[pc]; !ok {
+		var buf [16]byte
+		var read uintptr
+		if err := windows.ReadProcessMemory(th.sp.proc, uintptr(pc), &buf[0], uintptr(len(buf)), &read); err == nil {
+			pcSamples.bytes[pc] = append([]byte(nil), buf[:read]...)
+		}
+	}
+}
+
+// printSamples prints the hottest sampled addresses.
+func printSamples() {
+	pcSamples.Lock()
+	defer pcSamples.Unlock()
+	type kv struct {
+		pc uint64
+		n  int
+	}
+	var all []kv
+	for pc, n := range pcSamples.n {
+		all = append(all, kv{pc, n})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].n > all[j].n })
+	fmt.Fprintf(os.Stderr, "systrap: sampled %d pcs, %d distinct\n", pcSamples.total, len(all))
+	for i, e := range all {
+		if i == 20 {
+			break
+		}
+		fmt.Fprintf(os.Stderr, "systrap: sample %6d  pc %#x  % x\n", e.n, e.pc, pcSamples.bytes[e.pc])
+	}
 }

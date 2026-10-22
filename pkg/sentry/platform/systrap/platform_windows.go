@@ -94,6 +94,9 @@ func (p *Platform) Close() error {
 	p.closeOnce.Do(func() {
 		if traceWatch {
 			fmt.Fprintf(os.Stderr, "systrap: closing, %s\n", statsLine())
+			if traceSample {
+				printSamples()
+			}
 		}
 		p.dbg.close()
 		p.closeErr = p.host.close()
