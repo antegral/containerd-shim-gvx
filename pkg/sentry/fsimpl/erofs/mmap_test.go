@@ -23,6 +23,7 @@ import (
 	"slices"
 	"testing"
 
+	"z.gfire.dev/gvx/pkg/cpuid"
 	erofsimg "z.gfire.dev/gvx/pkg/erofs"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
@@ -35,6 +36,12 @@ import (
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
 )
+
+func init() {
+	// arch.New builds the floating-point state of the host. On amd64 that
+	// reads the CPUID feature set, which must exist before the first test.
+	cpuid.Initialize()
+}
 
 // stubPlatform backs a MemoryManager that never runs guest code. The test
 // only reads and writes through internal mappings.

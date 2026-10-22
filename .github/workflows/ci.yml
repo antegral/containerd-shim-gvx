@@ -10,6 +10,12 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**", "LICENSE"]
   workflow_dispatch:
+    inputs:
+      only:
+        description: "Run one job family: all, build, linux, darwin, or windows"
+        type: choice
+        default: all
+        options: [all, build, linux, darwin, windows]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,8 +26,8 @@ permissions:
 
 env:
   GOFLAGS: -mod=readonly
-  # Packages that gvx owns. The upstream gVisor trees have their own tests,
-  # which the project does not run.
+  # Packages that gvx owns or extends. The upstream gVisor trees have their own
+  # tests, which the project does not run.
   OWNED: >-
     ./cmd/... ./internal/... ./tools/upstream/... ./pkg/gvx/... ./pkg/oci/...
     ./pkg/netbackend/... ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/...
@@ -29,10 +35,26 @@ env:
     ./pkg/sync/... ./pkg/sentry/pgalloc/... ./pkg/sentry/time/...
     ./pkg/sentry/hostcpu/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/...
     ./pkg/sentry/platform/whpx/...
+  # The owned packages that need no hypervisor and no 16KB build. On a hosted
+  # macOS runner, pkg/gvx and cmd/rungv need the systrap engine instead.
+  OWNED_PLAIN: >-
+    ./internal/... ./tools/upstream/... ./pkg/oci/... ./pkg/netbackend/...
+    ./pkg/erofs/... ./pkg/sentry/fsimpl/erofs/... ./pkg/sentry/fsimpl/hostfs/...
+    ./pkg/syserr/... ./pkg/memutil/... ./pkg/fd/... ./pkg/sync/...
+    ./pkg/sentry/pgalloc/... ./pkg/sentry/time/... ./pkg/sentry/hostcpu/...
+    ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/... ./pkg/sentry/platform/whpx/...
+  # Packages that gvx wrote. Upstream packages carry vet findings that the
+  # project does not fix.
+  VET: >-
+    ./cmd/... ./internal/... ./tools/upstream/... ./pkg/gvx/... ./pkg/oci/...
+    ./pkg/netbackend/... ./pkg/hostlockdown/... ./pkg/sentry/platform/hvf/...
+    ./pkg/sentry/platform/whpx/... ./pkg/sentry/fsimpl/hostfs/... ./pkg/syserr/...
+    ./e2e/...
 
 jobs:
   build:
     name: build, vet, and audit
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'build'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -56,12 +78,16 @@ jobs:
           echo "::group::build darwin/arm64 with pagesize_16k"
           GOOS=darwin GOARCH=arm64 go build -tags pagesize_16k ./...
           echo "::endgroup::"
-      - name: Vet the packages that gvx owns for the six targets
+      - name: Vet the packages that gvx wrote for the six targets
         run: |
           for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
             echo "::group::vet $target"
-            GOOS=${target%/*} GOARCH=${target#*/} go vet $OWNED ./e2e/...
+            GOOS=${target%/*} GOARCH=${target#*/} go vet $VET
             echo "::endgroup::"
+          done
+          # The systrap package mixes upstream Linux files with gvx files, so vet it where only gvx files build.
+          for target in darwin/arm64 darwin/amd64 windows/amd64 windows/arm64; do
+            GOOS=${target%/*} GOARCH=${target#*/} go vet ./pkg/sentry/platform/systrap/
           done
           GOOS=darwin GOARCH=arm64 go vet -tags pagesize_16k ./pkg/sentry/platform/... ./pkg/gvx/... ./e2e/...
       - name: Cache the pinned upstream archive
@@ -74,6 +100,7 @@ jobs:
 
   linux:
     name: test linux/${{ matrix.arch }}
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'linux'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     strategy:
@@ -94,6 +121,7 @@ jobs:
 
   darwin-arm64:
     name: test darwin/arm64
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'darwin'
     runs-on: macos-15
     timeout-minutes: 40
     env:
@@ -107,8 +135,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Test the packages that gvx owns
-        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED
+      - name: Test the packages that need no hypervisor
+        run: go test -race -count=1 -exec "$PWD/scripts/codesign-exec.sh" $OWNED_PLAIN
       - name: Test the systrap engine and the SDK with 16KB pages
         run: |
           go test -race -count=1 -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" \
@@ -120,6 +148,7 @@ jobs:
 
   windows-amd64:
     name: test windows/amd64
+    if: github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'windows'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -139,13 +168,16 @@ jobs:
           Test-Path "$env:SystemRoot\System32\WinHvPlatform.dll"
       - name: Build rungv and a guest, then try to run it
         shell: bash
-        # The hosted runner may lack the Windows Hypervisor Platform. The step
-        # reports the outcome and does not fail the job. The unit tests above
-        # cover the code that does not need a hypervisor.
+        # The step reports the outcome and does not fail the job until the
+        # hosted runner is known to run a guest. GVX_DEBUG_LOG prints the
+        # Sentry log, which names the reason of a guest crash.
         continue-on-error: true
+        env:
+          GVX_DEBUG_LOG: "1"
         run: |
           go build -o rungv.exe ./cmd/rungv
           go run ./internal/testelf/cmd/mkelf -o smoke.elf
           ./rungv.exe stub || true
-          ./rungv.exe run -platform=auto -net=none -bin=smoke.elf | tee smoke.out
+          ./rungv.exe run -platform=auto -net=none -lockdown=false -bin=smoke.elf > smoke.out 2> smoke.err || { cat smoke.err; cat smoke.out; exit 1; }
+          cat smoke.out
           grep -q gvx-smoke-ok smoke.out

@@ -382,6 +382,11 @@ func writeStubExit(buf []byte, pc uint64) {
 // end of the test.
 func newTestPlatform(t testing.TB, fb *fakeBackend, opts Options) *Platform {
 	t.Helper()
+	if opts.processors == 0 {
+		// Several tests limit the pool to four processors, and a CI runner can
+		// have fewer CPUs than that.
+		opts.processors = 8
+	}
 	p, err := newPlatform(fb, opts)
 	if err != nil {
 		t.Fatalf("newPlatform: %v", err)

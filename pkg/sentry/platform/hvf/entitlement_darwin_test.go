@@ -167,6 +167,7 @@ func TestChildCreatesPlatform(t *testing.T) {
 // hypervisor entitlement, and runs the copy. New must sign a private copy,
 // run it, and the run must remove that copy.
 func TestUnsignedBinarySignsItselfOnce(t *testing.T) {
+	requireHypervisor(t)
 	if os.Getenv(childEnv) != "" {
 		t.Skip("the child runs TestChildCreatesPlatform")
 	}

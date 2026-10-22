@@ -37,6 +37,13 @@ const (
 	// (11), which Go's own Linkat uses and which every Windows version accepts.
 	fileLinkInformation = 11
 
+	// fileRenameInformationEx is the FileRenameInformationEx class of
+	// NtSetInformationFile. The rename names its destination relative to a
+	// root directory handle, so it stays inside the pinned workspace. The
+	// Win32 call SetFileInformationByHandle with FileRenameInfoEx returned
+	// ERROR_INVALID_PARAMETER for this layout on a hosted Windows runner.
+	fileRenameInformationEx = 65
+
 	// fileDispositionInfoExSize is sizeof(FILE_DISPOSITION_INFO_EX).
 	fileDispositionInfoExSize = 4
 )
@@ -149,7 +156,7 @@ func (h *hostRoot) remove(op, rel string, wantDir bool) error {
 // takes DELETE access, which a rename requires. The caller checks type
 // compatibility of source and destination.
 //
-// FILE_RENAME_FLAG_POSIX_SEMANTICS replaces a destination that other handles
+// FILE_RENAME_POSIX_SEMANTICS replaces a destination that other handles
 // hold open. A destination with the read-only attribute still fails with an
 // access error, which hostfs reports as EACCES.
 // Source: https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
@@ -179,8 +186,8 @@ func (h *hostRoot) rename(oldRel, newRel string) error {
 	if err != nil {
 		return hostError2("rename", oldRel, newRel, err)
 	}
-	err = windows.SetFileInformationByHandle(src, windows.FileRenameInfoEx, (*byte)(unsafe.Pointer(&buf[0])), size)
-	if err != nil {
+	var iosb windows.IO_STATUS_BLOCK
+	if err := windows.NtSetInformationFile(src, &iosb, (*byte)(unsafe.Pointer(&buf[0])), size, fileRenameInformationEx); err != nil {
 		return hostError2("rename", oldRel, newRel, err)
 	}
 	return nil

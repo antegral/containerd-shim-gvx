@@ -520,6 +520,7 @@ func TestCloseRacingWithSwitchNeverHangs(t *testing.T) {
 }
 
 func TestPlatformRegistrationAndLimits(t *testing.T) {
+	requireHypervisor(t)
 	ctor, err := platform.Lookup(PlatformName)
 	if err != nil {
 		t.Fatalf("platform.Lookup(%q): %v", PlatformName, err)

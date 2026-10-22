@@ -59,6 +59,10 @@ type Options struct {
 	// that runs guest code. It runs once per Switch, so it must be cheap and
 	// idempotent. A nil ThreadInit does nothing.
 	ThreadInit func() error
+
+	// processors overrides the processor count that the partition gets. Tests
+	// set it so that they do not depend on the CPU count of the host.
+	processors int
 }
 
 // errClosed reports a Switch or an address space operation on a closed
@@ -177,7 +181,10 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 		return nil, err
 	}
 
-	vpCount := min(max(runtime.NumCPU(), 1), maxVPs)
+	vpCount := opts.processors
+	if vpCount <= 0 {
+		vpCount = min(max(runtime.NumCPU(), 1), maxVPs)
+	}
 	info, err := be.createPartition(uint32(vpCount))
 	if err != nil {
 		return nil, fmt.Errorf("whpx: create partition: %w", err)

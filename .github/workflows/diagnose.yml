@@ -1,0 +1,56 @@
+name: diagnose
+
+# Manual runs of a chosen test selection on a chosen hosted runner. A developer
+# uses it to see how code behaves on a host that the developer does not have,
+# for example Windows, without running the whole suite.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Hosted runner"
+        type: choice
+        default: windows-latest
+        options: [windows-latest, macos-15, ubuntu-24.04, ubuntu-24.04-arm]
+      packages:
+        description: "Package patterns for go test"
+        default: ./pkg/sentry/fsimpl/hostfs/...
+      run:
+        description: "Value of go test -run (empty runs every test)"
+        default: ""
+      tags:
+        description: "Value of go test -tags (empty for none)"
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+  GVX_DEBUG_LOG: "1"
+  GVX_ALLOW_NO_HYPERVISOR: "1"
+  GVX_E2E_OFFLINE: "1"
+
+jobs:
+  test:
+    name: go test on ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run the selected tests
+        shell: bash
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          RUN: ${{ inputs.run }}
+          TAGS: ${{ inputs.tags }}
+        run: |
+          args=(-count=1 -v)
+          [ -n "$RUN" ] && args+=(-run "$RUN")
+          [ -n "$TAGS" ] && args+=(-tags "$TAGS")
+          if [ "$RUNNER_OS" = macOS ]; then
+            args+=(-exec "$PWD/scripts/codesign-exec.sh")
+          fi
+          go test "${args[@]}" $PACKAGES
