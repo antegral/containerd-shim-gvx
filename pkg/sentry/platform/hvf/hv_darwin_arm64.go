@@ -58,6 +58,9 @@ const (
 const (
 	hvExitReasonCanceled  uint32 = 0
 	hvExitReasonException uint32 = 1
+	// hvExitReasonUnknown is HV_EXIT_REASON_UNKNOWN. The header says that it
+	// should not happen in normal operation. See dispatchExit.
+	hvExitReasonUnknown uint32 = 3
 )
 
 // hvVCPUExit mirrors hv_vcpu_exit_t. The framework owns the memory and keeps

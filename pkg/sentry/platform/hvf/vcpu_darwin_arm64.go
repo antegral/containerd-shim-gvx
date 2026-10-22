@@ -66,6 +66,8 @@ type archWorker struct {
 	// the state the current entry asks the stub to establish.
 	synced, entry syncState
 	ids           idRegisters
+	// unknownExits counts consecutive hvExitReasonUnknown exits.
+	unknownExits int
 }
 
 // reloadAddr is the address of the stub reload routine in the guest.
@@ -311,9 +313,17 @@ func (w *vcpuWorker) guestRan() {
 	w.synced = w.entry
 }
 
+// maxUnknownExits bounds the consecutive hvExitReasonUnknown exits that
+// dispatchExit resumes. A signal storm resumes within a few entries, so a
+// vCPU that keeps failing this way has a real fault.
+const maxUnknownExits = 4096
+
 // dispatchExit decodes one hv_vcpu_run exit. It reports done=false when the
 // loop must enter the guest again.
 func (w *vcpuWorker) dispatchExit(c *Context, pt *GuestPageTable, ac *arch.Context64) (done bool, info *linux.SignalInfo, at hostarch.AccessType, err error) {
+	if w.exit.reason != hvExitReasonUnknown {
+		w.unknownExits = 0
+	}
 	switch w.exit.reason {
 	case hvExitReasonCanceled:
 		return w.onCancel(c, pt)
@@ -322,6 +332,21 @@ func (w *vcpuWorker) dispatchExit(c *Context, pt *GuestPageTable, ac *arch.Conte
 			return w.onStubExit(ac)
 		}
 		return w.onHypervisorException()
+	case hvExitReasonUnknown:
+		// WHY: under a collector that runs often (GOGC=1), 5 of 200 runs ended
+		// with this reason, and the exit carried no information. With
+		// GODEBUG=asyncpreemptoff=1, no run of 200 failed. A host signal that
+		// interrupts hv_vcpu_run, such as the SIGURG of Go preemption, is the
+		// probable cause. The vCPU keeps its registers across the exit. A real
+		// fault repeats on the next entry and then reports its own reason, so a
+		// resume loses nothing.
+		w.unknownExits++
+		if w.unknownExits > maxUnknownExits {
+			w.invalidateState()
+			return true, nil, hostarch.NoAccess, fmt.Errorf(
+				"hvf: %d consecutive vCPU exits with an unknown reason", w.unknownExits)
+		}
+		return w.onCancel(c, pt)
 	default:
 		w.invalidateState()
 		return true, nil, hostarch.NoAccess, fmt.Errorf(
