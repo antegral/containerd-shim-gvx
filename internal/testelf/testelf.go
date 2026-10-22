@@ -34,7 +34,7 @@ func BuildGuestELF64(targetArch string, exitCode int, stdoutText string) ([]byte
 // BuildGuestELF64At is like BuildGuestELF64 but links the ET_EXEC image at
 // baseVA. The code is position independent, so any page-aligned baseVA that
 // the execution backend allows as a guest address works. The systrap backend
-// on macOS needs baseVA at or above 0x400000000.
+// on macOS needs a baseVA above the host reservations of the process.
 func BuildGuestELF64At(targetArch string, baseVA uint64, exitCode int, stdoutText string) ([]byte, error) {
 	return buildELF64Binary(targetArch, baseVA, exitCode, stdoutText, false)
 }
@@ -434,8 +434,20 @@ func BuildGuestWriteFileELF64(targetArch, guestPath, content string) ([]byte, er
 // SYS_socket/SYS_bind/SYS_listen, accepts one HTTP request via SYS_accept,
 // replies with an HTTP 200 response containing the file body, and exits 0.
 func BuildGuestHTTPServerELF64(targetArch string, port uint16, serveFilePath string, workspaceOutPath string, workspaceOutContent string) ([]byte, error) {
+	return BuildGuestHTTPServerELF64At(targetArch, 0x400000, port, serveFilePath, workspaceOutPath, workspaceOutContent)
+}
+
+// BuildGuestHTTPServerELF64At is like BuildGuestHTTPServerELF64 but links the
+// image at baseVA. The arm64 code reaches any 48-bit baseVA. The amd64 code
+// loads addresses with 32-bit immediates, so it needs a baseVA below 4GB.
+func BuildGuestHTTPServerELF64At(targetArch string, baseVA uint64, port uint16, serveFilePath string, workspaceOutPath string, workspaceOutContent string) ([]byte, error) {
+	if (targetArch == "amd64" || targetArch == "x86_64") && baseVA >= 1<<32 {
+		return nil, fmt.Errorf("testelf: baseVA %#x does not fit the 32-bit immediates of the amd64 code", baseVA)
+	}
+	if baseVA >= 1<<48 {
+		return nil, fmt.Errorf("testelf: baseVA %#x is above the 48-bit address space", baseVA)
+	}
 	const (
-		baseVA         = uint64(0x400000)
 		codeOffset     = 0x100
 		wsPathOff      = 0x500
 		wsContentOff   = 0x580
@@ -460,6 +472,9 @@ func BuildGuestHTTPServerELF64(targetArch string, port uint16, serveFilePath str
 				0xd2800000|reg|(uint32(addr&0xffff)<<5),
 				0xf2a00000|reg|(uint32((addr>>16)&0xffff)<<5),
 			)
+			if addr>>32 != 0 {
+				words = append(words, 0xf2c00000|reg|(uint32((addr>>32)&0xffff)<<5)) // MOVK lsl 32
+			}
 		}
 
 		if workspaceOutPath != "" {

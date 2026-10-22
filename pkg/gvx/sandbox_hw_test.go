@@ -272,8 +272,21 @@ func TestSandboxOverlayWhiteoutsOpaqueAndOrdering(t *testing.T) {
 }
 
 func TestSandboxWorkspaceAndPortForward(t *testing.T) {
-	httpServerELF, err := testelf.BuildGuestHTTPServerELF64(
+	workspaceAndPortForward(t, PlatformAuto, staticBase())
+}
+
+func TestSandboxWorkspaceAndPortForwardUnderSystrap(t *testing.T) {
+	systraptest.Require(t)
+	workspaceAndPortForward(t, PlatformSystrap, systrapStaticBase)
+}
+
+// workspaceAndPortForward runs a guest HTTP server on platform, links the
+// server at base, and reads its page through a published host port.
+func workspaceAndPortForward(t *testing.T, platform PlatformType, base uint64) {
+	t.Helper()
+	httpServerELF, err := testelf.BuildGuestHTTPServerELF64At(
 		runtime.GOARCH,
+		base,
 		8080,
 		"/usr/share/nginx/html/index.html",
 		"/workspace/result.txt",
@@ -292,6 +305,7 @@ func TestSandboxWorkspaceAndPortForward(t *testing.T) {
 
 	workspaceDir := t.TempDir()
 	cfg := hostTestConfig(t)
+	cfg.Platform = platform
 	cfg.NetworkMode = NetModeNAT
 	cfg.OCILayerTars = [][]byte{layer}
 	cfg.WorkspacePath = workspaceDir
