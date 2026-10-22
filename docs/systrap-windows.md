@@ -214,6 +214,8 @@ The memory file is a temporary file. `sectionCache` creates a section of that fi
 6. After a write fault to a writable and executable page, map the original frame again.
 7. Patch the page again at the next fetch.
 
+An `amd64` instruction can cross into the next page. The fetch then faults in the next page, and the fault reports `RIP` in the first page, which is already executable. The engine therefore patches every page that the next 15 bytes from `RIP` touch. A fault that repeats three times without a patch becomes SIGSEGV. Without this rule, a guest that ran a shell pipeline hung on one `amd64` runner model.
+
 The original frame can be shared between address spaces and mapped at different addresses. The stub therefore never executes the original frame. A guest that writes to the page that it executes would make the engine swap the two mappings forever. The engine reports SIGSEGV for that write.
 
 ### 6.4 Stops and Resumes
@@ -239,6 +241,8 @@ A stop copies only the general-purpose registers. `PullFullState` reads the vect
 ### 6.5 `windows/arm64`
 
 The patcher replaces `svc #0`, `mrs xN, ctr_el0`, `msr tpidr_el0, xN`, and `ic ivau, xN` with `brk` instructions. Windows reports a `brk` with an unknown immediate as an illegal instruction. The Sentry finds the site in its table and emulates the instruction. It returns a system call, loads the constant `0x8444c004` for `CTR_EL0`, writes the TLS register, or calls `FlushInstructionCache` for the address in `xN`. A `brk` that the guest wrote becomes SIGTRAP, and any other illegal instruction becomes SIGILL.
+
+Windows also raises an illegal instruction for `dc civac` in the cache flush loop of Node 22. The probe of section 3.4 ran `dc cvau` and it executed. The engine therefore replaces `dc cvac`, `dc cvau`, `dc cvap`, `dc cvadp`, and `dc civac` with `nop` in the patched copy. The guest memory is coherent, so the operation has no effect that a guest can see. The replacement costs no stop. The engine did not test which of the five instructions raise the exception.
 
 `CONTEXT` has no field for `TPIDR_EL0`. A routine in the engine page (`msr tpidr_el0, x16; brk`) writes it. The Sentry runs the routine when the TLS value of the guest differs from the value in the thread. That happens at the start of a new thread and after a guest write of the register. The guest reads the register natively. Windows keeps `x18` and `TPIDR_EL0` across stops, and `CONTEXT_X18` makes the engine read and write `x18`.
 
@@ -306,7 +310,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
 | Workspace files | A file without a host handle maps through a copy. A writable shared mapping of such a file fails with `ENODEV`. |
 | Unpatched system calls | A hidden `syscall` that the scan misses runs as an NT service. |
-| JIT engines | The `ic ivau` emulation and the scan of anonymous code are untested with V8 or a JVM. |
+| JIT engines | Node 22 (V8) passes its two gates on `windows/arm64`. A JVM and the `amd64` runs of V8 are untested. |
 | Endpoint protection | The stub host, the debug object, and the executable views are untested with Microsoft Defender at its default settings. |
 | Single-step interrupt | A guest that uses the trap flag itself can lose one of its own steps. |
 
@@ -321,6 +325,9 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39800771242`, `39802593217`, `39803097982` | both | `x18` across waits, policy flags, `ntdll` patching, loader-less threads. |
 | `39803487649` | both | FS base recovery with the debugger. |
 | `39809735687`, `39811366093` | both | Stub design: initialized stub, start trap, park and resume, `x18` and `TPIDR_EL0` across stops, Low-integrity token, job, Win32k, second stub on one debug object. |
+| `39845577561`, `39846215053` | `arm64` | Node 22 gates: SIGILL at `dc civac`, then both gates pass with the `nop` replacement. |
+| `39853085199`, `39854000516` | `amd64` | Shell pipeline hang on an AMD EPYC 9V74 runner: 12 of 12 runs. The state dump shows a `call` at the end of a page. |
+| `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Eighteen runs on two other models (EPYC 7763 and 9V45) also pass. |
 
 The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
 
@@ -336,7 +343,7 @@ The scan of section 3.7 ran on a development host. Its output is in [`windows-sy
 5. Run the resulting executable and read lines that start with `PROBE`, `DBG`, `R2`, or `SP`.
 6. Delete the branch and keep the logs.
 
-To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to the guest. A line has the exception code, the address, and the bytes at the program counter. The value `2` also prints every stop. The output has an upper bound of 400 lines.
+To debug a guest stop in the engine, set `GVX_SYSTRAP_TRACE=1`. The engine then prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to the guest. A line has the exception code, the address, and the bytes at the program counter. The value `2` also prints every stop and prints the state of each stub every three seconds. The value `3` prints only that state, which does not change the timing of the guest. The output has an upper bound of 400 lines, or 200000 lines for the value `2`.
 
 ## 12. Sources
 

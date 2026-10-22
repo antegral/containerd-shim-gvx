@@ -126,4 +126,4 @@ Keep CI usage low. Do not add jobs that repeat work, and do not run registry tes
 | `GVX_E2E_OFFLINE=1` | Skips the tests that pull from a registry. |
 | `GVX_E2E_REQUIRE_NETWORK=1` | Fails, and does not skip, when the registry is unreachable. |
 | `GVX_DEBUG_LOG=1` | Prints the Sentry log, which names the reason of a guest crash. |
-| `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop. |
+| `GVX_SYSTRAP_TRACE=1` | Prints each signal that an illegal instruction, a breakpoint, or an arithmetic exception sends to a Windows `systrap` guest, with the exception code and the bytes at the program counter. The value `2` also prints every stop and the state of each stub. The value `3` prints only the state. |
