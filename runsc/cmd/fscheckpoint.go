@@ -1,0 +1,148 @@
+//go:build linux
+
+// Copyright 2026 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/google/subcommands"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"z.gfire.dev/gvx/pkg/sentry/fscheckpoint"
+	"z.gfire.dev/gvx/runsc/cmd/util"
+	"z.gfire.dev/gvx/runsc/config"
+	"z.gfire.dev/gvx/runsc/container"
+	"z.gfire.dev/gvx/runsc/flag"
+	"z.gfire.dev/gvx/runsc/sandbox"
+)
+
+// FSCheckpoint implements subcommands.Command for the "fscheckpoint" command.
+type FSCheckpoint struct {
+	containerLoader
+	imagePath    string
+	leaveRunning bool
+	direct       bool
+	paths        pathVar
+}
+
+// pathVar is a repeatable flag of [<prefix>=][<container>:]<path> filesystem
+// checkpoint targets.
+type pathVar struct {
+	targets []string
+
+	// defaultPrefix is the bundle prefix of targets without an explicit
+	// "<prefix>=". It must match the default prefix used by the command when
+	// saving, so that targets are validated as the command will group them.
+	defaultPrefix string
+}
+
+func (p *pathVar) String() string {
+	if p == nil {
+		return ""
+	}
+	return strings.Join(p.targets, ", ")
+}
+
+func (p *pathVar) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("empty path: %q", value)
+	}
+	combined := append(append([]string(nil), p.targets...), value)
+	if _, err := fscheckpoint.ParseBundlesWithDefaultPrefix(combined, p.defaultPrefix); err != nil {
+		return err
+	}
+	p.targets = combined
+	return nil
+}
+
+func (p *pathVar) Get() any {
+	return p.targets
+}
+
+// Name implements subcommands.Command.Name.
+func (*FSCheckpoint) Name() string {
+	return "fscheckpoint"
+}
+
+// Synopsis implements subcommands.Command.Synopsis.
+func (*FSCheckpoint) Synopsis() string {
+	return "checkpoint container filesystems (experimental)"
+}
+
+// Usage implements subcommands.Command.Usage.
+func (*FSCheckpoint) Usage() string {
+	return `fscheckpoint [flags] <container id>:
+	Saves sandbox filesystem checkpoint to -image-path directory. Restore checkpoints using "runsc create -fs-restore-image-path=<path>".
+`
+}
+
+// SetFlags implements subcommands.Command.SetFlags.
+func (c *FSCheckpoint) SetFlags(f *flag.FlagSet) {
+	f.StringVar(&c.imagePath, "image-path", "", "directory path to saved filesystem checkpoint")
+	f.BoolVar(&c.leaveRunning, "leave-running", false, "if true, resume containers after checkpointing; if false, containers exit with status 0 after checkpointing")
+	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint files")
+	f.Var(&c.paths, "path", `path inside the container to save to the checkpoint (can be repeated). Format: [<prefix>=][<container_id>:]<path>. Without <prefix>, the files are written unprefixed; otherwise as <prefix>_*, or into a <prefix>/ subdirectory if <prefix> ends with "/". Paths containing "=" require an explicit prefix. The special path value "all-tmpfs" saves all tmpfs mounts from the OCI spec that are disk-backed. Defaults to "/" if not specified.`)
+}
+
+// FetchSpec implements util.SubCommand.FetchSpec.
+func (c *FSCheckpoint) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
+	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
+	if err != nil {
+		return "", nil, fmt.Errorf("loading container: %w", err)
+	}
+	return cont.ID, cont.Spec, nil
+}
+
+// Execute implements subcommands.Command.Execute.
+func (c *FSCheckpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	if f.NArg() != 1 {
+		f.Usage()
+		return subcommands.ExitUsageError
+	}
+
+	conf := args[0].(*config.Config)
+
+	cont, err := c.loadContainer(conf, f, container.LoadOpts{})
+	if err != nil {
+		util.Fatalf("loading container: %v", err)
+	}
+
+	if c.imagePath == "" {
+		util.Fatalf("image-path flag must be provided")
+	}
+
+	if err := os.MkdirAll(c.imagePath, 0755); err != nil {
+		util.Fatalf("making directories at path provided: %v", err)
+	}
+
+	paths := c.paths.targets
+	if len(paths) == 0 {
+		paths = []string{"/"}
+	}
+
+	if err := cont.FSSave(conf, c.imagePath, sandbox.FSSaveOpts{
+		Direct:          c.direct,
+		ExitAfterSaving: !c.leaveRunning,
+		Paths:           paths,
+	}); err != nil {
+		util.Fatalf("filesystem checkpoint saving failed: %v", err)
+	}
+
+	return subcommands.ExitSuccess
+}

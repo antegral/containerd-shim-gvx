@@ -1,0 +1,81 @@
+//go:build linux
+
+// Copyright 2023 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package nvproxy provides subcommands for the nvproxy command.
+package nvproxy
+
+import (
+	"bytes"
+	"context"
+
+	"github.com/google/subcommands"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"z.gfire.dev/gvx/pkg/sentry/devices/nvproxy/nvconf"
+	"z.gfire.dev/gvx/runsc/config"
+	"z.gfire.dev/gvx/runsc/flag"
+)
+
+// Nvproxy implements subcommands.Command for the "nvproxy" command.
+type Nvproxy struct {
+	// SupportedDrivers returns the driver versions that nvproxy supports.
+	// Only the Sentry binaries, which link nvproxy, set it.
+	SupportedDrivers func() []nvconf.DriverVersion
+}
+
+// Name implements subcommands.Command.
+func (*Nvproxy) Name() string {
+	return "nvproxy"
+}
+
+// Synopsis implements subcommands.Command.
+func (*Nvproxy) Synopsis() string {
+	return "shows information about nvproxy support"
+}
+
+// Usage implements subcommands.Command.
+func (n *Nvproxy) Usage() string {
+	buf := bytes.Buffer{}
+	buf.WriteString("Usage: nvproxy <flags> <subcommand> <subcommand args>\n\n")
+
+	cdr := n.createCommander(&flag.FlagSet{})
+	cdr.VisitGroups(func(grp *subcommands.CommandGroup) {
+		cdr.ExplainGroup(&buf, grp)
+	})
+
+	return buf.String()
+}
+
+// SetFlags implements subcommands.Command.
+func (*Nvproxy) SetFlags(*flag.FlagSet) {}
+
+// FetchSpec implements util.SubCommand.FetchSpec.
+func (*Nvproxy) FetchSpec(_ *config.Config, _ *flag.FlagSet) (string, *specs.Spec, error) {
+	// None of the subcommands operate on a single container, so nothing to fetch.
+	return "", nil, nil
+}
+
+// Execute implements subcommands.Command.Execute.
+func (n *Nvproxy) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	return n.createCommander(f).Execute(ctx, args...)
+}
+
+func (n *Nvproxy) createCommander(f *flag.FlagSet) *subcommands.Commander {
+	cdr := subcommands.NewCommander(f, "nvproxy")
+	cdr.Register(cdr.HelpCommand(), "")
+	cdr.Register(cdr.FlagsCommand(), "")
+	cdr.Register(&listSupportedDrivers{supportedDrivers: n.SupportedDrivers}, "")
+	return cdr
+}

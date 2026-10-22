@@ -1,0 +1,214 @@
+//go:build linux
+
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/google/subcommands"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"z.gfire.dev/gvx/pkg/cleanup"
+	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/runsc/cmd/sandboxsetup"
+	"z.gfire.dev/gvx/runsc/cmd/util"
+	"z.gfire.dev/gvx/runsc/config"
+	"z.gfire.dev/gvx/runsc/container"
+	"z.gfire.dev/gvx/runsc/flag"
+	"z.gfire.dev/gvx/runsc/specutils"
+)
+
+type imagePaths []string
+
+// String implements flag.Value.String.
+func (p *imagePaths) String() string {
+	return strings.Join(*p, ",")
+}
+
+// Get implements flag.Value.Get.
+func (p *imagePaths) Get() any {
+	return p
+}
+
+// Set implements flag.Value.Set. Set(String()) should be idempotent.
+func (p *imagePaths) Set(value string) error {
+	*p = append(*p, strings.Split(value, ",")...)
+	return nil
+}
+
+// Create implements subcommands.Command for the "create" command.
+type Create struct {
+	// bundleDir is the path to the bundle directory (defaults to the
+	// current working directory).
+	bundleDir string
+
+	// pidFile is the filename that the sandbox pid will be written to.
+	// This file should only be created once the container process inside
+	// the sandbox is ready to use.
+	pidFile string
+
+	// consoleSocket is the path to an AF_UNIX socket which will receive a
+	// file descriptor referencing the master end of the console's
+	// pseudoterminal.  This is ignored unless spec.Process.Terminal is
+	// true.
+	consoleSocket string
+
+	// passFDs are host FDs exposed to the sandboxed application.
+	passFDs sandboxsetup.FDMappings
+
+	// userLog is the path to send user-visible logs to. This log is different
+	// from debug logs. The former is meant to be consumed by the users and should
+	// contain only information that is relevant to the person running the
+	// container, e.g. unsupported syscalls, while the later is more verbose and
+	// consumed by developers.
+	userLog string
+
+	// fsRestoreImagePaths is the list of paths to the filesystem checkpoints to
+	// restore. Combining bundles from different checkpoints is only supported on
+	// fresh container creation (create/run); during restore, all bundles must
+	// come from the same checkpoint as the sentry state image.
+	// fsRestoreDirect is true if files making up the filesystem checkpoint should
+	// be opened with O_DIRECT.
+	fsRestoreImagePaths imagePaths
+	fsRestoreDirect     bool
+
+	// noRootContainer creates a sandbox with no root container: the spec holds
+	// sandbox-wide settings only and containers are added afterwards.
+	noRootContainer bool
+
+	// spec is the cached OCI spec.
+	spec *specs.Spec
+}
+
+// Name implements subcommands.Command.Name.
+func (*Create) Name() string {
+	return "create"
+}
+
+// Synopsis implements subcommands.Command.Synopsis.
+func (*Create) Synopsis() string {
+	return "create a secure container"
+}
+
+// Usage implements subcommands.Command.Usage.
+func (*Create) Usage() string {
+	return "create [flags] <container id> - create a secure container\n"
+}
+
+// SetFlags implements subcommands.Command.SetFlags.
+func (c *Create) SetFlags(f *flag.FlagSet) {
+	f.Var(&c.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
+	f.StringVar(&c.bundleDir, "bundle", "", "path to the root of the bundle directory, defaults to the current directory")
+	f.StringVar(&c.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
+	f.StringVar(&c.pidFile, "pid-file", "", "filename that the container pid will be written to")
+	f.StringVar(&c.userLog, "user-log", "", "filename to send user-visible logs to. Empty means no logging.")
+	f.Var(&c.fsRestoreImagePaths, "fs-restore-image-path", "path to filesystem checkpoint (<dir> or <dir>/<prefix>) to restore (can be repeated; combining bundles from different checkpoints is only supported for create/run, not restore)")
+	f.BoolVar(&c.fsRestoreDirect, "fs-restore-direct", false, "open files in fs-restore-image-path with O_DIRECT")
+	f.BoolVar(&c.noRootContainer, "no-root-container", false, "create a sandbox with no root container; the bundle spec describes only the sandbox and containers are added later as subcontainers")
+}
+
+// passFiles takes ownership of the descriptors supplied by --pass-fd. The
+// caller must close them after donating them to the new sandbox.
+func (c *Create) passFiles() (map[int]*os.File, func(), error) {
+	files := make(map[int]*os.File, len(c.passFDs))
+	hostFiles := make(map[int]*os.File, len(c.passFDs))
+	var cu cleanup.Cleanup
+	defer cu.Clean()
+	for _, mapping := range c.passFDs {
+		file, ok := hostFiles[mapping.Host]
+		if !ok {
+			file = os.NewFile(uintptr(mapping.Host), "")
+			if file == nil {
+				return nil, nil, fmt.Errorf("creating file from descriptor %d", mapping.Host)
+			}
+			hostFiles[mapping.Host] = file
+			cu.Add(func() {
+				if err := file.Close(); err != nil {
+					log.Debugf("Closing passed FD %d: %v", mapping.Host, err)
+				}
+			})
+		}
+		files[mapping.Guest] = file
+	}
+	return files, cu.Release(), nil
+}
+
+// FetchSpec implements util.SubCommand.FetchSpec.
+func (c *Create) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
+	if f.NArg() < 1 {
+		return "", nil, fmt.Errorf("a container id is required")
+	}
+	cid := f.Arg(0)
+	if c.spec != nil {
+		return cid, c.spec, nil
+	}
+	if c.bundleDir == "" {
+		c.bundleDir = getwdOrDie()
+	}
+	spec, err := specutils.ReadSpec(c.bundleDir, specutils.SpecOpts{Conf: conf, NoRootContainer: c.noRootContainer})
+	if err != nil {
+		return cid, nil, fmt.Errorf("reading spec: %w", err)
+	}
+	c.spec = spec
+	return cid, c.spec, nil
+}
+
+// Execute implements subcommands.Command.Execute.
+func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	if f.NArg() != 1 {
+		f.Usage()
+		return subcommands.ExitUsageError
+	}
+
+	conf := args[0].(*config.Config)
+
+	if conf.Rootless {
+		return util.Errorf("Rootless mode not supported with %q", c.Name())
+	}
+
+	id, spec, err := c.FetchSpec(conf, f)
+	if err != nil {
+		return util.Errorf("FetchSpec: %v", err)
+	}
+	files, closeFiles, err := c.passFiles()
+	if err != nil {
+		return util.Errorf("preparing passed files: %v", err)
+	}
+	defer closeFiles()
+
+	// Create the container. A new sandbox will be created for the
+	// container unless the metadata specifies that it should be run in an
+	// existing container.
+	contArgs := container.Args{
+		ID:                  id,
+		Spec:                spec,
+		BundleDir:           c.bundleDir,
+		ConsoleSocket:       c.consoleSocket,
+		PIDFile:             c.pidFile,
+		UserLog:             c.userLog,
+		PassFiles:           files,
+		FSRestoreImagePaths: []string(c.fsRestoreImagePaths),
+		FSRestoreDirect:     c.fsRestoreDirect,
+		NoRootContainer:     c.noRootContainer,
+	}
+	if _, err := container.New(conf, contArgs); err != nil {
+		return util.Errorf("creating container: %v", err)
+	}
+	return subcommands.ExitSuccess
+}

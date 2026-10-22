@@ -1,0 +1,463 @@
+//go:build linux
+
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package boot
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"runtime"
+	"syscall"
+
+	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/pkg/sentry/kernel"
+	"z.gfire.dev/gvx/pkg/sentry/socket/netfilter"
+	"z.gfire.dev/gvx/pkg/sentry/socket/plugin"
+	"z.gfire.dev/gvx/pkg/tcpip"
+	"z.gfire.dev/gvx/pkg/tcpip/link/ethernet"
+	"z.gfire.dev/gvx/pkg/tcpip/link/fdbased"
+	"z.gfire.dev/gvx/pkg/tcpip/link/loopback"
+	"z.gfire.dev/gvx/pkg/tcpip/link/qdisc/fifo"
+	"z.gfire.dev/gvx/pkg/tcpip/link/qdisc/tbf"
+	"z.gfire.dev/gvx/pkg/tcpip/link/sniffer"
+	"z.gfire.dev/gvx/pkg/tcpip/link/xdp"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv4"
+	"z.gfire.dev/gvx/pkg/tcpip/network/ipv6"
+	"z.gfire.dev/gvx/pkg/tcpip/stack"
+	"z.gfire.dev/gvx/runsc/boot/sentryapi"
+	"z.gfire.dev/gvx/runsc/config"
+)
+
+// Network exposes methods that can be used to configure a network stack.
+type Network struct {
+	Stack  *stack.Stack
+	Kernel *kernel.Kernel
+
+	// PluginStack is a third-party network stack to use in place of
+	// netstack when non-nil.
+	PluginStack plugin.PluginStack
+}
+
+func toTcpipRoute(r *sentryapi.Route, id tcpip.NICID) (tcpip.Route, error) {
+	subnet, err := tcpip.NewSubnet(ipToAddress(r.Destination.IP), ipMaskToAddressMask(r.Destination.Mask))
+	if err != nil {
+		return tcpip.Route{}, err
+	}
+	return tcpip.Route{
+		Destination: subnet,
+		Gateway:     ipToAddress(r.Gateway),
+		NIC:         id,
+		MTU:         r.MTU,
+	}, nil
+}
+
+// InitPluginStack initializes plugin network stack.
+// It will invoke Init() that is registered by current plugin stack.
+func (n *Network) InitPluginStack(args *sentryapi.InitPluginStackArgs, _ *struct{}) error {
+	pluginStack := n.PluginStack
+	if pluginStack == nil {
+		return fmt.Errorf("plugin stack is not registered")
+	}
+
+	fdNum := len(args.FilePayload.Files)
+	fds := make([]int, fdNum)
+	for i := 0; i < fdNum; i++ {
+		oldFD := args.FilePayload.Files[i].Fd()
+		if newFD, err := syscall.Dup(int(oldFD)); err != nil {
+			return fmt.Errorf("failed to dup FD")
+		} else {
+			fds[i] = newFD
+		}
+	}
+
+	return pluginStack.Init(&plugin.InitStackArgs{
+		InitStr: args.InitStr,
+		FDs:     fds,
+	})
+}
+
+// CreateLinksAndRoutes creates links and routes in a network stack.  It should
+// only be called once.
+func (n *Network) CreateLinksAndRoutes(args *sentryapi.CreateLinksAndRoutesArgs, _ *struct{}) error {
+	if len(args.FDBasedLinks) > 0 && len(args.XDPLinks) > 0 {
+		return fmt.Errorf("received both fdbased and XDP links, but only one can be used at a time")
+	}
+	wantFDs := 0
+	for _, l := range args.FDBasedLinks {
+		wantFDs += l.NumChannels
+	}
+	for _, link := range args.XDPLinks {
+		// We have to keep several FDs alive when the sentry is
+		// responsible for binding, but when runsc binds we only expect
+		// the AF_XDP socket itself.
+		switch v := link.Bind; v {
+		case sentryapi.BindSentry:
+			wantFDs += 4
+		case sentryapi.BindRunsc:
+			wantFDs++
+		default:
+			return fmt.Errorf("unknown bind value: %d", v)
+		}
+	}
+	if args.PCAP {
+		wantFDs++
+	}
+	if args.NATBlob {
+		wantFDs++
+	}
+	if got := len(args.FilePayload.Files); got != wantFDs {
+		return fmt.Errorf("args.FilePayload.Files has %d FDs but we need %d entries based on FDBasedLinks, XDPLinks, and PCAP", got, wantFDs)
+	}
+
+	nicids := make(map[string]tcpip.NICID)
+
+	// Collect routes from all links.
+	var routes []tcpip.Route
+
+	// Loopback normally appear before other interfaces.
+	for _, link := range args.LoopbackLinks {
+		nicID := n.Stack.NextNICID()
+		nicids[link.Name] = nicID
+
+		var linkEP stack.LinkEndpoint
+		linkEP = ethernet.New(loopback.New())
+		if args.LogPackets {
+			linkEP = sniffer.New(linkEP)
+		}
+
+		log.Infof("Enabling loopback interface %q with id %d on addresses %+v", link.Name, nicID, link.Addresses)
+		opts := stack.NICOptions{
+			Name:               link.Name,
+			DeliverLinkPackets: true,
+		}
+		if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
+			return err
+		}
+
+		// Collect the routes from this link.
+		for _, r := range link.Routes {
+			route, err := toTcpipRoute(&r, nicID)
+			if err != nil {
+				return err
+			}
+			routes = append(routes, route)
+		}
+	}
+
+	// Setup fdbased or XDP links.
+	fdOffset := 0
+	if len(args.FDBasedLinks) > 0 {
+		// Choose a dispatch mode.
+		// Testing has shown that RecvMMsg is the fastest. Attempts to use
+		// the PacketMMap dispatcher have failed to result in higher throughput.
+		dispatchMode := fdbased.RecvMMsg
+
+		for _, link := range args.FDBasedLinks {
+			nicID := n.Stack.NextNICID()
+			nicids[link.Name] = nicID
+
+			FDs := make([]int, 0, link.NumChannels)
+			for j := 0; j < link.NumChannels; j++ {
+				// Copy the underlying FD.
+				oldFD := args.FilePayload.Files[fdOffset].Fd()
+				newFD, err := unix.Dup(int(oldFD))
+				if err != nil {
+					return fmt.Errorf("failed to dup FD %v: %v", oldFD, err)
+				}
+				FDs = append(FDs, newFD)
+				fdOffset++
+			}
+			mac := tcpip.LinkAddress(link.LinkAddress)
+			linkDispatchMode := dispatchMode
+			if link.IsProxy {
+				// Use Readv for a SOCK_SEQPACKET UDS proxy link so a peer EOF (0-byte
+				// read) stops the dispatcher cleanly instead of busy-spinning in
+				// RecvMMsg.
+				linkDispatchMode = fdbased.Readv
+			}
+
+			linkEP, err := fdbased.New(&fdbased.Options{
+				FDs:                  FDs,
+				MTU:                  uint32(link.MTU),
+				EthernetHeader:       mac != "" && !link.IsProxy,
+				Address:              mac,
+				PacketDispatchMode:   linkDispatchMode,
+				GSOMaxSize:           link.GSOMaxSize,
+				GVisorGSOEnabled:     link.GVisorGSOEnabled,
+				TXChecksumOffload:    link.TXChecksumOffload,
+				RXChecksumOffload:    link.RXChecksumOffload,
+				GRO:                  link.GVisorGRO,
+				ProcessorsPerChannel: link.ProcessorsPerChannel,
+				IsPacketSocket:       link.IsPacket,
+				PreConfigured:        link.PreConfigured,
+			})
+			if err != nil {
+				return err
+			}
+
+			// Setup packet logging if requested.
+			if args.PCAP {
+				newFD, err := unix.Dup(int(args.FilePayload.Files[fdOffset].Fd()))
+				if err != nil {
+					return fmt.Errorf("failed to dup pcap FD: %v", err)
+				}
+				const packetTruncateSize = 4096
+				linkEP, err = sniffer.NewWithWriter(linkEP, os.NewFile(uintptr(newFD), "pcap-file"), packetTruncateSize)
+				if err != nil {
+					return fmt.Errorf("failed to create PCAP logger: %v", err)
+				}
+				fdOffset++
+			} else if args.LogPackets {
+				linkEP = sniffer.New(linkEP)
+			}
+
+			var qDisc stack.QueueingDiscipline
+			switch link.QDisc {
+			case config.QDiscNone:
+			case config.QDiscFIFO:
+				log.Infof("Enabling FIFO QDisc on %q", link.Name)
+				qDisc = fifo.New(linkEP, runtime.GOMAXPROCS(0), 1000)
+			case config.QDiscTBF:
+				log.Infof("Enabling TBF QDisc on %q rate=%d burst=%d", link.Name, link.TBFRate, link.TBFBurst)
+				var err error
+				qDisc, err = tbf.New(linkEP, n.Stack.Clock(), link.TBFRate, link.TBFBurst, 1000)
+				if err != nil {
+					return fmt.Errorf("creating TBF qdisc for %q: %w", link.Name, err)
+				}
+			}
+
+			log.Infof("Enabling interface %q with id %d on addresses %+v (%v) w/ %d channels", link.Name, nicID, link.Addresses, mac, link.NumChannels)
+			opts := stack.NICOptions{
+				Name:               link.Name,
+				QDisc:              qDisc,
+				DeliverLinkPackets: true,
+			}
+			if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
+				return err
+			}
+
+			// Collect the routes from this link.
+			for _, r := range link.Routes {
+				route, err := toTcpipRoute(&r, nicID)
+				if err != nil {
+					return err
+				}
+				routes = append(routes, route)
+			}
+
+			if !link.IsProxy {
+				for _, neigh := range link.Neighbors {
+					proto, tcpipAddr := ipToAddressAndProto(neigh.IP)
+					n.Stack.AddStaticNeighbor(nicID, proto, tcpipAddr, tcpip.LinkAddress(neigh.HardwareAddr))
+				}
+			}
+		}
+	} else if len(args.XDPLinks) > 0 {
+		if nlinks := len(args.XDPLinks); nlinks > 1 {
+			return fmt.Errorf("XDP only supports one link device, but got %d", nlinks)
+		}
+		link := args.XDPLinks[0]
+		nicID := n.Stack.NextNICID()
+		nicids[link.Name] = nicID
+
+		// Get the AF_XDP socket.
+		oldFD := args.FilePayload.Files[fdOffset].Fd()
+		fd, err := unix.Dup(int(oldFD))
+		if err != nil {
+			return fmt.Errorf("failed to dup AF_XDP fd %v: %v", oldFD, err)
+		}
+		fdOffset++
+
+		// When the sentry is responsible for binding, the runsc
+		// process sends several other FDs in order to keep them open
+		// and alive. These are for BPF programs and maps that, if
+		// closed, will break the dispatcher.
+		if link.Bind == sentryapi.BindSentry {
+			for _, fdName := range []string{"program-fd", "sockmap-fd", "link-fd"} {
+				oldFD := args.FilePayload.Files[fdOffset].Fd()
+				if _, err := unix.Dup(int(oldFD)); err != nil {
+					return fmt.Errorf("failed to dup %s with FD %d: %v", fdName, oldFD, err)
+				}
+				fdOffset++
+			}
+		}
+
+		// Setup packet logging if requested.
+		mac := tcpip.LinkAddress(link.LinkAddress)
+		linkEP, err := xdp.New(&xdp.Options{
+			FD:                fd,
+			Address:           mac,
+			TXChecksumOffload: link.TXChecksumOffload,
+			RXChecksumOffload: link.RXChecksumOffload,
+			InterfaceIndex:    link.InterfaceIndex,
+			Bind:              link.Bind == sentryapi.BindSentry,
+			GRO:               link.GVisorGRO,
+		})
+		if err != nil {
+			return err
+		}
+
+		if args.PCAP {
+			newFD, err := unix.Dup(int(args.FilePayload.Files[fdOffset].Fd()))
+			if err != nil {
+				return fmt.Errorf("failed to dup pcap FD: %v", err)
+			}
+			const packetTruncateSize = 4096
+			linkEP, err = sniffer.NewWithWriter(linkEP, os.NewFile(uintptr(newFD), "pcap-file"), packetTruncateSize)
+			if err != nil {
+				return fmt.Errorf("failed to create PCAP logger: %v", err)
+			}
+			fdOffset++
+		} else if args.LogPackets {
+			linkEP = sniffer.New(linkEP)
+		}
+
+		var qDisc stack.QueueingDiscipline
+		switch link.QDisc {
+		case config.QDiscNone:
+		case config.QDiscFIFO:
+			log.Infof("Enabling FIFO QDisc on %q", link.Name)
+			qDisc = fifo.New(linkEP, runtime.GOMAXPROCS(0), 1000)
+		case config.QDiscTBF:
+			log.Infof("Enabling TBF QDisc on %q rate=%d burst=%d", link.Name, link.TBFRate, link.TBFBurst)
+			var err error
+			qDisc, err = tbf.New(linkEP, n.Stack.Clock(), link.TBFRate, link.TBFBurst, 1000)
+			if err != nil {
+				return fmt.Errorf("creating TBF qdisc for %q: %w", link.Name, err)
+			}
+		}
+
+		log.Infof("Enabling interface %q with id %d on addresses %+v (%v) w/ %d channels", link.Name, nicID, link.Addresses, mac, link.NumChannels)
+		opts := stack.NICOptions{
+			Name:               link.Name,
+			QDisc:              qDisc,
+			DeliverLinkPackets: true,
+		}
+		if err := n.createNICWithAddrs(nicID, linkEP, opts, link.Addresses); err != nil {
+			return err
+		}
+
+		// Collect the routes from this link.
+		for _, r := range link.Routes {
+			route, err := toTcpipRoute(&r, nicID)
+			if err != nil {
+				return err
+			}
+			routes = append(routes, route)
+		}
+
+		for _, neigh := range link.Neighbors {
+			proto, tcpipAddr := ipToAddressAndProto(neigh.IP)
+			n.Stack.AddStaticNeighbor(nicID, proto, tcpipAddr, tcpip.LinkAddress(neigh.HardwareAddr))
+		}
+	}
+
+	if !args.Defaultv4Gateway.Route.Empty() {
+		nicID, ok := nicids[args.Defaultv4Gateway.Name]
+		if !ok {
+			return fmt.Errorf("invalid interface name %q for default route", args.Defaultv4Gateway.Name)
+		}
+		route, err := toTcpipRoute(&args.Defaultv4Gateway.Route, nicID)
+		if err != nil {
+			return err
+		}
+		routes = append(routes, route)
+	}
+
+	if !args.Defaultv6Gateway.Route.Empty() {
+		nicID, ok := nicids[args.Defaultv6Gateway.Name]
+		if !ok {
+			return fmt.Errorf("invalid interface name %q for default route", args.Defaultv6Gateway.Name)
+		}
+		route, err := toTcpipRoute(&args.Defaultv6Gateway.Route, nicID)
+		if err != nil {
+			return err
+		}
+		routes = append(routes, route)
+	}
+
+	log.Infof("Setting routes %+v", routes)
+	n.Stack.SetRouteTable(routes)
+
+	// Set NAT table rules if necessary.
+	if args.NATBlob {
+		log.Infof("Replacing NAT table")
+		iptReplaceBlob, err := io.ReadAll(args.FilePayload.Files[fdOffset])
+		if err != nil {
+			return fmt.Errorf("failed to read iptables blob: %v", err)
+		}
+		if err := netfilter.SetEntries(n.Kernel.RootUserNamespace(), n.Stack, iptReplaceBlob, false); err != nil {
+			return fmt.Errorf("failed to SetEntries: %v", err)
+		}
+	}
+
+	if args.PauseExternalNetworking {
+		n.Stack.DisableAllNonLoopbackNICs()
+	}
+
+	n.Stack.SetAllowConnectedOnSave(args.AllowConnectedOnSave)
+
+	return nil
+}
+
+// createNICWithAddrs creates a NIC in the network stack and adds the given
+// addresses.
+func (n *Network) createNICWithAddrs(id tcpip.NICID, ep stack.LinkEndpoint, opts stack.NICOptions, addrs []sentryapi.IPWithPrefix) error {
+	if err := n.Stack.CreateNICWithOptions(id, ep, opts); err != nil {
+		return fmt.Errorf("CreateNICWithOptions(%d, _, %+v) failed: %v", id, opts, err)
+	}
+
+	for _, addr := range addrs {
+		proto, tcpipAddr := ipToAddressAndProto(addr.Address)
+		protocolAddr := tcpip.ProtocolAddress{
+			Protocol: proto,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpipAddr,
+				PrefixLen: addr.PrefixLen,
+			},
+		}
+		if err := n.Stack.AddProtocolAddress(id, protocolAddr, stack.AddressProperties{}); err != nil {
+			return fmt.Errorf("AddProtocolAddress(%d, %+v, {}) failed: %s", id, protocolAddr, err)
+		}
+	}
+	return nil
+}
+
+// ipToAddressAndProto converts IP to tcpip.Address and a protocol number.
+//
+// Note: don't use 'len(ip)' to determine IP version because length is always 16.
+func ipToAddressAndProto(ip net.IP) (tcpip.NetworkProtocolNumber, tcpip.Address) {
+	if i4 := ip.To4(); i4 != nil {
+		return ipv4.ProtocolNumber, tcpip.AddrFromSlice(i4)
+	}
+	return ipv6.ProtocolNumber, tcpip.AddrFromSlice(ip)
+}
+
+// ipToAddress converts IP to tcpip.Address, ignoring the protocol.
+func ipToAddress(ip net.IP) tcpip.Address {
+	_, addr := ipToAddressAndProto(ip)
+	return addr
+}
+
+// ipMaskToAddressMask converts IPMask to tcpip.AddressMask, ignoring the
+// protocol.
+func ipMaskToAddressMask(ipMask net.IPMask) tcpip.AddressMask {
+	addr := ipToAddress(net.IP(ipMask))
+	return tcpip.MaskFromBytes(addr.AsSlice())
+}

@@ -1,0 +1,167 @@
+//go:build linux
+
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/google/subcommands"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/pkg/log"
+	"z.gfire.dev/gvx/runsc/cmd/util"
+	"z.gfire.dev/gvx/runsc/config"
+	"z.gfire.dev/gvx/runsc/container"
+	"z.gfire.dev/gvx/runsc/flag"
+	"z.gfire.dev/gvx/runsc/specutils"
+)
+
+// Run implements subcommands.Command for the "run" command.
+type Run struct {
+	// Run flags are a super-set of those for Create.
+	Create
+
+	// detach indicates that runsc has to start a process and exit without waiting it.
+	detach bool
+
+	// execFD is the host file descriptor used for program execution.
+	execFD int
+
+	// spec is the cached OCI spec from FetchSpec().
+	spec *specs.Spec
+}
+
+// Name implements subcommands.Command.Name.
+func (*Run) Name() string {
+	return "run"
+}
+
+// Synopsis implements subcommands.Command.Synopsis.
+func (*Run) Synopsis() string {
+	return "create and run a secure container"
+}
+
+// Usage implements subcommands.Command.Usage.
+func (*Run) Usage() string {
+	return "run [flags] <container id> - create and run a secure container.\n"
+}
+
+// SetFlags implements subcommands.Command.SetFlags.
+func (r *Run) SetFlags(f *flag.FlagSet) {
+	f.BoolVar(&r.detach, "detach", false, "detach from the container's process")
+	f.IntVar(&r.execFD, "exec-fd", -1, "host file descriptor used for program execution")
+	r.Create.SetFlags(f)
+}
+
+// FetchSpec implements util.SubCommand.FetchSpec.
+func (r *Run) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *specs.Spec, error) {
+	if f.NArg() < 1 {
+		f.Usage()
+		return "", nil, fmt.Errorf("a container id is required")
+	}
+
+	id := f.Arg(0)
+	if r.spec != nil {
+		return id, r.spec, nil
+	}
+
+	if r.bundleDir == "" {
+		r.bundleDir = getwdOrDie()
+	}
+	spec, err := specutils.ReadSpec(r.bundleDir, specutils.SpecOpts{Conf: conf, NoRootContainer: r.noRootContainer})
+	if err != nil {
+		return "", nil, fmt.Errorf("reading spec: %w", err)
+	}
+	r.spec = spec
+	return id, spec, nil
+}
+
+// Execute implements subcommands.Command.Execute.
+func (r *Run) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	if f.NArg() != 1 {
+		f.Usage()
+		return subcommands.ExitUsageError
+	}
+
+	conf := args[0].(*config.Config)
+	waitStatus := args[1].(*unix.WaitStatus)
+
+	if conf.Rootless {
+		if conf.Network == config.NetworkSandbox {
+			return util.Errorf("sandbox network isn't supported with --rootless, use --network=none or --network=host")
+		}
+
+		if err := specutils.MaybeRunAsRoot(); err != nil {
+			return util.Errorf("Error executing inside namespace: %v", err)
+		}
+		// Execution will continue here if no more capabilities are needed...
+	}
+
+	id, spec, err := r.FetchSpec(conf, f)
+	if err != nil {
+		return util.Errorf("FetchSpec: %v", err)
+	}
+	specutils.LogSpecDebug(spec, conf.OCISeccomp)
+
+	if !r.noRootContainer {
+		if err := validateProcessSpec(spec.Process); err != nil {
+			return util.Errorf("invalid process spec: %v", err)
+		}
+	}
+
+	fdMap, closeFiles, err := r.passFiles()
+	if err != nil {
+		return util.Errorf("preparing passed files: %v", err)
+	}
+	defer closeFiles()
+
+	var execFile *os.File
+	if r.execFD >= 0 {
+		execFile = os.NewFile(uintptr(r.execFD), "exec-fd")
+	}
+
+	// Close the executable descriptor after passing it to the sandbox.
+	defer func() {
+		if execFile != nil && execFile.Close() != nil {
+			log.Debugf("Failed to close exec FD")
+		}
+	}()
+
+	runArgs := container.Args{
+		ID:                  id,
+		Spec:                spec,
+		BundleDir:           r.bundleDir,
+		ConsoleSocket:       r.consoleSocket,
+		PIDFile:             r.pidFile,
+		UserLog:             r.userLog,
+		Attached:            !r.detach,
+		PassFiles:           fdMap,
+		ExecFile:            execFile,
+		FSRestoreImagePaths: []string(r.fsRestoreImagePaths),
+		FSRestoreDirect:     r.fsRestoreDirect,
+		NoRootContainer:     r.noRootContainer,
+	}
+	ws, err := container.Run(conf, runArgs)
+	if err != nil {
+		return util.Errorf("running container: %v", err)
+	}
+
+	*waitStatus = ws
+	return subcommands.ExitSuccess
+}
