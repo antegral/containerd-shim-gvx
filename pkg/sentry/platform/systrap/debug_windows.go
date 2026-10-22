@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,34 +75,55 @@ var (
 	traceMuted atomic.Bool
 )
 
-// stopStats counts the stops of every stub by kind. The watch trace prints the
-// counts, which show what the time of a guest goes to.
+// stopKind names the kinds of a stop for the statistics.
+type stopKind int
+
+const (
+	stopTrap stopKind = iota
+	stopFaultRead
+	stopFaultWrite
+	stopFaultExec
+	stopStep
+	stopOther
+	stopKinds
+)
+
+var stopKindNames = [stopKinds]string{"trap", "read fault", "write fault", "execute fault", "step", "other"}
+
+// stopStats counts the stops of every stub by kind, and adds up the time that
+// the Sentry spent to serve each kind. waitNs is the time from the resume of a
+// thread to its next stop. The watch trace prints the numbers, which show what
+// the time of a guest goes to.
 var stopStats struct {
-	trap, faultRead, faultWrite, faultExec, step, other atomic.Uint64
+	count    [stopKinds]atomic.Uint64
+	handleNs [stopKinds]atomic.Uint64
+	waitNs   atomic.Uint64
 }
 
-// countStop adds one stop to stopStats.
-func countStop(ev debugEvent) {
+func kindOf(ev debugEvent) stopKind {
 	switch {
 	case ev.State == dbgStateSingleStep:
-		stopStats.step.Add(1)
+		return stopStep
 	case ev.Code == statusBreakpoint, ev.Code == statusIllegalInsn, ev.Code == statusPrivInsn:
-		stopStats.trap.Add(1)
+		return stopTrap
 	case ev.Code == statusAccessViol && ev.Info[0] == avExecute:
-		stopStats.faultExec.Add(1)
+		return stopFaultExec
 	case ev.Code == statusAccessViol && ev.Info[0] == avWrite:
-		stopStats.faultWrite.Add(1)
+		return stopFaultWrite
 	case ev.Code == statusAccessViol, ev.Code == statusInPageError:
-		stopStats.faultRead.Add(1)
-	default:
-		stopStats.other.Add(1)
+		return stopFaultRead
 	}
+	return stopOther
 }
 
 func statsLine() string {
-	return fmt.Sprintf("stops: trap %d, read fault %d, write fault %d, execute fault %d, step %d, other %d",
-		stopStats.trap.Load(), stopStats.faultRead.Load(), stopStats.faultWrite.Load(), stopStats.faultExec.Load(),
-		stopStats.step.Load(), stopStats.other.Load())
+	var b strings.Builder
+	fmt.Fprintf(&b, "stops (count, ms to serve):")
+	for k := stopKind(0); k < stopKinds; k++ {
+		fmt.Fprintf(&b, " %s %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6)
+	}
+	fmt.Fprintf(&b, " guest and wake-up %d ms", stopStats.waitNs.Load()/1e6)
+	return b.String()
 }
 
 func tracef(format string, args ...any) {

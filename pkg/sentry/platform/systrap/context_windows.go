@@ -19,6 +19,7 @@ package systrap
 import (
 	"fmt"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -129,9 +130,16 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 			th.forceStop()
 		}
 		for {
+			var waited time.Time
+			if traceEvents {
+				waited = time.Now()
+			}
 			ev, err := th.waitEvent(0)
 			if err != nil {
 				return nil, hostarch.NoAccess, errDeadContext
+			}
+			if traceEvents {
+				stopStats.waitNs.Add(uint64(time.Since(waited)))
 			}
 			out := c.handleEvent(ctx, mm, as, th, ac, ev)
 			if out.done {
@@ -161,7 +169,12 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
-	countStop(ev)
+	if traceEvents {
+		kind := kindOf(ev)
+		stopStats.count[kind].Add(1)
+		start := time.Now()
+		defer func() { stopStats.handleNs[kind].Add(uint64(time.Since(start))) }()
+	}
 	if traceAll && !traceMuted.Load() {
 		th.traceStop(as, ev)
 	}
