@@ -139,7 +139,7 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 				return nil, hostarch.NoAccess, errDeadContext
 			}
 			if traceEvents {
-				stopStats.waitNs.Add(uint64(time.Since(waited)))
+				stopStats.waitNs[kindOf(ev)].Add(uint64(time.Since(waited)))
 			}
 			out := c.handleEvent(ctx, mm, as, th, ac, ev)
 			if out.done {

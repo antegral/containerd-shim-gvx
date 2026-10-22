@@ -92,12 +92,12 @@ var stopKindNames = [stopKinds]string{"trap", "read fault", "write fault", "exec
 
 // stopStats counts the stops of every stub by kind, and adds up the time that
 // the Sentry spent to serve each kind. waitNs is the time from the resume of a
-// thread to its next stop. The watch trace prints the numbers, which show what
+// thread to a stop of the kind. The watch trace prints the numbers, which show what
 // the time of a guest goes to.
 var stopStats struct {
 	count    [stopKinds]atomic.Uint64
 	handleNs [stopKinds]atomic.Uint64
-	waitNs   atomic.Uint64
+	waitNs   [stopKinds]atomic.Uint64
 }
 
 func kindOf(ev debugEvent) stopKind {
@@ -118,12 +118,11 @@ func kindOf(ev debugEvent) stopKind {
 
 func statsLine() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "stops (count, ms to serve):")
+	fmt.Fprintf(&b, "stops (count, ms to serve, ms from resume to stop):")
 	for k := stopKind(0); k < stopKinds; k++ {
-		fmt.Fprintf(&b, " %s %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6)
+		fmt.Fprintf(&b, " %s %d %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6, stopStats.waitNs[k].Load()/1e6)
 	}
-	fmt.Fprintf(&b, " guest and wake-up %d ms", stopStats.waitNs.Load()/1e6)
-	return b.String()
+	return strings.TrimSuffix(b.String(), ",")
 }
 
 func tracef(format string, args ...any) {
