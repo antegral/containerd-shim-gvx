@@ -18,27 +18,26 @@ package systrap
 
 import "z.gfire.dev/gvx/pkg/sentry/platform"
 
-// Platform is the darwin/amd64 systrap backend. The amd64 stub does not exist
-// yet, so a Platform value never carries state.
+// Platform is the darwin/amd64 systrap backend. The project dropped the
+// engine, so a Platform value never carries state.
 type Platform struct {
 	platform.Platform
 }
 
 // New always fails on darwin/amd64.
 //
-// The engine here ships an arm64 stub only. An amd64 stub, which Rosetta 2
-// would run, needs its own spill code, an XSAVE context layout, a Mach
-// thread-state binding and the amd64 patcher. None of these exist in this tree.
-//
-// A probe on this host showed that a Rosetta task has 4KB VM pages and that the
-// resource-exception hand-off that the arm64 stub uses fails in a translated
-// child (its mach_msg send returns an error). The bootstrap-port hand-off
-// delivered a task port that the probe could not use. The amd64 hand-off and the
-// behavior of a Linux `syscall` instruction under Rosetta are therefore unproven.
+// WHY: the only way to run linux/amd64 guests through systrap on macOS is a
+// translated stub task under Rosetta 2. A probe showed that the approach works
+// in principle: a translated task has 4KB pages, and a Linux `syscall` raises
+// SIGSYS. The fail-closed Seatbelt profile that the arm64 stub applies then
+// panicked the host kernel, in the sandbox extension at syscallmask.c:259, when
+// a translated process applied a syscall-number filter. Without that filter a
+// guest could issue host system calls, so the project dropped the engine
+// instead of shipping weaker isolation.
 func New() (*Platform, error) {
 	return nil, &ErrUnavailable{
 		Host:   "darwin/amd64",
-		Reason: "no amd64 stub, patcher or Mach thread-state binding exists: the engine ships the arm64 stub only, and the Rosetta hand-off and syscall behavior are unproven",
+		Reason: "the project dropped the Rosetta 2 engine: a syscall-number Seatbelt filter on a translated process panicked the host kernel",
 	}
 }
 

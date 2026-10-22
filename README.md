@@ -136,7 +136,7 @@ Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path s
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
-`systrap` is implemented for macOS `arm64` only, and it needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). A Linux `ET_EXEC` image at `0x400000` does not load. On Windows and macOS `amd64`, `New()` returns `*ErrUnavailable`, and `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
+`systrap` is implemented for macOS `arm64` only, and it needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). A Linux `ET_EXEC` image at `0x400000` does not load. On Windows, `New()` returns `*ErrUnavailable`. On macOS `amd64`, the project dropped the Rosetta 2 engine: a syscall-number Seatbelt filter on a translated process panicked the host kernel, and a stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
 
 ### 3.2 Dual-Track Netstack and Port Forwarding (`pkg/netbackend`)
 
@@ -222,7 +222,7 @@ This table maps each implementation milestone to its deliverables and verificati
 | **M2** | **WHPX & HVF Engines & Static ELF Execution** | Boot static `busybox` (`PID 1`) via `platform/whpx` (Windows) and `platform/hvf` (macOS) on `amd64` and `arm64` and reach an interactive `busybox ash` prompt. |
 | **M3** | **Dynamic Linking, Dual-Track Netstack & OCI Runner** | Implement `clone`, `futex`, signals, TLS (`ARCH_SET_FS` & `TPIDR_EL0`), VDSO, `pkg/netbackend` (`-net=nat -p` & `-net=wg`), and `pkg/oci`. Boot `alpine:3.20` and `nginx:alpine`. |
 | **M4** | **`hostfs` VFS2 Driver & Self-Lockdown** | Pass POSIX rename and unlink tests (`git rebase`, `bun install`) on `/workspace` and verify `pkg/hostlockdown` blocks child process spawning on Windows and macOS. |
-| **M5** | **Unified `systrap` Fallback Engine (`winsystrap` & `darwinsystrap`)** | Implement lazy page-trap `arm64asm`/`x86asm` syscall patchers, trampoline islands, `sysmsg` stub subprocesses, and Rosetta 2 cross-arch support. Status: macOS `arm64` runs real guests and needs `pagesize_16k`. Windows and macOS `amd64` return `*ErrUnavailable`. |
+| **M5** | **Unified `systrap` Fallback Engine (`winsystrap` & `darwinsystrap`)** | Implement lazy page-trap `arm64asm`/`x86asm` syscall patchers, trampoline islands, `sysmsg` stub subprocesses, and Status: macOS `arm64` runs real guests and needs `pagesize_16k`. Windows returns `*ErrUnavailable`. The Rosetta 2 cross-arch engine on macOS is dropped. |
 
 ---
 
