@@ -495,10 +495,10 @@ Execute these steps in `lockdown_darwin.go` after opening the `Hypervisor.framew
 
 Execute these steps in `lockdown_linux.go` after opening the `systrap` platform, cached `.erofs` layer descriptors, network sockets, and the `/workspace` directory. The build must not use cgo. The Go runtime runs one system call on every thread only without cgo, and the upstream `systrap` platform hangs while it starts in a cgo build.
 
-1. Query the Landlock ABI version with `landlock_create_ruleset`. Return `ErrUnsupported` when the kernel lacks Landlock.
+1. Query the Landlock ABI version with `landlock_create_ruleset`. Return `ErrUnsupported` when the kernel lacks Landlock or the sync flag.
 2. Create a ruleset that handles every file access right of the ABI. Handle TCP bind and connect from ABI 4 on, unless the options allow outbound traffic.
 3. Add one rule that allows read, or read and write, access below the workspace directory.
-4. Call `prctl(PR_SET_NO_NEW_PRIVS)` and `landlock_restrict_self` on every thread with `syscall.AllThreadsSyscall`.
+4. Call `prctl(PR_SET_NO_NEW_PRIVS)` on every thread with `syscall.AllThreadsSyscall`. Call `landlock_restrict_self` once with `LANDLOCK_RESTRICT_SELF_TSYNC`, so that every thread joins one domain. A thread may trace only a process in its own domain or a child domain, and `systrap` traces its stubs from many threads.
 5. Probe that `fork` and `exec` of an existing program fails, that an open outside the workspace fails with `EACCES`, and that a TCP connect fails when the options block it.
 
 Landlock does not restrict UDP, and it does not stop `fork`. The Linux lockdown blocks the start of a new program and every new file access outside the workspace.

@@ -33,10 +33,11 @@ import (
 // Seatbelt profile. The domain also inherits to every thread that a locked
 // thread creates.
 //
-// Landlock restricts one thread. The Go runtime runs goroutines on many
-// threads, so Apply restricts all of them with syscall.AllThreadsSyscall. The
-// Go runtime supports that call only in a build without cgo, so a cgo build
-// returns ErrUnsupported.
+// Landlock restricts one thread, unless the sync flag asks for all threads of
+// the process. The Go runtime runs goroutines on many threads, so Apply uses
+// the flag and sets no_new_privs on every thread with
+// syscall.AllThreadsSyscall. The Go runtime supports that call only in a build
+// without cgo, so a cgo build returns ErrUnsupported.
 
 // Landlock access rights of ABI version 1 to 3.
 const (
@@ -156,8 +157,15 @@ func applyOSLockdown(opts Options) (Status, error) {
 	if err := allThreads(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0); err != nil {
 		return Status{}, fmt.Errorf("hostlockdown: prctl(PR_SET_NO_NEW_PRIVS): %w", err)
 	}
-	if err := allThreads(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(rulesetFD), 0, 0); err != nil {
-		return Status{}, fmt.Errorf("hostlockdown: landlock_restrict_self: %w", err)
+	// One call with the sync flag puts every thread into one domain. A call
+	// per thread would put each thread into its own domain, and a thread may
+	// trace only a process in its own domain or in a child domain. The upstream
+	// systrap platform traces its stub processes from many threads.
+	if _, _, errno := syscall.Syscall(unix.SYS_LANDLOCK_RESTRICT_SELF, uintptr(rulesetFD), unix.LANDLOCK_RESTRICT_SELF_TSYNC, 0); errno != 0 {
+		if errno == unix.EINVAL {
+			return Status{}, fmt.Errorf("%w: the kernel lacks LANDLOCK_RESTRICT_SELF_TSYNC, which one shared domain needs", ErrUnsupported)
+		}
+		return Status{}, fmt.Errorf("hostlockdown: landlock_restrict_self: %w", errno)
 	}
 
 	st := Status{}
