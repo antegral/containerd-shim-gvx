@@ -76,3 +76,24 @@ func TestInstructionCrossesBlockBoundary(t *testing.T) {
 	si, _, err := r.run()
 	mustSyscall(t, si, err, 93, r.ac)
 }
+
+func TestNearZeroBase(t *testing.T) {
+	for _, tc := range []struct {
+		addr uint64
+		want bool
+	}{
+		{0, true},
+		{0x28, true},
+		{fsBaseReach - 1, true},
+		{fsBaseReach, false},
+		{0x7e4a080dfb28, false},
+		{winBase, false},
+		{^uint64(0) - fsBaseReach, false},
+		{^uint64(0) - fsBaseReach + 1, true},
+		{^uint64(0) - 7, true},
+	} {
+		if got := nearZeroBase(tc.addr); got != tc.want {
+			t.Errorf("nearZeroBase(%#x) = %v, want %v", tc.addr, got, tc.want)
+		}
+	}
+}

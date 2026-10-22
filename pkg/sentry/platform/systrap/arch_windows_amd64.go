@@ -227,6 +227,11 @@ func (th *thread) illegalSignal(*addressSpace, uint64) (linuxSig, int32) { retur
 func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent) bool {
 	fs := ac.StateData().Regs.Fs_base
 	pc := th.ctx.pc()
+	if fs != 0 && ev.Info[0] != avExecute && !nearZeroBase(ev.Info[1]) {
+		// A thread with a valid base faults at the real address, not near
+		// zero. The fault is a page of the guest that the Sentry has to map.
+		return false
+	}
 	if fs == 0 || ev.Info[0] == avExecute {
 		if traceEvents && ev.Info[0] != avExecute && ev.Info[1] < 0x10000 {
 			tracef("pid %d thread %d: no FS repair, the guest FS base is zero, fault at %#x, pc %#x", th.sp.pid, th.tid, ev.Info[1], pc)
@@ -260,6 +265,17 @@ func (th *thread) archFault(as *addressSpace, ac *arch.Context64, ev debugEvent)
 	th.fsFix.pc, th.fsFix.sum = pc, sum
 	th.sp.fsRepairs.Add(1)
 	return true
+}
+
+// fsBaseReach is the distance from zero, in both directions, that an access
+// through a lost FS base can reach. Guest memory starts at 16 TiB, so an access
+// through a valid base never lands this close to zero.
+const fsBaseReach = 1 << 24
+
+// nearZeroBase reports whether an access at addr is at an offset from a zero
+// base: a small positive offset, or a small negative one that wraps.
+func nearZeroBase(addr uint64) bool {
+	return addr < fsBaseReach || addr > ^uint64(0)-fsBaseReach
 }
 
 // registerSum returns a hash of the flags and the general-purpose registers in
