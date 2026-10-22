@@ -126,7 +126,11 @@ static const char sandbox_child[] =
     "(deny syscall-mach (with send-signal SIGKILL))\n"
     "(allow syscall-mach (machtrap-number MSC_mach_msg_trap MSC_mach_msg2_trap "
     "MSC__kernelrpc_mach_port_deallocate_trap))\n"
-    "(deny syscall-mig (with send-signal SIGKILL))\n";
+    "(deny syscall-mig (with send-signal SIGKILL))\n"
+    // macOS 15 counts the delivery of a guest fault to the BSD signal handler
+    // as the MIG routine mach_exception_raise. Without this rule the kernel
+    // kills the stub at the first guest fault.
+    "(allow syscall-mig (kernel-mig-routine mach_exception_raise))\n";
 
 static struct gv_ctl *ctl;
 

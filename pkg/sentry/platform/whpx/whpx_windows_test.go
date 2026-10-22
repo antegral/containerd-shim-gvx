@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
+	"z.gfire.dev/gvx/pkg/cpuid"
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
@@ -31,6 +32,12 @@ import (
 // no hypervisor. Other hosts never run them.
 
 const guestCodeAddr = 0x400000
+
+func init() {
+	// arch.New builds the floating-point state of the host. On amd64 that
+	// reads the CPUID feature set, which must exist before the first test.
+	cpuid.Initialize()
+}
 
 func newRealPlatform(t *testing.T) *Platform {
 	t.Helper()

@@ -26,20 +26,56 @@ import (
 	"testing"
 )
 
-// TestEmbeddedStubMatchesSources rebuilds the stub from its sources and
-// compares the bytes with the embedded image. The build is deterministic, so a
-// difference means that the sources and the committed image drifted apart.
+// buildInfo is the record that build.sh writes next to the committed stub. It
+// holds a hash of the sources and the compiler version of that build.
+type buildInfo struct{ sources, clang string }
+
+func readBuildInfo(t *testing.T, path string) buildInfo {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var info buildInfo
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		key, value, _ := strings.Cut(line, " ")
+		switch key {
+		case "sources":
+			info.sources = value
+		case "clang":
+			info.clang = value
+		}
+	}
+	if info.sources == "" || info.clang == "" {
+		t.Fatalf("%s lacks a sources or a clang line: %q", path, data)
+	}
+	return info
+}
+
+// TestEmbeddedStubMatchesSources keeps the committed stub and its sources in
+// step. It always compares the hash of the sources with the record of the last
+// build. It also rebuilds the stub and compares the bytes, but only with the
+// compiler of the last build, because another clang version emits other bytes.
 func TestEmbeddedStubMatchesSources(t *testing.T) {
-	for _, tool := range []string{"clang", "codesign"} {
+	for _, tool := range []string{"clang", "codesign", "shasum"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s is not installed", tool)
 		}
 	}
+	committed := readBuildInfo(t, filepath.Join("stub", "BUILD_INFO"))
 	out := t.TempDir()
 	cmd := exec.Command("sh", "build.sh", out)
 	cmd.Dir = "stub"
 	if msg, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build.sh failed: %v\n%s", err, msg)
+	}
+	fresh := readBuildInfo(t, filepath.Join(out, "BUILD_INFO"))
+	if fresh.sources != committed.sources {
+		t.Fatalf("the stub sources changed after the last build: run go generate in this package")
+	}
+	if fresh.clang != committed.clang {
+		t.Logf("the compiler is %q and the committed stub used %q, so the test skips the byte comparison", fresh.clang, committed.clang)
+		return
 	}
 	built, err := os.ReadFile(filepath.Join(out, "gvx-stub-darwin-arm64"))
 	if err != nil {
