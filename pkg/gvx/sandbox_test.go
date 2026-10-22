@@ -107,10 +107,15 @@ func TestConfigNormalizeRejectsInvalid(t *testing.T) {
 		})
 	}
 
-	// The foreign architecture is valid for systrap, which runs it through
-	// Rosetta 2 or Prism.
+	// Only the host architecture runs on Linux, where the systrap platform is
+	// the upstream one. The other hosts accept a foreign architecture for systrap.
 	cfg := Config{Platform: PlatformSystrap, Architecture: otherArch()}
-	if err := cfg.normalize(); err != nil {
+	err := cfg.normalize()
+	if runtime.GOOS == "linux" {
+		if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), "only the host architecture") {
+			t.Fatalf("normalize(systrap, %s) on Linux = %v, want ErrInvalidConfig that names the host architecture", otherArch(), err)
+		}
+	} else if err != nil {
 		t.Fatalf("normalize(systrap, %s) failed: %v", otherArch(), err)
 	}
 }

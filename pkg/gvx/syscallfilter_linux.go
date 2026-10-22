@@ -97,6 +97,9 @@ func embedderRules(cfg Config) seccomp.SyscallRules {
 			},
 		},
 	})
+	// The Go runtime reads the CPU affinity mask once a second to adjust
+	// GOMAXPROCS. The call reads one mask and has no side effect.
+	rules.Add(unix.SYS_SCHED_GETAFFINITY, seccomp.MatchAll{})
 	if cfg.WorkspacePath != "" {
 		// os.Root.Rename calls renameat. The host filesystem rules of runsc
 		// have only renameat2.

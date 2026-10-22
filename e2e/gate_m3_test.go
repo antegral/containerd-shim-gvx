@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -331,8 +332,11 @@ func TestE2EGateM3ArchitectureSelection(t *testing.T) {
 	for _, plat := range []string{string(autoPlatform()), "auto"} {
 		_, stderr, code := runTool(t, rungv, "run", "-lockdown=false", "-platform="+plat, "-net=none",
 			"-arch="+foreign, "-cache-dir="+cacheDir, "-image=alpine:3.20", "--", "/bin/true")
-		wantErr := "guest architecture " + foreign + " needs -platform=systrap"
-		if code != 2 || !strings.Contains(stderr, wantErr) || !strings.Contains(stderr, "run only the host architecture") {
+		wantErr, wantTail := "guest architecture "+foreign+" needs -platform=systrap", "run only the host architecture"
+		if runtime.GOOS == "linux" {
+			wantErr, wantTail = "guest architecture "+foreign+" cannot run on a", "only the host architecture"
+		}
+		if code != 2 || !strings.Contains(stderr, wantErr) || !strings.Contains(stderr, wantTail) {
 			t.Errorf("rungv run -platform=%s -arch=%s = (code %d, stderr %q), want usage error %q", plat, foreign, code, stderr, wantErr)
 		}
 	}

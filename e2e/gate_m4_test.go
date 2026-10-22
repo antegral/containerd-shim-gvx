@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -722,8 +723,11 @@ func TestE2EGateM4LockdownDefaultBlocksSubprocess(t *testing.T) {
 			if !rep.Lockdown.Applied || !rep.LockedAPI {
 				t.Errorf("default run: Lockdown.Applied=%v IsLockedDown=%v, want both true", rep.Lockdown.Applied, rep.LockedAPI)
 			}
-			if !rep.Lockdown.SubprocessBlocked || !rep.Lockdown.UnboundFileOpenBlocked {
-				t.Errorf("default run: lockdown status %+v, want subprocess and file-open blocks", rep.Lockdown)
+			// The Linux seccomp filter cannot read paths, so a workspace keeps
+			// opens relative to a directory descriptor, and the status says so.
+			wantUnbound := runtime.GOOS != "linux"
+			if !rep.Lockdown.SubprocessBlocked || rep.Lockdown.UnboundFileOpenBlocked != wantUnbound {
+				t.Errorf("default run: lockdown status %+v, want a subprocess block and UnboundFileOpenBlocked=%v", rep.Lockdown, wantUnbound)
 			}
 			if rep.SpawnErr == "" {
 				t.Errorf("default run: host subprocess creation succeeded")

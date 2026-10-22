@@ -220,8 +220,13 @@ func (c *Config) normalize() error {
 	if _, err := elfMachine(c.Architecture); err != nil {
 		return err
 	}
-	if c.Architecture != runtime.GOARCH && c.Platform != PlatformSystrap {
-		return fmt.Errorf("%w: guest architecture %s needs -platform=systrap on a %s host: the hardware backends run only the host architecture", ErrInvalidConfig, c.Architecture, runtime.GOARCH)
+	if c.Architecture != runtime.GOARCH {
+		if runtime.GOOS == "linux" {
+			return fmt.Errorf("%w: guest architecture %s cannot run on a %s Linux host: the upstream systrap platform runs only the host architecture", ErrInvalidConfig, c.Architecture, runtime.GOARCH)
+		}
+		if c.Platform != PlatformSystrap {
+			return fmt.Errorf("%w: guest architecture %s needs -platform=systrap on a %s host: the hardware backends run only the host architecture", ErrInvalidConfig, c.Architecture, runtime.GOARCH)
+		}
 	}
 
 	if c.NetworkMode == "" {
