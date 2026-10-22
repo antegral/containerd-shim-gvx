@@ -327,7 +327,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39809735687`, `39811366093` | both | Stub design: initialized stub, start trap, park and resume, `x18` and `TPIDR_EL0` across stops, Low-integrity token, job, Win32k, second stub on one debug object. |
 | `39845577561`, `39846215053` | `arm64` | Node 22 gates: SIGILL at `dc civac`, then both gates pass with the `nop` replacement. |
 | `39853085199`, `39854000516` | `amd64` | Shell pipeline hang on an AMD EPYC 9V74 runner: 12 of 12 runs. The state dump shows a `call` at the end of a page. |
-| `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Eighteen runs on two other models (EPYC 7763 and 9V45) also pass. |
+| `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Seventeen runs on two other models (EPYC 7763 and 9V45) also pass. |
 
 The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
 
