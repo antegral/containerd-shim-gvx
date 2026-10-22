@@ -266,7 +266,6 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 		return nil, fmt.Errorf("AssignProcessToJobObject: %w", err)
 	}
 	h.jobs[pi.ProcessId] = job
-	h.setPriorities(pi.Process)
 
 	// The host attaches the stub to the debug object of the Sentry. The Sentry
 	// then needs no right to debug a process, which a lockdown can remove.
@@ -290,23 +289,6 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 		return nil, fmt.Errorf("DuplicateHandle(thread): %w", err)
 	}
 	return &stubHandles{pid: pi.ProcessId, tid: pi.ThreadId, proc: proc, thread: thread, level: level}, nil
-}
-
-// setPriorities gives the stub the I/O and page priority of a normal process.
-// A token of Low integrity makes the stub a background process, and the page
-// faults of its views then wait behind the I/O of every normal process.
-func (h *stubHostLoop) setPriorities(proc windows.Handle) {
-	io, ioErr := ntProcessUint32(proc, processIoPriority)
-	page, pageErr := ntProcessUint32(proc, processPagePriority)
-	if traceEvents {
-		tracef("stub host: I/O priority %d (%v), page priority %d (%v)", io, ioErr, page, pageErr)
-	}
-	if err := ntSetProcessUint32(proc, processIoPriority, ioPriorityNormal); err != nil && traceEvents {
-		tracef("stub host: set the I/O priority: %v", err)
-	}
-	if err := ntSetProcessUint32(proc, processPagePriority, pagePriorityNormal); err != nil && traceEvents {
-		tracef("stub host: set the page priority: %v", err)
-	}
 }
 
 // createProcess starts the suspended stub with the strongest mitigation set

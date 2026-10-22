@@ -42,8 +42,6 @@ var (
 	procNtResumeThread       = modNtdll.NewProc("NtResumeThread")
 	procNtTerminateThread    = modNtdll.NewProc("NtTerminateThread")
 	procNtTerminateProcess   = modNtdll.NewProc("NtTerminateProcess")
-	procNtQueryInfoProcess   = modNtdll.NewProc("NtQueryInformationProcess")
-	procNtSetInfoProcess     = modNtdll.NewProc("NtSetInformationProcess")
 
 	procGetThreadContext      = modKernel32.NewProc("GetThreadContext")
 	procSetThreadContext      = modKernel32.NewProc("SetThreadContext")
@@ -319,27 +317,4 @@ func flushInstructionCache(proc windows.Handle, addr, size uintptr) error {
 		return fmt.Errorf("FlushInstructionCache(%#x+%#x): %w", addr, size, e)
 	}
 	return nil
-}
-
-// Process information classes that set the priority of the I/O and of the pages
-// of a process.
-const (
-	processIoPriority   = 33
-	processPagePriority = 39
-
-	ioPriorityNormal   = 2
-	pagePriorityNormal = 5
-)
-
-// ntProcessUint32 reads a 32-bit process information class.
-func ntProcessUint32(proc windows.Handle, class uintptr) (uint32, error) {
-	var v uint32
-	st, _, _ := procNtQueryInfoProcess.Call(uintptr(proc), class, uintptr(unsafe.Pointer(&v)), 4, 0)
-	return v, ntCheck("NtQueryInformationProcess", st)
-}
-
-// ntSetProcessUint32 writes a 32-bit process information class.
-func ntSetProcessUint32(proc windows.Handle, class uintptr, v uint32) error {
-	st, _, _ := procNtSetInfoProcess.Call(uintptr(proc), class, uintptr(unsafe.Pointer(&v)), 4)
-	return ntCheck("NtSetInformationProcess", st)
 }
