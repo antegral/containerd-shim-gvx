@@ -97,6 +97,14 @@ func newRig(t testing.TB, p *Platform) *rig {
 	if err != nil {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
+	t.Cleanup(mf.Destroy)
+	return newRigOn(t, p, mf)
+}
+
+// newRigOn returns a rig with a new address space and context that use the
+// memory file mf. The caller destroys mf.
+func newRigOn(t testing.TB, p *Platform, mf *pgalloc.MemoryFile) *rig {
+	t.Helper()
 	asI, err := p.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		t.Fatalf("NewAddressSpace: %v", err)
@@ -108,7 +116,6 @@ func newRig(t testing.TB, p *Platform) *rig {
 	t.Cleanup(func() {
 		r.ctx.Release()
 		as.Release()
-		mf.Destroy()
 	})
 	return r
 }
@@ -540,12 +547,17 @@ func TestManySystemCalls(t *testing.T) {
 
 func TestAddressSpacesAreIndependent(t *testing.T) {
 	p := newPlatform(t)
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	t.Cleanup(mf.Destroy)
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			r := newRig(t, p)
+			r := newRigOn(t, p, mf)
 			r.program(gSyscall(uint64(200+i), uint64(i)))
 			si, _, err := r.run()
 			if si != nil || err != nil || regNr(r.ac) != uint64(200+i) {
@@ -634,13 +646,20 @@ func TestForkStorm(t *testing.T) {
 	// space first and the context second, the way the Sentry does when a
 	// process exits while a thread still holds its context.
 	p := newPlatform(t)
+	// One memory file serves every task. A memory file takes a gigabyte of
+	// address space and disk space, and the hosted runners have little disk.
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	t.Cleanup(mf.Destroy)
 	var wg sync.WaitGroup
 	for i := 0; i < 24; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			for round := 0; round < 4; round++ {
-				r := newRig(t, p)
+				r := newRigOn(t, p, mf)
 				r.program(gSyscall(uint64(400 + i)))
 				si, _, err := r.run()
 				if si != nil || err != nil || regNr(r.ac) != uint64(400+i) {
