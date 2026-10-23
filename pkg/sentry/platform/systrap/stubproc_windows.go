@@ -40,6 +40,16 @@ const (
 	internalSize = uint64(0x10000)
 	internalBase = winLimit - internalSize
 
+	// lowBase and lowLimit bound the low guest window. A non-PIE executable
+	// runs at the address that it links to. Go links an arm64 program at
+	// 0x10000, and most linkers use 0x400000. lowBase is the lowest address of a
+	// Windows process. lowLimit is the address of KUSER_SHARED_DATA, which every
+	// process maps. The range was free in every suspended stub that the probes
+	// created on windows-latest and windows-11-arm. A placeholder over the range
+	// kept the loader out of it. The Sentry reserves it before the loader runs.
+	lowBase  = uint64(0x10000)
+	lowLimit = uint64(0x7FFE0000)
+
 	// codeSize is the size of the executable part of the engine pages. The
 	// data pages follow it.
 	codeSize = 0x4000
@@ -134,6 +144,11 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	t1 := time.Now()
 	if err := virtualAllocPlaceholder(sp.proc, uintptr(winBase), uintptr(winLimit-winBase)); err != nil {
 		return fail(fmt.Errorf("%w: %v", errWindowTaken, err))
+	}
+	if p.lowWindow {
+		if err := virtualAllocPlaceholder(sp.proc, uintptr(lowBase), uintptr(lowLimit-lowBase)); err != nil {
+			return fail(fmt.Errorf("%w: low window: %v", errWindowTaken, err))
+		}
 	}
 	bringUpStats.windowNs.Add(uint64(time.Since(t1)))
 	t2 := time.Now()

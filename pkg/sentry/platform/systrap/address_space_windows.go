@@ -79,7 +79,7 @@ type addressSpace struct {
 
 	mu       sync.Mutex
 	released bool
-	win      *windowMap
+	win      *guestWindows
 	blocks   map[uint64]*execBlock
 
 	// internal holds the engine pages at the top of the window.
@@ -177,10 +177,14 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create a stub process: %w", err)
 	}
+	wins := []*windowMap{newWindowMap(stubView{sp.proc}, winBase, winLimit)}
+	if p.lowWindow {
+		wins = append(wins, newWindowMap(stubView{sp.proc}, lowBase, lowLimit))
+	}
 	as := &addressSpace{
 		p:      p,
 		sp:     sp,
-		win:    newWindowMap(stubView{sp.proc}, winBase, winLimit),
+		win:    newGuestWindows(wins...),
 		blocks: make(map[uint64]*execBlock),
 	}
 	pagesStart := time.Now()

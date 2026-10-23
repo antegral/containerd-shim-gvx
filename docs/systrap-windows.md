@@ -44,6 +44,7 @@ The engine needs 4KB mappings of a shared memory file in the address space of an
 | Same call at the base of a view | the whole view becomes a placeholder | same |
 | A view that starts as `PAGE_READWRITE`, then changes to execute | fails with `ERROR_INVALID_PARAMETER` | fails |
 | Reserve 110 TiB (`0x100000000000` to `0x7ee000000000`) as one placeholder before the loader runs | succeeds in every stub of the probe and of the engine tests | same |
+| Reserve `0x10000` to `0x7ffe0000` as one placeholder before the loader runs | free in 60 of 60 suspended processes; the loader never used it; 64KB views mapped at `0x10000`, `0x400000`, and `0x7ffc0000` | same |
 | Remote 4KB split, map, protect, unmap | 4.0, 2.6, 2.0, 2.9 µs | 1.7, 1.4, 1.8, 7.2 µs |
 
 The window map in section 6.2 follows these rules. A mapping of arbitrary size becomes one view. A partial unmap unmaps the whole view and maps the surviving parts again.
@@ -204,7 +205,7 @@ The `init` function of the package runs the host loop when the environment varia
 
 The host creates each stub with `CreateProcessAsUser`. It uses a copy of its own token without privileges at Low integrity, and it adds the Win32k and handle mitigations when Windows accepts them. It puts the stub in a job that allows one process, kills on close, and blocks all window operations. It attaches the stub to the debug object of the Sentry, because the lockdown can remove the right to debug a process from the Sentry. It duplicates the process and thread handles into the Sentry, and it keeps the job handle until the Sentry releases the stub.
 
-A stub reaches the ready state in four steps. The Sentry reserves the guest window as one placeholder while the stub is suspended. It resumes the initial thread, and the loader runs. The loader raises the initial breakpoint of a debuggee. The Sentry suspends the initial thread there, replies, and never resumes it. The stub is then fully initialized and idle.
+A stub reaches the ready state in four steps. The Sentry reserves each guest window as one placeholder while the stub is suspended. It resumes the initial thread, and the loader runs. The loader raises the initial breakpoint of a debuggee. The Sentry suspends the initial thread there, replies, and never resumes it. The stub is then fully initialized and idle.
 
 The platform keeps two ready stubs in a pool. One goroutine fills the pool while the guests run, and a fork or an exec takes a stub from it. A bring-up takes 20 ms on `arm64` and 10 ms on `amd64`, and the loader needs most of that time. The pool hides that time when the guest does other work between two forks. When the pool is empty, the call starts a stub itself. `Close` terminates the stubs that no guest took.
 
@@ -213,6 +214,14 @@ The platform keeps two ready stubs in a pool. One goroutine fills the pool while
 The guest window of a stub is `[0x100000000000, 0x7edfffff0000)`. It starts at 16 TiB, above the heaps and stacks that Windows places in the first few TiB, and it ends below the system DLLs. The top 64KB hold the engine pages: 16KB of code and 48KB of data. `MinUserAddress` and `MaxUserAddress` exclude them.
 
 `windowMap` turns each `MapFile`, `Unmap`, and protection request into the five operations that Windows allows on placeholders. It keeps one extent for each placeholder or view. A mapping of any size becomes one view. A partial change unmaps the whole view and maps the surviving parts again. A randomized test checks the map against a reference model with a fake host that enforces the Windows rules. The code runs on macOS too, so the logic has a fast test on the development host.
+
+The low window is `[0x10000, 0x7ffe0000)`. It holds a non-PIE `ET_EXEC` image at the address that it links to. Go links an `arm64` program at `0x10000`, and most other linkers use `0x400000`. `0x10000` is the lowest user address of Windows, and `0x7ffe0000` is the page of `KUSER_SHARED_DATA`. The range between the two windows belongs to the stub. The platform reports it through `platform.AddressHolePlatform`, and the memory manager never maps there.
+
+`windowMap` stays the same. `guestWindows` routes each call to the window that owns the address. An unmap that crosses the hole clears both windows.
+
+`New` decides once whether the platform uses the low window. It brings up one stub with both windows. If that fails, the platform keeps only the high window, and `MinUserAddress` stays at 16 TiB. The decision cannot change later, because the memory manager reads the guest range when a process starts.
+
+The repair of a lost FS base treats a small positive offset from zero as a candidate. With the low window, that offset stops at `0x10000`, the lowest guest address. An access above it is a real guest access, for example to the TLS block of a static executable at `0x400000`.
 
 The memory file is a temporary file. `sectionCache` creates a section of that file for the file handle that `memmap.File.FD` returns, and it creates a new section when the file grows. A host file that the Sentry opened read-only, such as an erofs layer, maps through a read-only section. A file without a host handle, such as a workspace file of `hostfs`, maps through a copy of its bytes in an anonymous section. Such a mapping cannot be writable.
 
@@ -317,7 +326,7 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | Item | State |
 | :--- | :--- |
 | Fast path | Not implemented. A patched `svc` or `syscall` could branch to a trampoline that signals the Sentry with an event pair, and skip the debugger. The measured event round trip is 12 to 27 µs, against 70 to 190 µs for a stop. |
-| Guest addresses below 16 TiB | A non-PIE `ET_EXEC` image that links at `0x400000` does not load. Position-independent images load. The macOS engine has the same limit. |
+| Guest addresses outside the two windows | No guest mapping can use an address below `0x10000` or between `0x7ffe0000` and 16 TiB. The memory manager treats the second range as a hole. |
 | Writing to the executing page | A guest that writes to the page that it executes gets SIGSEGV. |
 | GS base | A guest cannot set it. `UserModifiedGS` reports an error on `amd64`. |
 | Workspace files | A file without a host handle maps through a copy. A writable shared mapping of such a file fails with `ENODEV`. |
@@ -344,6 +353,8 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39845577561`, `39846215053` | `arm64` | Node 22 gates: SIGILL at `dc civac`, then both gates pass with the `nop` replacement. |
 | `39853085199`, `39854000516` | `amd64` | Shell pipeline hang on an AMD EPYC 9V74 runner: 12 of 12 runs. The state dump shows a `call` at the end of a page. |
 | `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Seventeen runs on two other models (EPYC 7763 and 9V45) also pass. |
+| `39898594534`, `39898597202` | `amd64`, `arm64` | The low window: 60 suspended processes on each runner. The range was free, one placeholder covered it, the loader stayed out of it, and 64KB views mapped in it. |
+| `39899579241` | `arm64` | The `arm64` build of herdr links at `0x400000`. Before the low window it failed with `out of memory`. |
 
 The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
 

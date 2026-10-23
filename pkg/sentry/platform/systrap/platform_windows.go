@@ -58,6 +58,11 @@ type Platform struct {
 	// userMin and userMax bound the guest address range.
 	userMin, userMax uint64
 
+	// lowWindow tells whether every stub also reserves the low guest window.
+	// New decides it once, because the guest range of the platform must not
+	// change while guests run.
+	lowWindow bool
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -88,8 +93,45 @@ func New() (*Platform, error) {
 		userMin:   winBase,
 		userMax:   internalBase,
 	}
+	first := p.selectLowWindow()
 	p.startPool()
+	if first != nil {
+		select {
+		case p.pool.ready <- first:
+		default:
+			first.destroy()
+		}
+	}
 	return p, nil
+}
+
+// selectLowWindow decides whether the stubs of the platform reserve the low
+// guest window. It brings up one stub with both windows. If that works, the
+// platform keeps the low window, and the stub goes to the pool. If it fails,
+// the host places something in the low range. The platform then keeps only the
+// high window, and the first guest reports the cause of a failure that is not
+// about the window.
+func (p *Platform) selectLowWindow() *stubProc {
+	p.lowWindow, p.userMin = true, lowBase
+	sp, err := p.newStubProcFresh()
+	if err == nil {
+		return sp
+	}
+	if traceEvents {
+		tracef("systrap: no low guest window: %v", err)
+	}
+	p.lowWindow, p.userMin = false, winBase
+	return nil
+}
+
+// UserAddressHole implements platform.AddressHolePlatform.UserAddressHole. The
+// range between the low window and the high window belongs to the stub
+// process.
+func (p *Platform) UserAddressHole() hostarch.AddrRange {
+	if !p.lowWindow {
+		return hostarch.AddrRange{}
+	}
+	return hostarch.AddrRange{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(winBase)}
 }
 
 // Close terminates every stub process and frees the Sentry-side memory. It is

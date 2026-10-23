@@ -272,3 +272,56 @@ func TestWindowMapBreaksAfterHostFailure(t *testing.T) {
 		t.Fatal("a broken window accepted another call")
 	}
 }
+
+const (
+	lowTestBase  = uint64(0x400000)
+	lowTestLimit = lowTestBase + 16*0x1000
+)
+
+// TestGuestWindowsServeTwoWindows checks a stub with a low window and a high
+// window. Each mapping goes to the window that owns its address. The memory
+// manager unmaps ranges that cross the gap, and the router clears both windows.
+func TestGuestWindowsServeTwoWindows(t *testing.T) {
+	lowHost := newFakeHost(lowTestBase, lowTestLimit)
+	highHost := newFakeHost(testBase, testLimit)
+	g := newGuestWindows(newWindowMap(lowHost, lowTestBase, lowTestLimit), newWindowMap(highHost, testBase, testLimit))
+
+	if err := g.Map(lowTestBase, 0x2000, "low", 0, viewReadWrite); err != nil {
+		t.Fatalf("map in the low window: %v", err)
+	}
+	if err := g.Map(testBase+0x1000, 0x1000, "high", 0, viewRead); err != nil {
+		t.Fatalf("map in the high window: %v", err)
+	}
+	if _, ok := lowHost.pageState(lowTestBase + 0x1000); !ok {
+		t.Error("the low host has no view at the second page of the low mapping")
+	}
+	if _, ok := highHost.pageState(lowTestBase); ok {
+		t.Error("the high host has a view at a low address")
+	}
+	if v, start, ok := g.Lookup(lowTestBase + 0x1000); !ok || v.backing != "low" || start != lowTestBase {
+		t.Errorf("Lookup in the low window = (%v, %#x, %v), want the low view that starts at %#x", v.backing, start, ok, lowTestBase)
+	}
+	if v, _, ok := g.Lookup(testBase + 0x1000); !ok || v.backing != "high" {
+		t.Errorf("Lookup in the high window = (%v, %v), want the high view", v.backing, ok)
+	}
+	if _, _, ok := g.Lookup(lowTestLimit + 0x1000); ok {
+		t.Error("Lookup in the gap between the windows found a view")
+	}
+
+	if err := g.Map(lowTestLimit, 0x1000, "gap", 0, viewRead); err == nil {
+		t.Error("a mapping in the gap between the windows succeeded")
+	}
+	if err := g.Map(lowTestLimit-0x1000, 0x2000, "span", 0, viewRead); err == nil {
+		t.Error("a mapping that runs past the end of the low window succeeded")
+	}
+
+	if err := g.Unmap(lowTestBase, testLimit-lowTestBase); err != nil {
+		t.Fatalf("unmap across the gap: %v", err)
+	}
+	if _, ok := lowHost.pageState(lowTestBase); ok {
+		t.Error("the low view survived an unmap that covers it")
+	}
+	if _, ok := highHost.pageState(testBase + 0x1000); ok {
+		t.Error("the high view survived an unmap that covers it")
+	}
+}

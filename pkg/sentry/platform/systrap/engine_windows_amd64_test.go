@@ -77,23 +77,31 @@ func TestInstructionCrossesBlockBoundary(t *testing.T) {
 	mustSyscall(t, si, err, 93, r.ac)
 }
 
+// TestNearZeroBase checks which faults look like an access through a lost FS
+// base. A positive offset from a zero base lies below the lowest guest
+// address. A real guest address never counts, so a static executable at
+// 0x400000 can use its own TLS block when the low window exists.
 func TestNearZeroBase(t *testing.T) {
 	for _, tc := range []struct {
-		addr uint64
-		want bool
+		name     string
+		guestMin uint64
+		addr     uint64
+		want     bool
 	}{
-		{0, true},
-		{0x28, true},
-		{fsBaseReach - 1, true},
-		{fsBaseReach, false},
-		{0x7e4a080dfb28, false},
-		{winBase, false},
-		{^uint64(0) - fsBaseReach, false},
-		{^uint64(0) - fsBaseReach + 1, true},
-		{^uint64(0) - 7, true},
+		{"high window only, zero base", winBase, 0, true},
+		{"high window only, small offset", winBase, 0x28, true},
+		{"high window only, offset of a large TLS block", winBase, 0x100000, true},
+		{"high window only, a guest address", winBase, winBase, false},
+		{"low window, small offset", lowBase, 0x28, true},
+		{"low window, last address below the guest range", lowBase, lowBase - 1, true},
+		{"low window, lowest guest address", lowBase, lowBase, false},
+		{"low window, address in a static executable", lowBase, 0x400000, false},
+		{"low window, small negative offset", lowBase, ^uint64(0) - 7, true},
+		{"high window only, small negative offset", winBase, ^uint64(0) - 0xfff, true},
+		{"low window, a high guest address", lowBase, 0x7e4a080dfb28, false},
 	} {
-		if got := nearZeroBase(tc.addr); got != tc.want {
-			t.Errorf("nearZeroBase(%#x) = %v, want %v", tc.addr, got, tc.want)
+		if got := nearZeroBase(tc.addr, tc.guestMin); got != tc.want {
+			t.Errorf("%s: nearZeroBase(%#x, %#x) = %v, want %v", tc.name, tc.addr, tc.guestMin, got, tc.want)
 		}
 	}
 }
