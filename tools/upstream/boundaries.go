@@ -191,6 +191,8 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/oci"}, "github.com/klauspost/compress/*", "zstd-compressed OCI layers"},
 	{[]string{"pkg/oci"}, "github.com/cespare/xxhash/*", "content-addressed layer cache keys"},
 	{[]string{"pkg/oci"}, "golang.org/x/sys/*", "the Windows layer cache opens files with full sharing and renames with POSIX semantics"},
+	// cmd/rungv: the login command reads a password without echo.
+	{[]string{"cmd/rungv"}, "golang.org/x/term", "rungv login and rungv save detect a terminal, and login reads a password from it without echo"},
 }
 
 // boundaryTestExceptions apply to _test.go files only.
@@ -208,6 +210,7 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/hostlockdown"}, "pkg/seccomp", "tests install a small seccomp program through Options.InstallSyscallFilter"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/hostlockdown", "a test proves that the stub keeps working after hostlockdown.Apply"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "a test pins that the vDSO image that the Sentry maps never names x18"},
+	{[]string{"cmd/rungv"}, "github.com/creack/pty", "tests give rungv save and rungv login a pseudo terminal as standard input and output"},
 }
 
 func exceptionApplies(ex importException, pkg, imp string) bool {
