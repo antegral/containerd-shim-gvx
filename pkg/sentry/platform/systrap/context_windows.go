@@ -479,14 +479,17 @@ func (c *Context) PullFullState(_ platform.AddressSpace, ac *arch.Context64) err
 	th.mu.Lock()
 	defer th.mu.Unlock()
 	if f := th.fast.Load(); f != nil && f.inSpill {
-		// The thread runs in the spill routine, so its registers are live.
-		if err := th.getLiveFP(); err != nil {
+		// The thread waits in the spill routine. The arch code reads the vector
+		// state where the routine keeps it.
+		if err := th.archFastGetFP(f, ac); err != nil {
 			return err
 		}
-	} else if err := th.getContext(th.ctx.fpFlags()); err != nil {
-		return err
+	} else {
+		if err := th.getContext(th.ctx.fpFlags()); err != nil {
+			return err
+		}
+		th.ctx.storeFP(ac)
 	}
-	th.ctx.storeFP(ac)
 	c.fpInThread = false
 	return nil
 }

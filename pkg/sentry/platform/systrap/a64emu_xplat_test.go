@@ -43,6 +43,9 @@ type a64Machine struct {
 	mem map[uint64]byte
 
 	tpidr uint64
+	// v holds V0 to V31 as two words each. fpsr and fpcr are the FP registers.
+	vec        [32][2]uint64
+	fpsr, fpcr uint64
 
 	// Hooks. A nil hook does nothing.
 	onYield func(m *a64Machine)
@@ -313,6 +316,10 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		switch args[1] {
 		case "S3_3_C13_C0_2":
 			return false, m.setReg(args[0], m.tpidr)
+		case "S3_3_C4_C4_1", "FPSR":
+			return false, m.setReg(args[0], m.fpsr)
+		case "S3_3_C4_C4_0", "FPCR":
+			return false, m.setReg(args[0], m.fpcr)
 		case "S3_3_C4_C2_0":
 			return false, m.setReg(args[0], m.nzcvWord())
 		}
@@ -321,12 +328,21 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		if err := need(2); err != nil {
 			return false, err
 		}
-		if args[0] != "S3_3_C4_C2_0" {
-			return false, fmt.Errorf("system register %q", args[0])
+		switch args[0] {
+		case "S3_3_C4_C2_0":
+			v, err := m.getReg(args[1])
+			m.setNZCV(v)
+			return false, err
+		case "S3_3_C4_C4_1", "FPSR":
+			v, err := m.getReg(args[1])
+			m.fpsr = v
+			return false, err
+		case "S3_3_C4_C4_0", "FPCR":
+			v, err := m.getReg(args[1])
+			m.fpcr = v
+			return false, err
 		}
-		v, err := m.getReg(args[1])
-		m.setNZCV(v)
-		return false, err
+		return false, fmt.Errorf("system register %q", args[0])
 	case "LDR", "LDAR":
 		if err := need(2); err != nil {
 			return false, err
@@ -377,6 +393,23 @@ func (m *a64Machine) step(inst arm64asm.Inst) (done bool, err error) {
 		addr, err := m.memAddr(args[2])
 		if err != nil {
 			return false, err
+		}
+		if strings.HasPrefix(args[0], "Q") {
+			for i := range 2 {
+				n, err := strconv.Atoi(args[i][1:])
+				if err != nil || n < 0 || n > 31 {
+					return false, fmt.Errorf("vector register %q", args[i])
+				}
+				for h := range 2 {
+					a := addr + uint64(16*i+8*h)
+					if op == "LDP" {
+						m.vec[n][h] = m.read(a, 8)
+					} else {
+						m.write(a, 8, m.vec[n][h])
+					}
+				}
+			}
+			return false, nil
 		}
 		for i := range 2 {
 			if op == "LDP" {

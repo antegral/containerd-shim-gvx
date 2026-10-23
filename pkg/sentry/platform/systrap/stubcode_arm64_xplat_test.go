@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	"golang.org/x/arch/arm64/arm64asm"
+
+	"z.gfire.dev/gvx/pkg/sentry/arch"
 )
 
 func TestA64EncodersDecodeAsIntended(t *testing.T) {
@@ -40,6 +42,12 @@ func TestA64EncodersDecodeAsIntended(t *testing.T) {
 		{a64stlrW(0, 19), "STLR W0, [X19]"},
 		{a64ldp(0, 1, a64SP, -512), "LDP X0, X1, [SP,#-512]"},
 		{a64stp(0, 1, 2, -512), "STP X0, X1, [X2,#-512]"},
+		{a64stpQ(0, 1, 16, winOffVec), "STP Q0, Q1, [X16,#512]"},
+		{a64ldpQ(30, 31, 16, winOffVec+16*30), "LDP Q30, Q31, [X16,#992]"},
+		{a64MRSFPSR | 0, "MRS X0, S3_3_C4_C4_1"},
+		{a64MRSFPCR | 0, "MRS X0, S3_3_C4_C4_0"},
+		{a64MSRFPSR | 0, "MSR S3_3_C4_C4_1, X0"},
+		{a64MSRFPCR | 0, "MSR S3_3_C4_C4_0, X0"},
 		{a64stp(14, 15, 16, winOffX+8*14), "STP X14, X15, [X16,#184]"},
 		{a64movReg(19, 16), "MOV X19, X16"},
 		{a64movFromSP(0), "MOV X0, SP"},
@@ -515,5 +523,141 @@ func TestWinTLSSlotLoadsTheVirtualThreadPointer(t *testing.T) {
 	}
 	if err := encodeWinTLSSlot(make([]byte, winTLSSlotSize), slot, site, 31); err == nil {
 		t.Error("a slot for xzr was accepted")
+	}
+}
+
+// guestVector returns the vector register value that the rig gives the guest.
+func guestVector(n, half int) uint64 { return uint64(0xA000+n)<<8 | uint64(half) }
+
+const (
+	rigGuestFpsr = 0x11
+	rigGuestFpcr = 0x22
+)
+
+// armVectors makes the guest vector registers and the clobber of every call.
+func (r *spillRig) armVectors() {
+	m := r.m
+	for n := range m.vec {
+		m.vec[n] = [2]uint64{guestVector(n, 0), guestVector(n, 1)}
+	}
+	m.fpsr, m.fpcr = rigGuestFpsr, rigGuestFpcr
+	prev := m.onCall
+	m.onCall = func(m *a64Machine, target uint64) {
+		prev(m, target)
+		// The volatile vector registers of the Windows ARM64 ABI.
+		for n := range m.vec {
+			if n < 8 || n >= 16 {
+				m.vec[n] = [2]uint64{0, 0}
+			}
+		}
+	}
+}
+
+func (r *spillRig) checkVectorsAre(t *testing.T, when string, want func(n, half int) uint64, fpsr, fpcr uint64) {
+	t.Helper()
+	for n := range r.m.vec {
+		for h := range 2 {
+			if got := r.m.vec[n][h]; got != want(n, h) {
+				t.Errorf("%s: v%d half %d = %#x, want %#x", when, n, h, got, want(n, h))
+			}
+		}
+	}
+	if r.m.fpsr != fpsr || r.m.fpcr != fpcr {
+		t.Errorf("%s: fpsr %#x fpcr %#x, want %#x %#x", when, r.m.fpsr, r.m.fpcr, fpsr, fpcr)
+	}
+}
+
+func TestSpillSavesVectorStateForTheSentry(t *testing.T) {
+	r := newSpillRig(t)
+	r.armVectors()
+	r.m.onYield = func(m *a64Machine) {
+		for n := range 32 {
+			for h := range 2 {
+				got := m.read(rigSysm+winOffVec+uint64(16*n+8*h), 8)
+				if got != guestVector(n, h) {
+					t.Errorf("saved v%d half %d = %#x, want %#x", n, h, got, guestVector(n, h))
+				}
+			}
+		}
+		if got := m.read(rigSysm+winOffFpsr, 8); got != rigGuestFpsr {
+			t.Errorf("saved fpsr = %#x", got)
+		}
+		if got := m.read(rigSysm+winOffFpcr, 8); got != rigGuestFpcr {
+			t.Errorf("saved fpcr = %#x", got)
+		}
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSpillKeepsVectorStateAcrossItsOwnSystemCalls(t *testing.T) {
+	// The routine calls NtSetEvent when the Sentry sleeps and
+	// NtWaitForSingleObject when the stub sleeps. Windows can clobber the
+	// volatile vector registers in both calls.
+	for _, resume := range []uint32{winStateRunHot, winStateRunCold} {
+		r := newSpillRig(t)
+		r.armVectors()
+		r.sentryWaiter(1)
+		r.onCallee = func(m *a64Machine, target uint64) {
+			if target == rigWaitFn {
+				r.setState(resume)
+			}
+		}
+		if err := r.m.run(100000); err != nil {
+			t.Fatal(err)
+		}
+		if len(r.callLog) != 2 {
+			t.Fatalf("calls = %v, want NtSetEvent and NtWaitForSingleObject", r.callLog)
+		}
+		r.checkVectorsAre(t, "after both calls", guestVector, rigGuestFpsr, rigGuestFpcr)
+	}
+}
+
+func TestSpillLoadsVectorStateThatTheSentryWrote(t *testing.T) {
+	changed := func(n, h int) uint64 { return 0xC0DE0000 + uint64(n)<<4 + uint64(h) }
+	for _, resume := range []uint32{winStateRunHot, winStateRunCold} {
+		r := newSpillRig(t)
+		r.armVectors()
+		r.m.onYield = func(m *a64Machine) {
+			for n := range 32 {
+				for h := range 2 {
+					m.write(rigSysm+winOffVec+uint64(16*n+8*h), 8, changed(n, h))
+				}
+			}
+			m.write(rigSysm+winOffFpsr, 8, 0x33)
+			m.write(rigSysm+winOffFpcr, 8, 0x44)
+			r.setState(resume)
+		}
+		if err := r.m.run(100000); err != nil {
+			t.Fatal(err)
+		}
+		r.checkVectorsAre(t, "resume", changed, 0x33, 0x44)
+	}
+}
+
+func TestWinSysmsgVectorBlockMatchesTheFloatingPointState(t *testing.T) {
+	src := newTrapContext()
+	state := *src.FloatingPointData()
+	for i := range state[fpStateOffV : fpStateOffV+32*16] {
+		state[fpStateOffV+i] = byte(i*7 + 1)
+	}
+	binary.LittleEndian.PutUint32(state[fpStateOffFpsr:], 0xAB)
+	binary.LittleEndian.PutUint32(state[fpStateOffFpcr:], 0xCD)
+
+	var sm winSysmsg
+	sm.loadVector(src)
+	if sm.Vec[0] != 1 || sm.Vec[16] != byte(16*7+1) || sm.Fpsr != 0xAB || sm.Fpcr != 0xCD {
+		t.Fatalf("loadVector put v0 byte %#x, v1 byte %#x, fpsr %#x, fpcr %#x", sm.Vec[0], sm.Vec[16], sm.Fpsr, sm.Fpcr)
+	}
+	dst := arch.New(arch.Host)
+	sm.storeVector(dst)
+	got := *dst.FloatingPointData()
+	if string(got[fpStateOffV:fpStateOffV+32*16]) != string(state[fpStateOffV:fpStateOffV+32*16]) {
+		t.Error("the vector registers differ after the round trip")
+	}
+	if binary.LittleEndian.Uint32(got[fpStateOffFpsr:]) != 0xAB || binary.LittleEndian.Uint32(got[fpStateOffFpcr:]) != 0xCD {
+		t.Error("fpsr or fpcr differ after the round trip")
 	}
 }

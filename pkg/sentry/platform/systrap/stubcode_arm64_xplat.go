@@ -45,6 +45,10 @@ const (
 	a64TPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
 	a64MRSNZCV = 0xd53b4200 // mrs xN, nzcv.
 	a64MSRNZCV = 0xd51b4200 // msr nzcv, xN.
+	a64MRSFPSR = 0xd53b4420 // mrs xN, fpsr.
+	a64MRSFPCR = 0xd53b4400 // mrs xN, fpcr.
+	a64MSRFPSR = 0xd51b4420 // msr fpsr, xN.
+	a64MSRFPCR = 0xd51b4400 // msr fpcr, xN.
 	a64DMBISH  = 0xd5033bbf
 	a64YIELD   = 0xd503203f
 	a64BRK     = 0xd4200000
@@ -69,6 +73,16 @@ func a64ldrW(rt, rn, off uint32) uint32 { return 0xb9400000 | (off/4)<<10 | rn<<
 func a64strW(rt, rn, off uint32) uint32 { return 0xb9000000 | (off/4)<<10 | rn<<5 | rt }
 func a64ldarW(rt, rn uint32) uint32     { return 0x88dffc00 | rn<<5 | rt }
 func a64stlrW(rt, rn uint32) uint32     { return 0x889ffc00 | rn<<5 | rt }
+
+// a64stpQ and a64ldpQ store and load two 128-bit vector registers. off is a
+// byte offset that is a multiple of 16 between -1024 and 1008.
+func a64stpQ(rt, rt2, rn uint32, off int32) uint32 {
+	return 0xad000000 | uint32(off/16)&0x7f<<15 | rt2<<10 | rn<<5 | rt
+}
+
+func a64ldpQ(rt, rt2, rn uint32, off int32) uint32 {
+	return 0xad400000 | uint32(off/16)&0x7f<<15 | rt2<<10 | rn<<5 | rt
+}
 
 // a64ldp and a64stp use the signed offset form. off is a byte offset that is a
 // multiple of 8 between -512 and 504.
@@ -169,6 +183,36 @@ func (c winSpillCode) coldExit() int {
 // BRKs of the engine use 0x5c0 to 0x5c4.
 const brkFastExit = 0x5c5
 
+// saveVector returns the instructions that store V0 to V31, FPSR, and FPCR in
+// the sysmsg that base names. They use x0 as scratch, which the caller saved.
+func saveVector(base uint32) []uint32 {
+	var w []uint32
+	for i := uint32(0); i < 32; i += 2 {
+		w = append(w, a64stpQ(i, i+1, base, int32(winOffVec+16*i)))
+	}
+	return append(w,
+		a64MRSFPSR|0,
+		a64strX(0, base, winOffFpsr),
+		a64MRSFPCR|0,
+		a64strX(0, base, winOffFpcr),
+	)
+}
+
+// restoreVector returns the instructions that load V0 to V31, FPSR, and FPCR
+// from the sysmsg that base names. They use x0 as scratch.
+func restoreVector(base uint32) []uint32 {
+	var w []uint32
+	for i := uint32(0); i < 32; i += 2 {
+		w = append(w, a64ldpQ(i, i+1, base, int32(winOffVec+16*i)))
+	}
+	return append(w,
+		a64ldrX(0, base, winOffFpsr),
+		a64MSRFPSR|0,
+		a64ldrX(0, base, winOffFpcr),
+		a64MSRFPCR|0,
+	)
+}
+
 // buildSpill generates the spill routine for the layout of this file.
 func buildSpill() (winSpillCode, error) {
 	var a a64Asm
@@ -190,6 +234,7 @@ func buildSpill() (winSpillCode, error) {
 	for i := uint32(18); i < 30; i += 2 {
 		a.emit(a64stp(i, i+1, 16, int32(winOffX+8*i)))
 	}
+	a.emit(saveVector(16)...)
 	a.emit(
 		a64strX(30, 16, winOffX+8*30),
 		a64movFromSP(0),
@@ -290,14 +335,15 @@ func buildSpill() (winSpillCode, error) {
 	return winSpillCode{code: code, coldBrk: coldBrk}, nil
 }
 
-// restoreCommon loads the flags and the registers that both resumes load the
-// same way: x2 to x15, x18, x20 to x29, and x30. It runs before the registers
-// that differ.
+// restoreCommon loads the vector state, the flags, and the registers that both
+// resumes load the same way: x2 to x15, x18, x20 to x29, and x30. It runs
+// before the registers that differ. It uses x0 as scratch.
 func restoreCommon(base uint32) []uint32 {
-	w := []uint32{
+	w := restoreVector(base)
+	w = append(w,
 		a64ldrX(0, base, winOffNZCV),
-		a64MSRNZCV | 0,
-	}
+		a64MSRNZCV|0,
+	)
 	for i := uint32(2); i < 16; i += 2 {
 		w = append(w, a64ldp(i, i+1, base, int32(winOffX+8*i)))
 	}

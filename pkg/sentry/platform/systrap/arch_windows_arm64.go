@@ -356,6 +356,22 @@ func archPC(ac *arch.Context64) uint64 { return ac.StateData().Regs.Pc }
 // address of the sysmsg, which names the page to the spill routine.
 func (th *thread) archAttachFast(*fastSlot) error { return nil }
 
+// archFastSetFP writes the vector state of ac into the sysmsg of a thread that
+// waits in the spill routine. The routine loads it on the next resume. A system
+// call of Windows can clobber the volatile vector registers, so the live
+// context of the thread cannot carry the state. Callers hold mu.
+func (th *thread) archFastSetFP(f *fastThread, ac *arch.Context64) error {
+	f.slot.sm.loadVector(ac)
+	return nil
+}
+
+// archFastGetFP reads the vector state that the spill routine saved in the
+// sysmsg into ac. Callers hold mu.
+func (th *thread) archFastGetFP(f *fastThread, ac *arch.Context64) error {
+	f.slot.sm.storeVector(ac)
+	return nil
+}
+
 func movzImm(rd, imm uint32) uint32 { return 0xd2800000 | imm<<5 | rd }
 func subsImm1(rd uint32) uint32     { return 0xf1000400 | rd<<5 | rd }
 

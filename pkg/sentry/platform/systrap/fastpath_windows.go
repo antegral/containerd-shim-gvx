@@ -427,7 +427,7 @@ func (th *thread) fastTrapLocked(as *addressSpace, f *fastThread, ac *arch.Conte
 // hold mu.
 func (th *thread) fastStart(f *fastThread, ac *arch.Context64, loadFP bool) error {
 	if loadFP {
-		if err := th.setLiveFP(ac); err != nil {
+		if err := th.archFastSetFP(f, ac); err != nil {
 			return err
 		}
 	}
@@ -475,28 +475,6 @@ func (th *thread) fastExit(ac *arch.Context64, ev debugEvent) outcome {
 func (th *thread) isFastExit(ev debugEvent) bool {
 	f := th.fast.Load()
 	return f != nil && ev.Addr == th.sp.p.coldExitVA()
-}
-
-// setLiveFP writes the vector state of ac into a thread that runs in the spill
-// routine. The call suspends the thread for the time of the write. Callers hold mu.
-func (th *thread) setLiveFP(ac *arch.Context64) error {
-	if err := ntSuspendThread(th.h); err != nil {
-		return th.ctxErr("NtSuspendThread", err)
-	}
-	defer func() { _ = ntResumeThread(th.h) }()
-	th.ctx.loadFrom(ac, true)
-	th.ctx.setFlags(th.ctx.fpFlags())
-	return th.setContext()
-}
-
-// getLiveFP reads the vector state of a thread that runs in the spill routine
-// into th.ctx. Callers hold mu.
-func (th *thread) getLiveFP() error {
-	if err := ntSuspendThread(th.h); err != nil {
-		return th.ctxErr("NtSuspendThread", err)
-	}
-	defer func() { _ = ntResumeThread(th.h) }()
-	return th.getContext(th.ctx.fpFlags())
 }
 
 // inFastCode reports whether pc lies in code that a trap runs: the spill

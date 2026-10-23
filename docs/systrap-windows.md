@@ -330,7 +330,7 @@ These stops keep the debug path: every fault, every execute fault that patches a
 
 `Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls, because the trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the patched instruction, because the slot has not run.
 
-The spill routine never touches a vector register. `PullFullState` and `FullStateChanged` suspend the thread for the time of one context call. The engine assumes that the two ntdll calls keep the vector registers of the guest.
+On `arm64`, the spill routine saves V0 to V31, FPSR, and FPCR in the `winSysmsg` before it makes any call, and loads them on every resume. The Sentry reads and writes the vector state of a trapped thread in that block. A first CI run on `windows-11-arm` showed that the calls of the routine lose the volatile vector registers, so the live thread context did not hold the guest state: `PullFullState` read zero, and a value from the Sentry reached the guest as zero. The ABI lets a call clobber V0 to V7 and V16 to V31, and the guest expects a system call to keep them. On `amd64`, the routine touches no vector register. `PullFullState` and `FullStateChanged` suspend the thread for the time of one context call. This relies on the Windows x64 kernel keeping the vector registers across the calls of the routine. Nobody has measured it.
 
 When the variable is set, `New` runs a guest with six system calls in a new stub. All six must take the fast path. A failed run, or a run that exceeds 30 seconds, makes `New` return `ErrUnavailable`. A host that fails this test therefore reports the failure and does not fall back without notice.
 
@@ -339,7 +339,7 @@ The design rests on facts that no Windows document states:
 - No code of the stub uses the three `NT_TIB` words.
 - `ntdll` loads at the same address in the Sentry and in the stub.
 - `TPIDR_EL0` keeps the value that the engine writes, across waits and stops, on `arm64`. Section 3.4 measured this for waits and stops, but not for the spill routine itself.
-- The ntdll stubs and the kernel keep the vector registers across a wait.
+- On `amd64`, the ntdll stubs and the kernel keep the vector registers across `NtSetEvent` and `NtWaitForSingleObject`. A first CI run showed that this does not hold on `arm64`, which section 6.8 describes. The `amd64` claim has no measurement of its own beyond the passing engine tests.
 
 | Piece | Verified by |
 | :--- | :--- |

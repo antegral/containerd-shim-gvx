@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"encoding/binary"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -35,6 +36,12 @@ type winRegs struct {
 type winSysmsg struct {
 	winSysmsgHeader
 	Regs winRegs
+	_    [winOffVec - winOffRegs - 33*8]byte
+	// Vec holds V0 to V31 of the trapped guest. Fpsr and Fpcr hold the
+	// floating-point status and control registers.
+	Vec  [32 * 16]byte
+	Fpsr uint64
+	Fpcr uint64
 }
 
 // Offsets of the registers in the winSysmsg.
@@ -42,6 +49,13 @@ const (
 	winOffX    = winOffRegs
 	winOffSP   = winOffRegs + 31*8
 	winOffNZCV = winOffSP + 8
+
+	// winOffVec is the offset of V0 to V31, 16 bytes each. A system call of
+	// Windows can clobber the volatile vector registers, so the spill routine
+	// saves all of them before it makes any call and loads them on return.
+	winOffVec  = 0x200
+	winOffFpsr = winOffVec + 32*16
+	winOffFpcr = winOffFpsr + 8
 
 	// winSlotSize is the size of one trampoline slot.
 	winSlotSize = trapSlotSize
@@ -56,6 +70,10 @@ const (
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs)-winOffRegs]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.SP)-31*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.NZCV)-32*8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Vec)-winOffVec]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Fpsr)-winOffFpsr]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Fpcr)-winOffFpcr]
+var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsg{})-(winOffFpcr+8)]
 
 // winTrap describes one trap of a thread, as the Sentry decoded it.
 type winTrap struct {
@@ -84,6 +102,30 @@ func (r *winRegs) storeTo(ac *arch.Context64, ret uint64) {
 	regs.Pc = ret
 	regs.Pstate = regs.Pstate&^pstateNZCV | r.NZCV&pstateNZCV
 	st.OrigR0 = r.X[0]
+}
+
+// storeVector copies V0 to V31, FPSR, and FPCR from the sysmsg into the
+// floating-point state of ac.
+func (m *winSysmsg) storeVector(ac *arch.Context64) {
+	state := *ac.FloatingPointData()
+	if len(state) < fpStateOffV+32*16 {
+		return
+	}
+	copy(state[fpStateOffV:fpStateOffV+32*16], m.Vec[:])
+	binary.LittleEndian.PutUint32(state[fpStateOffFpsr:], uint32(m.Fpsr))
+	binary.LittleEndian.PutUint32(state[fpStateOffFpcr:], uint32(m.Fpcr))
+}
+
+// loadVector copies the floating-point state of ac into the vector block of
+// the sysmsg. The spill routine loads the block on the next resume.
+func (m *winSysmsg) loadVector(ac *arch.Context64) {
+	state := *ac.FloatingPointData()
+	if len(state) < fpStateOffV+32*16 {
+		return
+	}
+	copy(m.Vec[:], state[fpStateOffV:fpStateOffV+32*16])
+	m.Fpsr = uint64(binary.LittleEndian.Uint32(state[fpStateOffFpsr:]))
+	m.Fpcr = uint64(binary.LittleEndian.Uint32(state[fpStateOffFpcr:]))
 }
 
 // resumeState returns the state that the Sentry publishes for ac after a trap.
