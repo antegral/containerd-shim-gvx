@@ -19,6 +19,8 @@ import (
 	"testing"
 
 	"golang.org/x/arch/x86/x86asm"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // x86Inst is one decoded instruction with its offset in the code page.
@@ -259,7 +261,7 @@ func TestX64ExceptionStubsAndCommonPath(t *testing.T) {
 			}
 		}
 		wantPushes := []int{v}
-		if !x64ErrorCodeVectors[v] {
+		if !hvcommon.VectorHasErrorCode(v) {
 			wantPushes = []int{0, v}
 		}
 		if len(pushes) != len(wantPushes) || pushes[len(pushes)-1] != v || (len(pushes) == 2 && pushes[0] != 0) {

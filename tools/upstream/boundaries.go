@@ -213,7 +213,7 @@ var boundaryExceptions = []importException{
 // boundaryTestExceptions apply to _test.go files only.
 var boundaryTestExceptions = []importException{
 	{[]string{"pkg/gvx", "cmd/rungv"}, "internal/*", "gvx-owned guest ELF and image fixtures for tests"},
-	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf"}, "golang.org/x/arch/*", "tests disassemble the generated guest stubs"},
+	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/hvcommon"}, "golang.org/x/arch/*", "tests disassemble the generated guest stubs"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/pgalloc", "tests back the chunks of mapped files with a memory file, as pkg/gvx does on Linux"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/memutil", "tests create the memfd of the memory file that backs chunks"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/usage", "pgalloc.AllocOpts takes a usage.MemoryKind"},

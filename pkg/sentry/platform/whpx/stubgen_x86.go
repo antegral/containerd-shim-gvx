@@ -17,6 +17,8 @@ package whpx
 import (
 	"encoding/binary"
 	"fmt"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // This file generates the ring-0 code that runs inside an amd64 partition.
@@ -36,11 +38,11 @@ import (
 // the user selectors equal the values that pkg/sentry/arch expects.
 const (
 	x64SelKernelCS32 = 0x08
-	x64SelKernelCS   = 0x10
-	x64SelKernelSS   = 0x18
-	x64SelUserCS32   = 0x23
-	x64SelUserSS     = 0x2B
-	x64SelUserCS     = 0x33
+	x64SelKernelCS   = hvcommon.SelKernelCS
+	x64SelKernelSS   = hvcommon.SelKernelSS
+	x64SelUserCS32   = hvcommon.SelUserCS32
+	x64SelUserSS     = hvcommon.SelUserSS
+	x64SelUserCS     = hvcommon.SelUserCS64
 
 	// x64StarUserBase is the SYSRET selector base. SYSRET adds 8 for SS and
 	// 16 for the 64-bit CS.
@@ -63,28 +65,24 @@ const (
 
 // Offsets inside the stub code page.
 const (
-	x64CodeOffEntry     = 0x000
-	x64CodeOffReload    = 0x200
-	x64CodeOffExcStubs  = 0x600
-	x64CodeOffCommon    = 0x800
-	x64ExcStubSize      = 16
-	x64SysOffGDT        = 0x000
-	x64SysOffIDT        = 0x100
-	x64DescAttrCode64   = 0x00AF9B000000FFFF
-	x64DescAttrCode32   = 0x00CF9B000000FFFF
-	x64DescAttrData     = 0x00CF93000000FFFF
-	x64DescAttrUCode32  = 0x00CFFB000000FFFF
-	x64DescAttrUData    = 0x00CFF3000000FFFF
-	x64DescAttrUCode64  = 0x00AFFB000000FFFF
-	x64IDTGateInterrupt = 0x8E
+	x64CodeOffEntry    = 0x000
+	x64CodeOffReload   = 0x200
+	x64CodeOffExcStubs = 0x600
+	x64CodeOffCommon   = 0x800
+	x64ExcStubSize     = 16
+	x64SysOffGDT       = 0x000
+	x64SysOffIDT       = 0x100
+	x64DescAttrCode64  = hvcommon.DescKernelCode64
+	x64DescAttrCode32  = 0x00CF9B000000FFFF
+	x64DescAttrData    = hvcommon.DescKernelData
+	x64DescAttrUCode32 = hvcommon.DescUserCode32
+	x64DescAttrUData   = hvcommon.DescUserData
+	x64DescAttrUCode64 = hvcommon.DescUserCode64
 )
 
 // x64Regs lists the general registers that CommPage.Regs spills, as hardware
 // register numbers. RSP has its own slot.
 var x64Regs = [...]int{0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-
-// x64ErrorCodeVectors lists the vectors for which the CPU pushes an error code.
-var x64ErrorCodeVectors = map[int]bool{8: true, 10: true, 11: true, 12: true, 13: true, 14: true, 17: true, 21: true, 29: true, 30: true}
 
 // x64Stubs is the generated amd64 guest code and tables.
 type x64Stubs struct {
@@ -182,7 +180,7 @@ func buildX64Stubs(kernelBase uint64) (*x64Stubs, error) {
 	// Exception stubs.
 	for v := range x64IDTVectors {
 		stub := newX86Asm()
-		if !x64ErrorCodeVectors[v] {
+		if !hvcommon.VectorHasErrorCode(v) {
 			stub.pushImm8(0)
 		}
 		stub.pushImm8(byte(v))
@@ -255,13 +253,8 @@ func buildX64Stubs(kernelBase uint64) (*x64Stubs, error) {
 	idt := s.Sys[x64SysOffIDT:]
 	for v := range x64IDTVectors {
 		target := layout.code() + uint64(x64CodeOffExcStubs+v*x64ExcStubSize)
-		g := idt[v*16:]
-		binary.LittleEndian.PutUint16(g[0:], uint16(target))
-		binary.LittleEndian.PutUint16(g[2:], x64SelKernelCS)
-		g[4] = 0
-		g[5] = x64IDTGateInterrupt
-		binary.LittleEndian.PutUint16(g[6:], uint16(target>>16))
-		binary.LittleEndian.PutUint32(g[8:], uint32(target>>32))
+		g := hvcommon.IDTGate(target, 0)
+		copy(idt[v*16:], g[:])
 	}
 	return s, nil
 }
@@ -269,8 +262,7 @@ func buildX64Stubs(kernelBase uint64) (*x64Stubs, error) {
 // x64InitTSS writes the task state segment of one virtual processor into its
 // CommPage. Only RSP0 and the I/O map base are meaningful.
 func x64InitTSS(page *CommPage, commVA uint64) {
-	binary.LittleEndian.PutUint64(page.TSS[4:], commVA+commStackTop)
-	binary.LittleEndian.PutUint16(page.TSS[102:], commTSSSize)
+	hvcommon.FillTSS(page.TSS[:], commVA+commStackTop)
 }
 
 // x86Cond is the low nibble of a Jcc opcode.
@@ -307,44 +299,32 @@ func (a *x86Asm) emit32(v uint32) {
 
 func (a *x86Asm) label(name string) { a.labels[name] = len(a.buf) }
 
-// gsMem emits the GS prefix, the ModRM and SIB bytes for an absolute address
-// and the displacement. reg is the ModRM reg field.
-func (a *x86Asm) gsMem(reg byte, disp int32) {
-	a.emit(0x04|(reg&7)<<3, 0x25)
-	a.emit32(uint32(disp))
-}
-
 // movGSFromReg emits MOV [gs:disp], r64.
 func (a *x86Asm) movGSFromReg(disp int32, reg int) {
-	a.emit(0x65, 0x48|byte(reg>>3)<<2, 0x89)
-	a.gsMem(byte(reg), disp)
+	a.buf = hvcommon.AppendMovToGS(a.buf, reg, uint32(disp))
 }
 
 // movRegFromGS emits MOV r64, [gs:disp].
 func (a *x86Asm) movRegFromGS(reg int, disp int32) {
-	a.emit(0x65, 0x48|byte(reg>>3)<<2, 0x8B)
-	a.gsMem(byte(reg), disp)
+	a.buf = hvcommon.AppendMovFromGS(a.buf, reg, uint32(disp))
 }
 
 // movGSImm32 emits MOV DWORD [gs:disp], imm32.
 func (a *x86Asm) movGSImm32(disp int32, imm uint32) {
 	a.emit(0x65, 0xC7)
-	a.gsMem(0, disp)
+	a.buf = hvcommon.AppendGSOperand(a.buf, 0, uint32(disp))
 	a.emit32(imm)
 }
 
 // testGSImm32 emits TEST DWORD [gs:disp], imm32.
 func (a *x86Asm) testGSImm32(disp int32, imm uint32) {
 	a.emit(0x65, 0xF7)
-	a.gsMem(0, disp)
+	a.buf = hvcommon.AppendGSOperand(a.buf, 0, uint32(disp))
 	a.emit32(imm)
 }
 
 // pushGS emits PUSH QWORD [gs:disp].
-func (a *x86Asm) pushGS(disp int32) {
-	a.emit(0x65, 0xFF)
-	a.gsMem(6, disp)
-}
+func (a *x86Asm) pushGS(disp int32) { a.buf = hvcommon.AppendPushGS(a.buf, uint32(disp)) }
 
 // testRSPByte emits TEST BYTE [rsp+disp8], imm8.
 func (a *x86Asm) testRSPByte(disp int8, imm byte) {
@@ -353,10 +333,10 @@ func (a *x86Asm) testRSPByte(disp int8, imm byte) {
 
 func (a *x86Asm) pushImm8(v byte) { a.emit(0x6A, v) }
 func (a *x86Asm) popRAX()         { a.emit(0x58) }
-func (a *x86Asm) hlt()            { a.emit(0xF4) }
-func (a *x86Asm) swapgs()         { a.emit(0x0F, 0x01, 0xF8) }
+func (a *x86Asm) hlt()            { a.buf = hvcommon.AppendHlt(a.buf) }
+func (a *x86Asm) swapgs()         { a.buf = hvcommon.AppendSwapgs(a.buf) }
 func (a *x86Asm) sysretq()        { a.emit(0x48, 0x0F, 0x07) }
-func (a *x86Asm) iretq()          { a.emit(0x48, 0xCF) }
+func (a *x86Asm) iretq()          { a.buf = hvcommon.AppendIretq(a.buf) }
 func (a *x86Asm) movCR3FromRAX()  { a.emit(0x0F, 0x22, 0xD8) }
 func (a *x86Asm) movRAXFromCR2()  { a.emit(0x0F, 0x20, 0xD0) }
 func (a *x86Asm) jmpRel32(rel int32) {
