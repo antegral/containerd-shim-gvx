@@ -1,6 +1,6 @@
 // Spill and reload code of the macOS systrap stub for arm64.
 // Island slots branch to gv_spill with the guest x16 and x17 saved at
-// [sp, #-16] and x17 holding the slot tail address.
+// [sp, #-512] and x17 holding the slot tail address.
 
 #include "gvx_stub.h"
 
@@ -16,7 +16,7 @@ _gv_spill:
     mrs   x16, TPIDRRO_EL0
     and   x16, x16, #0xfffffffffffffff8
     stp   x0, x1, [x16, #(SM_MC+MC_X0+0)]
-    ldp   x0, x1, [sp, #-16]
+    ldp   x0, x1, [sp, #-512]
     stp   x0, x1, [x16, #(SM_MC+MC_X0+16*8)]
     str   x17, [x16, #SM_TAIL]
     stp   x2, x3, [x16, #(SM_MC+MC_X0+2*8)]

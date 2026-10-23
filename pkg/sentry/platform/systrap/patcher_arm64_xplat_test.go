@@ -107,9 +107,9 @@ func TestTrapSlotLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := func(i int) uint32 { return binary.LittleEndian.Uint32(buf[4*i:]) }
-	// Disassembly: stp x16, x17, [sp, #-16]; adr x17, .+12; ldr x16, .+16; br x16;
-	// ldp x16, x17, [sp, #-16]; b ret; .quad spill.
-	if w(0) != 0xa93f47f0 || w(1) != 0x10000071 || w(2) != 0x58000090 || w(3) != 0xd61f0200 || w(4) != 0xa97f47f0 {
+	// Disassembly: stp x16, x17, [sp, #-512]; adr x17, .+12; ldr x16, .+16; br x16;
+	// ldp x16, x17, [sp, #-512]; b ret; .quad spill.
+	if w(0) != 0xa92047f0 || w(1) != 0x10000071 || w(2) != 0x58000090 || w(3) != 0xd61f0200 || w(4) != 0xa96047f0 {
 		t.Errorf("slot words = %#x %#x %#x %#x %#x", w(0), w(1), w(2), w(3), w(4))
 	}
 	if target, ok := decodeBranch(slotVA+20, w(5)); !ok || target != ret {

@@ -310,10 +310,10 @@ func TestLazyPatchOnce(t *testing.T) {
 		off := target - isl.base
 		slot := pageBytes(isl.page)[off:]
 		if got := binary.LittleEndian.Uint32(slot); got != arm64STPx16x17 {
-			t.Errorf("slot of site %d starts with %#x, want stp x16, x17, [sp, #-16]", idx, got)
+			t.Errorf("slot of site %d starts with %#x, want stp x16, x17, [sp, #-512]", idx, got)
 		}
 		if got := binary.LittleEndian.Uint32(slot[trapSlotTailOffset:]); got != arm64LDPx16x17 {
-			t.Errorf("slot tail of site %d is %#x, want ldp x16, x17, [sp, #-16]", idx, got)
+			t.Errorf("slot tail of site %d is %#x, want ldp x16, x17, [sp, #-512]", idx, got)
 		}
 		back, ok := decodeBranch(target+trapSlotTailOffset+4, binary.LittleEndian.Uint32(slot[trapSlotTailOffset+4:]))
 		if !ok || back != codeVA+uint64(idx)*4+4 {
@@ -643,6 +643,29 @@ func TestWritableExecutableBlock(t *testing.T) {
 	}
 }
 
+func TestSyscallKeepsTheWordsBelowTheStackPointer(t *testing.T) {
+	// Go assembly keeps live words just below the stack pointer across a
+	// system call. runtime.clone leaves the g, m and fn of its child there. The
+	// trap slot spills x16 and x17, and the spill must not touch those words.
+	p := newPlatform(t)
+	r := newRig(t, p)
+	r.program(
+		movz(9, 0x1234),
+		0xf81f03e9, // stur x9, [sp, #-16]
+		0xf81f83e9, // stur x9, [sp, #-8]
+		movz(8, 1), insnSVC0,
+		0xf85f03ea, // ldur x10, [sp, #-16]
+		0xf85f83eb, // ldur x11, [sp, #-8]
+		movz(8, 2), insnSVC0,
+	)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 1, r.ac)
+	si, _, err = r.run()
+	mustSyscall(t, si, err, 2, r.ac)
+	if x := &r.regs().Regs; x[10] != 0x1234 || x[11] != 0x1234 {
+		t.Errorf("the words below the stack pointer read back %#x and %#x, want 0x1234 and 0x1234", x[10], x[11])
+	}
+}
 func TestSelfWritingBlockFaults(t *testing.T) {
 	// A guest that stores to the block that it executes would make the engine
 	// swap the write permission and the execute permission forever. The
