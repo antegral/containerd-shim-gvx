@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"runtime"
 	"strconv"
@@ -73,30 +74,62 @@ type PortForward struct {
 	BindAddress string
 }
 
-// ParsePortForward parses a "hostPort:guestPort" or "hostPort:guestPort/proto"
-// specification string.
+// ParsePortForward parses a Docker publish specification: "guest",
+// "host:guest", "ip:host:guest", or "ip::guest", with an optional "/tcp" or
+// "/udp" suffix. A host port of zero, and a specification with only a guest
+// port, ask for a free host port. The default bind address is 127.0.0.1. An
+// IPv6 address is written in brackets. A port range is not supported.
 func ParsePortForward(spec string) (PortForward, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return PortForward{}, errors.New("gvx: empty port forward specification")
 	}
 	proto := "tcp"
-	if slash := strings.IndexByte(spec, '/'); slash != -1 {
+	if slash := strings.LastIndexByte(spec, '/'); slash != -1 {
 		proto = strings.ToLower(strings.TrimSpace(spec[slash+1:]))
 		spec = spec[:slash]
 		if proto != "tcp" && proto != "udp" {
 			return PortForward{}, fmt.Errorf("gvx: unsupported port forward protocol %q", proto)
 		}
 	}
-	parts := strings.Split(spec, ":")
-	if len(parts) != 2 {
-		return PortForward{}, fmt.Errorf("gvx: invalid port forward %q (expected hostPort:guestPort)", spec)
+
+	bind := "127.0.0.1"
+	rest := spec
+	if strings.HasPrefix(rest, "[") {
+		end := strings.IndexByte(rest, ']')
+		if end < 0 || end+1 >= len(rest) || rest[end+1] != ':' {
+			return PortForward{}, fmt.Errorf("gvx: invalid port forward %q: an IPv6 address needs brackets and a port", spec)
+		}
+		bind, rest = rest[1:end], rest[end+2:]
+		if ip, err := netip.ParseAddr(bind); err != nil || !ip.Is6() {
+			return PortForward{}, fmt.Errorf("gvx: invalid IPv6 address %q in %q", bind, spec)
+		}
 	}
-	hostPort, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 16)
-	if err != nil {
-		return PortForward{}, fmt.Errorf("gvx: invalid host port in %q: %w", spec, err)
+	parts := strings.Split(rest, ":")
+	if bind == "127.0.0.1" && len(parts) == 3 {
+		bind, parts = parts[0], parts[1:]
+		if ip, err := netip.ParseAddr(bind); err != nil || !ip.Is4() {
+			return PortForward{}, fmt.Errorf("gvx: invalid bind address %q in %q (want an IPv4 address, or an IPv6 address in brackets)", bind, spec)
+		}
 	}
-	guestPort, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 16)
+
+	var hostPart, guestPart string
+	switch len(parts) {
+	case 1:
+		guestPart = parts[0]
+	case 2:
+		hostPart, guestPart = parts[0], parts[1]
+	default:
+		return PortForward{}, fmt.Errorf("gvx: invalid port forward %q (expected guest, host:guest, or ip:host:guest)", spec)
+	}
+	var hostPort uint64
+	if hostPart = strings.TrimSpace(hostPart); hostPart != "" {
+		var err error
+		if hostPort, err = strconv.ParseUint(hostPart, 10, 16); err != nil {
+			return PortForward{}, fmt.Errorf("gvx: invalid host port in %q: %w", spec, err)
+		}
+	}
+	guestPort, err := strconv.ParseUint(strings.TrimSpace(guestPart), 10, 16)
 	if err != nil || guestPort == 0 {
 		return PortForward{}, fmt.Errorf("gvx: invalid guest port in %q", spec)
 	}
@@ -104,7 +137,7 @@ func ParsePortForward(spec string) (PortForward, error) {
 		HostPort:    uint16(hostPort),
 		GuestPort:   uint16(guestPort),
 		Protocol:    proto,
-		BindAddress: "127.0.0.1",
+		BindAddress: bind,
 	}, nil
 }
 

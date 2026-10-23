@@ -63,7 +63,7 @@ func TestParsePortForward(t *testing.T) {
 		}
 	}
 
-	for _, spec := range []string{"", "80", "1:2:3", "70000:80", "80:0", "80:80/sctp", "x:80"} {
+	for _, spec := range []string{"", "1:2:3", "70000:80", "80:0", "80:80/sctp", "x:80"} {
 		if _, err := ParsePortForward(spec); err == nil {
 			t.Fatalf("ParsePortForward(%q) succeeded, want error", spec)
 		}
