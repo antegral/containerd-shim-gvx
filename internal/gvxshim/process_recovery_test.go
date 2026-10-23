@@ -16,7 +16,7 @@ import (
 const processServeGateEnv = "GVX_SHIM_TEST_SERVE_GATE"
 
 // processServeGate delays only the test binary before production Main reads its startup pipes.
-// TestMain retains the connection until os.Exit, so EOF proves that the child actually exited.
+// TestMain retains the connection until os.Exit, so peer closure proves that the child actually exited.
 func processServeGate() (net.Conn, error) {
 	address := os.Getenv(processServeGateEnv)
 	if address == "" || len(os.Args) < 2 || os.Args[len(os.Args)-1] != "serve" {
@@ -144,7 +144,7 @@ func TestProcessLauncherDeathBeforeBoundReport(t *testing.T) {
 	if _, err := gate.Write([]byte{1}); err != nil {
 		t.Fatalf("release serving child into production Main: %v", err)
 	}
-	if n, err := gate.Read(signal[:]); n != 0 || !errors.Is(err, io.EOF) {
+	if n, err := gate.Read(signal[:]); n != 0 || !processGatePeerClosed(err) {
 		t.Fatalf("child retained its process-owned gate after launcher death: n=%d err=%v", n, err)
 	}
 	awaitProcessExit(t, lease, record)

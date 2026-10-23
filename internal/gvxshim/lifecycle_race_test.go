@@ -322,12 +322,8 @@ func TestDeleteObservesLeaseAfterStopEndpointCloses(t *testing.T) {
 	if _, err := task.NewTTRPCTaskClient(client).Shutdown(requestContext, &task.ShutdownRequest{ID: child.record.Identity.ID}); err != nil {
 		t.Fatal(err)
 	}
-	awaitLifecycleCondition(t, ctx, "stop listener did not close", func() (bool, error) {
-		connection, err := dialLocal(ctx, child.record.Stop.Address)
-		if err != nil {
-			return true, nil
-		}
-		return false, connection.Close()
+	awaitLifecycleCondition(t, ctx, "stop listener did not close admission", func() (bool, error) {
+		return processStopAdmissionClosed(ctx, child.record.Stop.Address, blocked)
 	})
 	if err := tryLock(lease); !errors.Is(err, errLockBusy) {
 		if err == nil {
