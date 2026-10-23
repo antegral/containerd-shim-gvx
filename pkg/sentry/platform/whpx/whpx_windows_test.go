@@ -19,6 +19,7 @@ package whpx
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -39,6 +40,12 @@ func init() {
 	cpuid.Initialize()
 }
 
+// realMem holds the host memory that the guest of each real platform maps.
+var (
+	realMemMu sync.Mutex
+	realMem   = map[*Platform][][]byte{}
+)
+
 func newRealPlatform(t *testing.T) *Platform {
 	t.Helper()
 	p, err := New()
@@ -52,6 +59,14 @@ func newRealPlatform(t *testing.T) *Platform {
 		if err := p.Close(); err != nil {
 			t.Errorf("Close: %v", err)
 		}
+		realMemMu.Lock()
+		defer realMemMu.Unlock()
+		for _, mem := range realMem[p] {
+			if err := p.be.freeHost(mem); err != nil {
+				t.Error(err)
+			}
+		}
+		delete(realMem, p)
 	})
 	return p
 }
@@ -64,12 +79,11 @@ func realGuest(t *testing.T, p *Platform, code []byte) (*Context, *fakeMM, *arch
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		as.Release()
-		if err := p.be.freeHost(mem); err != nil {
-			t.Error(err)
-		}
-	})
+	// The partition keeps the mapping of mem until Close, so newRealPlatform
+	// frees the memory after Close.
+	realMemMu.Lock()
+	realMem[p] = append(realMem[p], mem)
+	realMemMu.Unlock()
 	copy(mem, code)
 	if err := as.mapHost(guestCodeAddr, mem[:pageSize], hostarch.AccessType{Read: true, Execute: true}); err != nil {
 		t.Fatal(err)
@@ -83,7 +97,7 @@ func realGuest(t *testing.T, p *Platform, code []byte) (*Context, *fakeMM, *arch
 
 func TestRealPlatformLifecycle(t *testing.T) {
 	p := newRealPlatform(t)
-	if p.ConcurrencyCount() < 1 || p.MapUnit() != pageSize {
+	if p.ConcurrencyCount() < 1 || p.MapUnit() != 2<<20 {
 		t.Errorf("concurrency %d, map unit %d", p.ConcurrencyCount(), p.MapUnit())
 	}
 	if runtime.GOARCH == "arm64" && !p.arm64 {

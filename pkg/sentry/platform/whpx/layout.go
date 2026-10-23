@@ -35,6 +35,19 @@ const (
 	gpaWindowBase = 1 << 30
 	gpaWindowEnd  = 1 << 36
 
+	// gpaTableEnd ends the zone of the kernel region and of the page-table
+	// slabs. The zone is 4 GiB. The zone for guest memory follows it up to
+	// gpaWindowEnd. A multiple of arenaSize keeps every arena aligned.
+	gpaTableEnd = gpaWindowBase + 4<<30
+
+	// arenaShift and arenaSize set the host window of one arena. An arena
+	// owns a guest physical window of the same size and maps a host address
+	// to the same offset inside it. A host range inside one arena stays
+	// contiguous in guest physical memory.
+	arenaShift = 26
+	arenaSize  = 1 << arenaShift
+	arenaMask  = arenaSize - 1
+
 	// maxVPs caps the virtual processors of one partition.
 	maxVPs = 64
 )
