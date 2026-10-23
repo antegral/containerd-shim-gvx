@@ -28,7 +28,7 @@ Run `rungv help` to print this list.
 | `logout` | Remove the credentials of a registry. |
 | `stub` | Probe the `systrap` engine of this host. |
 
-Flags go before the arguments. Every flag has a single-dash form, such as `-e`, and a double-dash form, such as `--env`. A cluster of one-letter flags, such as `-it`, works for `-i`, `-t`, `-d`, and `-P`.
+Print the flags of a command with `rungv COMMAND --help`. The flag `-h` of `run` sets the hostname, as in Docker. Flags go before the arguments. Every flag has a single-dash form, such as `-e`, and a double-dash form, such as `--env`. A cluster of one-letter flags, such as `-it`, works for `-i`, `-t`, `-d`, and `-P`.
 
 ## 3. `rungv run`
 
