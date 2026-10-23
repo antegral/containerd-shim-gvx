@@ -523,3 +523,52 @@ func TestSandboxRefusesAnExecutableThatThePageSizeCannotMap(t *testing.T) {
 		t.Errorf("stdout = %q, want no output because the guest must not start", outBuf.String())
 	}
 }
+
+// TestSandboxRunsAGuestWhoseCodeAndDataShareAHostPage runs a guest with code
+// and data in one 16KB host page. A build with 4KB guest pages maps each 4KB
+// page with its own permissions, so every engine runs the guest. A build with
+// 16KB guest pages cannot give one page two permission sets. It must refuse
+// the guest before it starts, and the error must name both segments.
+func TestSandboxRunsAGuestWhoseCodeAndDataShareAHostPage(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("the guest is arm64 code")
+	}
+	cfg := hostTestConfig(t)
+	var outBuf bytes.Buffer
+	cfg.Stdout = &outBuf
+	if hostarch.PageSize > basePageSize {
+		systraptest.Require(t)
+		cfg.Platform = PlatformSystrap
+	}
+	base := staticBase()
+	if hostarch.PageSize > basePageSize {
+		base = systrapBase()
+	}
+	elf, err := testelf.BuildSharedPageGuestELF64(base)
+	if err != nil {
+		t.Fatalf("BuildSharedPageGuestELF64 failed: %v", err)
+	}
+	cfg.ELFBytes = elf
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() {
+		if err := sb.Close(); err != nil {
+			t.Errorf("Close() failed: %v", err)
+		}
+	}()
+	code, err := sb.Run(context.Background())
+	if hostarch.PageSize > basePageSize {
+		if !errors.Is(err, ErrUnsupportedELFLayout) || !strings.Contains(err.Error(), "program headers 0 and 1") {
+			t.Errorf("Run() error = %v, want ErrUnsupportedELFLayout that names program headers 0 and 1", err)
+		}
+		if outBuf.Len() != 0 {
+			t.Errorf("stdout = %q, want no output because the guest must not start", outBuf.String())
+		}
+		return
+	}
+	if err != nil || code != 0 || outBuf.String() != testelf.SharedPageOK {
+		t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), testelf.SharedPageOK)
+	}
+}
