@@ -19,11 +19,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"os"
 	"runtime"
 	"strings"
-
-	"golang.org/x/term"
 
 	"z.gfire.dev/gvx/pkg/gvx"
 	"z.gfire.dev/gvx/pkg/oci"
@@ -81,12 +78,6 @@ func imageFail(stderr io.Writer, command string, err error) int {
 func imageUsageError(stderr io.Writer, command, format string, args ...any) int {
 	_, _ = fmt.Fprintf(stderr, "rungv %s: %s\n", command, fmt.Sprintf(format, args...))
 	return 2
-}
-
-// isTerminal reports whether v is an open terminal.
-func isTerminal(v any) bool {
-	f, ok := v.(*os.File)
-	return ok && term.IsTerminal(int(f.Fd()))
 }
 
 // shortImageID returns the 12 hex digits that Docker shows for an image ID.

@@ -63,7 +63,7 @@ func loadSubcommand(_ context.Context, args []string, stdin io.Reader, stdout, s
 			}
 		}()
 		source = f
-	} else if stdin == nil || isTerminal(stdin) {
+	} else if stdin == nil || oci.IsTerminal(stdin) {
 		return imageUsageError(stderr, "load", "no archive on standard input: use -i FILE or pipe an archive")
 	}
 

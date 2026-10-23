@@ -50,7 +50,7 @@ func saveSubcommand(ctx context.Context, args []string, stdout, stderr io.Writer
 	if fs.NArg() == 0 {
 		return imageUsageError(stderr, "save", "missing IMAGE argument")
 	}
-	if output == "" && isTerminal(stdout) {
+	if output == "" && oci.IsTerminal(stdout) {
 		return imageUsageError(stderr, "save", "refusing to write an archive to a terminal: use -o FILE or redirect standard output")
 	}
 	cache, arch, err := cacheFlags.open()

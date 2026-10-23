@@ -15,15 +15,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
-
-	"golang.org/x/term"
 
 	"z.gfire.dev/gvx/pkg/oci"
 )
@@ -47,21 +42,6 @@ func init() {
 			return logoutSubcommand(ctx, args, streams.stdout, streams.stderr)
 		},
 	})
-}
-
-// readTerminalPassword reads a password from the terminal with the file
-// descriptor fd and does not echo it. Tests replace it, because a test cannot
-// type into a terminal.
-var readTerminalPassword = term.ReadPassword
-
-// readLine reads one line and removes the line ending. It returns an empty
-// string at the end of the input.
-func readLine(in *bufio.Reader) (string, error) {
-	line, err := in.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return "", err
-	}
-	return strings.TrimRight(line, "\r\n"), nil
 }
 
 func loginSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -93,40 +73,28 @@ func loginSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout
 	if stdin == nil {
 		stdin = strings.NewReader("")
 	}
-	in := bufio.NewReader(stdin)
-	interactive := isTerminal(stdin)
 	if username == "" {
-		if interactive {
+		if oci.IsTerminal(stdin) {
 			_, _ = fmt.Fprint(stderr, "Username: ")
 		}
-		line, err := readLine(in)
+		line, err := oci.ReadLine(stdin)
 		if err != nil {
 			return imageFail(stderr, "login", fmt.Errorf("read the user name: %w", err))
 		}
 		username = line
 	}
 	if password == "" {
-		switch {
-		case passwordStdin:
-			raw, err := io.ReadAll(in)
-			if err != nil {
-				return imageFail(stderr, "login", fmt.Errorf("read the password: %w", err))
+		var err error
+		if passwordStdin {
+			var raw []byte
+			if raw, err = io.ReadAll(stdin); err == nil {
+				password = strings.TrimRight(string(raw), "\r\n")
 			}
-			password = strings.TrimRight(string(raw), "\r\n")
-		case interactive:
-			_, _ = fmt.Fprint(stderr, "Password: ")
-			raw, err := readTerminalPassword(int(stdin.(*os.File).Fd()))
-			_, _ = fmt.Fprintln(stderr)
-			if err != nil {
-				return imageFail(stderr, "login", fmt.Errorf("read the password: %w", err))
-			}
-			password = string(raw)
-		default:
-			line, err := readLine(in)
-			if err != nil {
-				return imageFail(stderr, "login", fmt.Errorf("read the password: %w", err))
-			}
-			password = line
+		} else {
+			password, err = oci.ReadPassword(stdin, stderr)
+		}
+		if err != nil {
+			return imageFail(stderr, "login", fmt.Errorf("read the password: %w", err))
 		}
 	}
 	if username == "" || password == "" {
