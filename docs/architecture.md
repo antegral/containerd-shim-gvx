@@ -581,6 +581,8 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 
 A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests.
 
+The gate `TestE2EGateETExec` decides whether a backend runs an executable that links at a fixed address. It runs four programs: a static Go program, a static C program, `herdr api schema`, and the `herdr` server with one request. Each program must print the same output on every backend. The macOS `systrap` engine refuses these images today, so its rows skip. The skip ends when the engine runs them. The Go and `herdr` rows need `go` and a download of the `herdr` release file. The C row and the server row pull `alpine:3.20`.
+
 | Platform | Verified By |
 | :--- | :--- |
 | `darwin/arm64` `hvf` | The Apple Silicon development host. A hosted runner has no hypervisor. |
