@@ -92,12 +92,12 @@ var boundaryRules = []importRule{
 	},
 	{
 		pkg:       "pkg/sentry/platform/whpx",
-		allowed:   []string{"pkg/sentry/platform", "pkg/memutil", "pkg/abi/linux", xSysWindows},
+		allowed:   []string{"pkg/sentry/platform", "pkg/sentry/platform/hvcommon", "pkg/memutil", "pkg/abi/linux", xSysWindows},
 		forbidden: append([]string{"pkg/sentry/kernel/*", "pkg/sentry/vfs/*", "cmd/*"}, without(platformSiblings, "pkg/sentry/platform/whpx")...),
 	},
 	{
 		pkg:       "pkg/sentry/platform/hvf",
-		allowed:   []string{"pkg/sentry/platform", "pkg/memutil", "pkg/abi/linux", xSysUnix},
+		allowed:   []string{"pkg/sentry/platform", "pkg/sentry/platform/hvcommon", "pkg/memutil", "pkg/abi/linux", xSysUnix},
 		forbidden: append([]string{"pkg/sentry/kernel/*", "pkg/sentry/vfs/*", "cmd/*"}, without(platformSiblings, "pkg/sentry/platform/hvf")...),
 	},
 	{
@@ -109,6 +109,21 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/fsimpl/hostfs",
 		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
 		forbidden: []string{"pkg/sentry/platform/*", "cmd/*"},
+	},
+	{
+		// ext4lite is a read-write VFS2 filesystem in a single host file. It
+		// implements the same VFS interfaces as hostfs, so it gets the same
+		// import surface, and it must not reach a platform backend.
+		pkg:       "pkg/sentry/fsimpl/ext4lite",
+		allowed:   []string{"pkg/sentry/vfs", "pkg/abi/linux", "pkg/fd", "golang.org/x/sys/*"},
+		forbidden: []string{"pkg/sentry/platform/*", "cmd/*"},
+	},
+	{
+		// hvcommon holds the pure helpers that whpx and hvf share. It must not
+		// import a backend, the kernel, or the VFS.
+		pkg:       "pkg/sentry/platform/hvcommon",
+		allowed:   []string{"pkg/sentry/platform", "pkg/abi/linux"},
+		forbidden: append([]string{"pkg/sentry/kernel/*", "pkg/sentry/vfs/*", "cmd/*"}, platformSiblings...),
 	},
 	{
 		pkg:       "pkg/sync",
@@ -141,6 +156,7 @@ func without(list []string, drop string) []string {
 var sentryAPIUsers = []string{
 	"pkg/gvx",
 	"pkg/sentry/fsimpl/hostfs",
+	"pkg/sentry/fsimpl/ext4lite",
 	"pkg/sentry/platform/whpx",
 	"pkg/sentry/platform/hvf",
 	"pkg/sentry/platform/systrap",
@@ -164,11 +180,12 @@ var boundaryExceptions = []importException{
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/systrap"}, "pkg/sentry/arch", "platform.Context.Switch exchanges arch.Context64 values"},
 	{platformBackends, "pkg/sentry/platform/interrupt", "platform.Context.Switch callers wake a running vCPU through interrupt.Forwarder"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf"}, "pkg/ring0/pagetables", "hardware backends build guest stage-1 and stage-2 page tables with the shared pagetables package"},
-	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/kernel/auth", "vfs.FilesystemImpl methods take auth.Credentials"},
-	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/limits", "vfs write paths consult limits.FileSize"},
-	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/socket/unix/transport", "vfs.FilesystemImpl.BoundEndpointAt returns transport.BoundEndpoint"},
-	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/refs", "vfs.DentryImpl reference counting uses refs.RefCounter"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/kernel/auth", "vfs.FilesystemImpl methods take auth.Credentials"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/limits", "vfs write paths consult limits.FileSize"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/sentry/socket/unix/transport", "vfs.FilesystemImpl.BoundEndpointAt returns transport.BoundEndpoint"},
+	{[]string{"pkg/sentry/fsimpl/hostfs", "pkg/sentry/fsimpl/ext4lite"}, "pkg/refs", "vfs.DentryImpl reference counting uses refs.RefCounter"},
 	{[]string{"pkg/sentry/platform/systrap"}, "golang.org/x/sys/*", "host memory and subprocess APIs on Windows and macOS (SPEC section 3.3)"},
+	{[]string{"pkg/sentry/kernel"}, "pkg/hostarch", "addrhole_xplat.go lists the address holes of a platform as hostarch.AddrRange values"},
 
 	// pkg/gvx boots the Sentry. The kernel constructors take these types.
 	{[]string{"pkg/gvx"}, "pkg/abi/linux", "Linux ABI constants for guest syscall numbers and errno values"},
@@ -203,8 +220,8 @@ var boundaryTestExceptions = []importException{
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/sentry/uniqueid", "vfs.Init in tests needs a uniqueid.Provider on the context"},
 	{[]string{"pkg/sentry/fsimpl/hostfs"}, "pkg/errors", "tests compare errors.Error values from the VFS"},
 	{[]string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "pkg/sentry/platform/systrap"}, "pkg/cpuid", "arch.Context64 and the CPUID trap path need cpuid.Initialize before a test builds a context"},
-	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/pgalloc", "tests build the pgalloc.MemoryFile that backs guest pages"},
-	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/usage", "pgalloc.AllocOpts takes a usage.MemoryKind"},
+	{[]string{"pkg/sentry/platform/systrap", "pkg/sentry/platform/hvf"}, "pkg/sentry/pgalloc", "tests build the pgalloc.MemoryFile that backs guest pages"},
+	{[]string{"pkg/sentry/platform/systrap", "pkg/sentry/platform/hvf"}, "pkg/sentry/usage", "pgalloc.AllocOpts takes a usage.MemoryKind"},
 	{[]string{"pkg/hostlockdown"}, "pkg/seccomp", "tests install a small seccomp program through Options.InstallSyscallFilter"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/hostlockdown", "a test proves that the stub keeps working after hostlockdown.Apply"},
 	{[]string{"pkg/sentry/platform/systrap"}, "pkg/sentry/loader/vdsodata", "a test pins that the vDSO image that the Sentry maps never names x18"},

@@ -70,6 +70,16 @@ PROTECT pkg/sentry/platform/*_darwin*
 PROTECT pkg/sentry/platform/platforms/*_windows*
 PROTECT pkg/sentry/platform/platforms/*_darwin*
 PROTECT internal/**
+PROTECT pkg/erofs/*_xplat*
+PROTECT pkg/fd/*_xplat*
+PROTECT pkg/fdnotifier/*_xplat*
+PROTECT pkg/hostarch/*_darwin*
+PROTECT pkg/memutil/*_xplat*
+PROTECT pkg/sentry/kernel/*_xplat*
+PROTECT pkg/sentry/mm/*_xplat*
+PROTECT pkg/sentry/platform/*_xplat*
+PROTECT pkg/sync/*_xplat*
+PROTECT pkg/syserr/*_xplat*
 
 EXCLUDE .github/**
 EXCLUDE .buildkite/**

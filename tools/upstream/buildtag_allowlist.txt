@@ -34,15 +34,15 @@ seam pkg/sentry/fsimpl/erofs/filesystem.go
 
 # pkg/hostarch: the opt-in 16KB page size (build tag pagesize_16k, SPEC section 1 and 3.3).
 # Upstream already reserves a tag for 64KB pages. Each 4KB file gains one more negated tag so that
-# exactly one of the three page-size files applies. The new gvx file hostarch_arm64_16k.go holds the 16KB constants.
+# exactly one of the three page-size files applies. The new gvx file hostarch_darwin_arm64_16k.go holds the 16KB constants.
 expr pkg/hostarch/hostarch_arm64_4k.go arm64 && !pagesize_64k && !pagesize_16k
 expr pkg/hostarch/hostarch_arm64_4k_state_autogen.go arm64 && !pagesize_64k && !pagesize_16k
 
-# Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno.go).
+# Content seam: host errno translation on Windows and macOS (pkg/syserr/linux_errno_xplat.go).
 seam pkg/syserr/syserr.go
 
 # Content seam: the memory manager keeps mappings out of the address hole of a platform
-# (pkg/sentry/platform/addrhole.go and pkg/sentry/mm/addrhole.go). The Windows engine
+# (pkg/sentry/platform/addrhole_xplat.go and pkg/sentry/mm/addrhole_xplat.go). The Windows engine
 # has a low guest window and a high guest window, and the host owns the range between them.
 seam pkg/sentry/mm/vma.go
 

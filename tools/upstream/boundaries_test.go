@@ -194,6 +194,38 @@ func TestBoundaryForbiddenWinsOverException(t *testing.T) {
 	}
 }
 
+func TestBoundaryHvcommonIsSharedByBothHardwareBackends(t *testing.T) {
+	t.Parallel()
+
+	m := modulePrefix
+	for _, file := range []string{"pkg/sentry/platform/whpx/x.go", "pkg/sentry/platform/hvf/x.go"} {
+		if vs := boundaryCheck(t, file, importLines(m+"pkg/sentry/platform/hvcommon")); len(vs) != 0 {
+			t.Errorf("%s importing hvcommon flagged: %v", file, vs)
+		}
+	}
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/x_xplat.go", importLines(m+"pkg/sentry/platform/hvcommon")); len(vs) != 1 {
+		t.Errorf("systrap importing hvcommon: %d violations, want 1", len(vs))
+	}
+	// hvcommon holds pure helpers. It never imports a backend.
+	for _, backend := range []string{"whpx", "hvf", "systrap"} {
+		if vs := boundaryCheck(t, "pkg/sentry/platform/hvcommon/x.go", importLines(m+"pkg/sentry/platform/"+backend)); len(vs) != 1 {
+			t.Errorf("hvcommon importing %s: %d violations, want 1", backend, len(vs))
+		}
+	}
+}
+
+func TestBoundaryExt4liteNeverImportsAPlatformBackend(t *testing.T) {
+	t.Parallel()
+
+	m := modulePrefix
+	if vs := boundaryCheck(t, "pkg/sentry/fsimpl/ext4lite/x.go", importLines(m+"pkg/sentry/vfs", m+"pkg/abi/linux", m+"pkg/fd")); len(vs) != 0 {
+		t.Errorf("ext4lite VFS imports flagged: %v", vs)
+	}
+	if vs := boundaryCheck(t, "pkg/sentry/fsimpl/ext4lite/x.go", importLines(m+"pkg/sentry/platform/whpx")); len(vs) != 1 {
+		t.Errorf("ext4lite importing a platform backend: %d violations, want 1", len(vs))
+	}
+}
+
 func TestBoundaryAllowsOwnSubtreeAndStdlib(t *testing.T) {
 	t.Parallel()
 

@@ -37,6 +37,11 @@ func TestClassifyFilePartitionsThreeIsolationTiers(t *testing.T) {
 		{name: "tier3 sentry kernel", path: "pkg/sentry/kernel/kernel.go", want: Tier3Upstream},
 		{name: "tier3 linux futex", path: "pkg/sync/futex_linux.go", want: Tier3Upstream},
 		{name: "tier3 token inside word", path: "pkg/sentry/kernel/darwinish.go", want: Tier3Upstream},
+		{name: "tier1 ext4lite volume engine", path: "pkg/sentry/fsimpl/ext4lite/ext4lite.go", want: Tier1Additive},
+		{name: "tier1 hvcommon shared stubs", path: "pkg/sentry/platform/hvcommon/arm64.go", want: Tier1Additive},
+		{name: "tier2 xplat helper in a shared package", path: "pkg/syserr/linux_errno_xplat.go", want: Tier2Sibling},
+		{name: "tier2 darwin page size file", path: "pkg/hostarch/hostarch_darwin_arm64_16k.go", want: Tier2Sibling},
+		{name: "tier3 helper without a marker", path: "pkg/syserr/linux_errno.go", want: Tier3Upstream},
 	}
 
 	for _, tc := range cases {
