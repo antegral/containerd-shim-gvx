@@ -98,7 +98,8 @@ func nativeRelative(dir *pinnedDir, name string, access, disposition, options ui
 	}
 	var h windows.Handle
 	var iosb windows.IO_STATUS_BLOCK
-	err = windows.NtCreateFile(&h, access|windows.SYNCHRONIZE|windows.READ_CONTROL, &oa, &iosb, nil, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, disposition, options|windows.FILE_OPEN_REPARSE_POINT|windows.FILE_SYNCHRONOUS_IO_NONALERT, 0, 0)
+	// Metadata validation also needs FILE_READ_ATTRIBUTES on write-only and append-only handles.
+	err = windows.NtCreateFile(&h, access|windows.SYNCHRONIZE|windows.READ_CONTROL|windows.FILE_READ_ATTRIBUTES, &oa, &iosb, nil, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, disposition, options|windows.FILE_OPEN_REPARSE_POINT|windows.FILE_SYNCHRONOUS_IO_NONALERT, 0, 0)
 	runtime.KeepAlive(oa)
 	if err != nil {
 		return nil, windowsPathError("NtCreateFile", name, err)
@@ -123,12 +124,29 @@ func platformOpenRelative(dir *pinnedDir, name string, flags int, perm os.FileMo
 	}
 	if flags&os.O_EXCL != 0 {
 		disposition = windows.FILE_CREATE
+		access |= windows.DELETE
 	}
 	options := uint32(windows.FILE_NON_DIRECTORY_FILE)
 	if directory {
 		options = windows.FILE_DIRECTORY_FILE
 	}
-	return nativeRelative(dir, name, access, disposition, options, flags&os.O_CREATE != 0)
+	f, err := nativeRelative(dir, name, access, disposition, options, flags&os.O_CREATE != 0)
+	if err != nil {
+		return nil, err
+	}
+	if disposition == windows.FILE_CREATE {
+		kind := regularEntry
+		if directory {
+			kind = directoryEntry
+		}
+		if _, err := validateFile(f, kind, true); err != nil {
+			// FILE_CREATE proves ownership; delete through that handle, not a potentially replaced path.
+			var remove byte = 1
+			removeErr := windows.SetFileInformationByHandle(windows.Handle(f.Fd()), windows.FileDispositionInfo, &remove, 1)
+			return nil, errors.Join(err, removeErr, f.Close())
+		}
+	}
+	return f, nil
 }
 
 func platformMkdir(dir *pinnedDir, name string) error {

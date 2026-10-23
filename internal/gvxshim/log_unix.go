@@ -92,13 +92,7 @@ func (s *unixLogSink) Write(data []byte) (int, error) {
 	}
 	s.fifo = file
 	s.mu.Unlock()
-	deadlineErr := file.SetWriteDeadline(time.Now().Add(s.timeout))
-	var n int
-	if deadlineErr == nil {
-		n, err = file.Write(data)
-	} else {
-		err = deadlineErr
-	}
+	n, err := s.writeFIFO(file, fd, data)
 	s.mu.Lock()
 	var closeErr error
 	if s.fifo == file {
@@ -107,6 +101,39 @@ func (s *unixLogSink) Write(data []byte) (int, error) {
 	}
 	s.mu.Unlock()
 	return n, errors.Join(err, closeErr)
+}
+
+func (s *unixLogSink) writeFIFO(file *os.File, fd int, data []byte) (int, error) {
+	deadline := time.Now().Add(s.timeout)
+	written := 0
+	for written < len(data) {
+		s.mu.Lock()
+		if s.closed || s.fifo != file {
+			s.mu.Unlock()
+			return written, os.ErrClosed
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			s.mu.Unlock()
+			return written, os.ErrDeadlineExceeded
+		}
+		n, err := unix.Write(fd, data[written:])
+		if n > 0 {
+			written += n
+		}
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+			// Darwin excludes FIFOs from Go's deadline-aware poller.
+			// Bound each native poll while the mutex protects against descriptor reuse.
+			wait := min(remaining, 10*time.Millisecond)
+			poll := [1]unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+			_, err = unix.Poll(poll[:], int((wait+time.Millisecond-1)/time.Millisecond))
+		}
+		s.mu.Unlock()
+		if err != nil && !errors.Is(err, unix.EINTR) {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 func (s *unixLogSink) Close() error {

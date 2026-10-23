@@ -38,10 +38,10 @@ func bindPinnedSocket(dir *pinnedDir, name string) (_ net.Listener, err error) {
 	}
 	unix.CloseOnExec(fd)
 	file := os.NewFile(uintptr(fd), name)
-	// Darwin supplies a thread-local directory for pathname-only bind.
+	// Use libSystem: Darwin no longer supports these raw syscall entry points.
 	runtime.LockOSThread()
-	_, _, setErr := unix.Syscall(unix.SYS___PTHREAD_FCHDIR, dir.Handle.Fd(), 0, 0)
-	if setErr != 0 {
+	setErr := unix.PthreadFchdir(int(dir.Handle.Fd()))
+	if setErr != nil {
 		runtime.UnlockOSThread()
 		return nil, errors.Join(setErr, file.Close())
 	}
@@ -51,20 +51,20 @@ func bindPinnedSocket(dir *pinnedDir, name string) (_ net.Listener, err error) {
 	if bindErr == nil {
 		ref, refErr = boundSocketReference(dir, name)
 	}
-	_, _, resetErr := unix.Syscall(unix.SYS___PTHREAD_FCHDIR, ^uintptr(0), 0, 0)
-	if resetErr == 0 {
+	resetErr := unix.PthreadFchdir(-1)
+	if resetErr == nil {
 		runtime.UnlockOSThread()
 	}
 	// A failed reset keeps this goroutine on its thread until process exit.
 	if bindErr != nil || refErr != nil {
-		return nil, errors.Join(bindErr, refErr, errnoOrNil(resetErr), file.Close())
+		return nil, errors.Join(bindErr, refErr, resetErr, file.Close())
 	}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, removeBoundSocket(dir, ref))
 		}
 	}()
-	if resetErr != 0 {
+	if resetErr != nil {
 		return nil, errors.Join(resetErr, file.Close())
 	}
 	if err := unix.Fchmodat(int(dir.Handle.Fd()), name, 0600, unix.AT_SYMLINK_NOFOLLOW); err != nil {
@@ -81,11 +81,4 @@ func bindPinnedSocket(dir *pinnedDir, name string) (_ net.Listener, err error) {
 		return nil, err
 	}
 	return listener, nil
-}
-
-func errnoOrNil(err syscall.Errno) error {
-	if err == 0 {
-		return nil
-	}
-	return err
 }

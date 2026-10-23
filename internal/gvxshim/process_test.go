@@ -462,27 +462,7 @@ func testBlockedProcessBootstrap(t *testing.T, killLauncher bool) {
 	f.timeout = 2 * time.Second
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	defer cancel()
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reader.Close()
-	defer writer.Close()
-	if err := writer.SetWriteDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
-	block := make([]byte, 4096)
-	for {
-		if _, err := writer.Write(block); err != nil {
-			if !os.IsTimeout(err) {
-				t.Fatalf("fill bootstrap pipe: %v", err)
-			}
-			break
-		}
-	}
-	if err := writer.SetWriteDeadline(time.Time{}); err != nil {
-		t.Fatal(err)
-	}
+	writer := fullProcessBootstrapPipe(t)
 	cmd := f.cmd(ctx, "start")
 	cmd.Stdout = writer
 	var stderr bytes.Buffer
