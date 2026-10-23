@@ -231,7 +231,7 @@ func TestE2EGateETExecHerdrSchema(t *testing.T) {
 // herdrServerScript starts the herdr server, waits until it answers a request,
 // prints the answer, and stops the server.
 const herdrServerScript = `export HOME=/tmp/h && mkdir -p $HOME &&
-cp /workspace/herdr /usr/local/bin/herdr &&
+cp /workspace/herdr /usr/local/bin/herdr && chmod 755 /usr/local/bin/herdr &&
 (herdr server >/tmp/server.log 2>&1 &) &&
 i=0 &&
 until herdr workspace list >/tmp/list.txt 2>/dev/null; do
