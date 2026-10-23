@@ -17,7 +17,6 @@ package gvx
 import (
 	"errors"
 	"fmt"
-	"slices"
 )
 
 // ErrUnsupportedELFLayout marks an executable whose load segments cannot map
@@ -30,17 +29,15 @@ const (
 	// Linkers align segments to at least this size, so the layout check has
 	// nothing to find at this size.
 	basePageSize = 4096
-
-	// elfPermMask selects the execute, write, and read bits of p_flags.
-	elfPermMask = 7
 )
 
 // elfLayoutProblem describes the first load segment of an ELF64 executable
 // that a guest page of pageSize bytes cannot map. It returns an empty string
 // when every segment maps, and for a file that is not ELF64. The loader maps
-// whole pages, so two layouts fail. In the first, a segment has an address and
-// a file offset that differ modulo the page size. In the second, two segments
-// with different permissions share one page.
+// whole pages, so a segment with an address and a file offset that differ
+// modulo the page size fails. Two segments that share one page do not fail.
+// The loader gives that page the union of their permissions, and the systrap
+// engine runs the code in it.
 func elfLayoutProblem(header []byte, pageSize uint64) string {
 	_, segments, ok := parseLoadSegments(header)
 	if !ok || pageSize == 0 {
@@ -51,25 +48,6 @@ func elfLayoutProblem(header []byte, pageSize uint64) string {
 			return fmt.Sprintf("program header %d (PT_LOAD, vaddr %#x, offset %#x) is not congruent modulo the %d-byte guest page size",
 				seg.index, seg.vaddr, seg.offset, pageSize)
 		}
-	}
-	slices.SortStableFunc(segments, func(a, b loadSegment) int {
-		switch {
-		case a.vaddr < b.vaddr:
-			return -1
-		case a.vaddr > b.vaddr:
-			return 1
-		}
-		return 0
-	})
-	for i := 1; i < len(segments); i++ {
-		prev, next := segments[i-1], segments[i]
-		pageStart := next.vaddr - next.vaddr%pageSize
-		prevEnd := prev.vaddr + prev.memsz
-		if (prev.flags^next.flags)&elfPermMask == 0 || (prevEnd+pageSize-1)/pageSize*pageSize <= pageStart {
-			continue
-		}
-		return fmt.Sprintf("program headers %d and %d (PT_LOAD, vaddr %#x and %#x, offset %#x and %#x) share the %d-byte guest page at %#x with different permissions",
-			prev.index, next.index, prev.vaddr, next.vaddr, prev.offset, next.offset, pageSize, pageStart)
 	}
 	return ""
 }

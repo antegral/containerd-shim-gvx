@@ -55,6 +55,17 @@ const (
 	// x18Offset and spillOffset locate the virtual x18 and the scratch spill word.
 	x18Offset   = 912
 	spillOffset = 920
+
+	// waiterSentry and waiterStub are the bits of sysmsg.Waiter.
+	waiterSentry = 1
+	waiterStub   = 2
+	// waiterOffset is the offset of Waiter in the sysmsg.
+	waiterOffset = 884
+	// sentrySpinRounds is the number of procyield rounds of the Sentry before
+	// it sleeps on State.
+	sentrySpinRounds = 512
+	// sentrySpinYields is the number of YIELD instructions in one round.
+	sentrySpinYields = 4
 )
 
 // mcontext mirrors the Darwin _STRUCT_MCONTEXT64 that the kernel writes into a
@@ -80,8 +91,10 @@ type sysmsg struct {
 	Code  uint64
 	MC    mcontext
 	Cold  uint32
-	_     uint32
-	Alt   [3]uint64
+	// Waiter holds the bits that tell the other side to call ulock_wake. A side
+	// sets its bit before it sleeps on State and clears the bit when it wakes.
+	Waiter uint32
+	Alt    [3]uint64
 	// X18 is the guest x18. The kernel zeroes the real x18 on every return
 	// from an exception, so patched code reads and writes this word instead.
 	X18 uint64

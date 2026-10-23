@@ -339,15 +339,28 @@ func encodeAdrpSlot(buf []byte, slotVA, site uint64, rd uint8, value uint64) err
 // rn. The slot adds the bias to a pointer of the zone and jumps. For blr it
 // first sets the link register to site+4, so that the callee returns to the
 // guest code and not to the slot. It returns the byte size of the slot.
+//
+// A blr leaves rn unchanged, and a guest keeps a callback pointer in a
+// callee-saved register for later compares and stores. The slot therefore
+// biases a copy of the pointer in x16. No callee reads x16 on entry, because
+// the calling convention names it a scratch register for the call itself. The
+// registers x16 and x17 and every br change the register in place. A br does
+// not return to the slot, so the slot cannot restore the register.
 func encodeIndirectSlot(buf []byte, slotVA, site uint64, rn uint8, link bool) (int, error) {
-	w := []uint32{encodeBiasTBNZ(rn, 8), encodeBiasOrr(rn, rn)}
+	reg := rn
+	var w []uint32
+	if link && rn != 16 && rn != 17 {
+		reg = 16
+		w = append(w, zoneMovX16|uint32(rn)<<16)
+	}
+	w = append(w, encodeBiasTBNZ(reg, 8), encodeBiasOrr(reg, reg))
 	size := brSlotSize
 	if link {
 		ret := site + 4
 		w = append(w, encodeMovZ(30, ret), encodeMovK(30, ret>>16, 16), encodeMovK(30, ret>>32, 32))
 		size = blrSlotSize
 	}
-	w = append(w, zoneBrReg|uint32(rn)<<5)
+	w = append(w, zoneBrReg|uint32(reg)<<5)
 	if len(buf) < size || len(w)*4 > size {
 		return 0, fmt.Errorf("indirect slot needs %d bytes, buffer has %d", size, len(buf))
 	}

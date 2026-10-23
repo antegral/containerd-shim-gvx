@@ -561,7 +561,19 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		for _, it := range items {
 			taken[int(it.Offset)] = struct{}{}
 		}
-		for _, z := range scanZone(copyBuf, base, func(off int) bool { _, t := taken[off]; return t }) {
+		// The scan recognizes instructions by their bit pattern. A data word in
+		// a block that also holds code, such as a string at the start of the
+		// read-only data, can look like an adr or a br. When the section
+		// headers describe the block, the scan skips the words outside the
+		// executable sections. A page without usable headers stays whole,
+		// because the biased addresses need the slots.
+		skip := func(off int) bool {
+			if _, t := taken[off]; t {
+				return true
+			}
+			return scope.proven() && !scope.contains(gbase+uint64(off))
+		}
+		for _, z := range scanZone(copyBuf, base, skip) {
 			if z.kind == siteAdrp && as.isGoCode(z.value) {
 				// The Go runtime compares a function address with the code range
 				// of its module data, and the zone mode biased that range. An

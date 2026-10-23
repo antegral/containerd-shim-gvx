@@ -157,6 +157,99 @@ func TestZoneIndirectBranchesTakeGuestPointers(t *testing.T) {
 	}
 }
 
+func TestZoneBlrKeepsTheGuestValueOfThePointerRegister(t *testing.T) {
+	// A guest keeps a callback pointer in a callee-saved register and compares
+	// or stores it after the call. The slot of blr biases a copy in x16.
+	r := newZoneRig(t)
+	prog := make([]uint32, 0x30)
+	copy(prog, append(loadAddr(20, zoneCode+0x80), 0xd63f0280 /* blr x20 */, movz(8, 9), insnSVC0))
+	prog[0x80/4], prog[0x84/4] = movz(0, 100), 0xd65f03c0
+	r.zoneProgram(zoneCode, prog...)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	x := &r.regs().Regs
+	if x[0] != 100 {
+		t.Errorf("x0 = %d, want 100 from the callee", x[0])
+	}
+	if x[20] != zoneCode+0x80 {
+		t.Errorf("x20 = %#x after blr, want the guest pointer %#x", x[20], zoneCode+0x80)
+	}
+}
+
+func TestZoneFaultInsideAStoreOfTheBaseRestoresTheScratchRegisters(t *testing.T) {
+	// str x1, [x1, #16] stores its own base register, so the slot borrows x16
+	// and x17. The second pass stores through an unmapped pointer. The fault
+	// must return the guest values of x16, x17, and x1.
+	r := newZoneRig(t)
+	prog := []uint32{movz(16, 0x1616), movz(17, 0x1717)}
+	prog = append(prog, loadAddr(1, zoneData)...)
+	prog = append(prog, movz(2, 2))
+	prog = append(prog, 0xf9000821) // str x1, [x1, #16], the loop head
+	prog = append(prog, loadAddr(1, 0x600000)...)
+	prog = append(prog, subsImm(2, 2, 1), 0x54ffff61 /* b.ne loop head */, movz(8, 9), insnSVC0)
+	r.zoneProgram(zoneCode, prog...)
+	r.mapPage(zoneData, readWrite)
+	si, at, err := r.run()
+	wantSignal(t, si, at, err, linux.SIGSEGV, 1, 0x600010, hostarch.Write)
+	x := &r.regs().Regs
+	for _, tc := range []struct {
+		what      string
+		got, want uint64
+	}{
+		{"x16", x[16], 0x1616},
+		{"x17", x[17], 0x1717},
+		{"x1", x[1], 0x600000},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %#x after the fault, want the guest value %#x", tc.what, tc.got, tc.want)
+		}
+	}
+}
+
+func TestZoneStoreIntoAnExecutableBlockOfAnotherBlock(t *testing.T) {
+	// The data block is also executable, and the guest has run code in it, so
+	// the block holds a patched copy without write access. A store from the
+	// slot of another block must restore the writable frame and not end with
+	// SIGSEGV.
+	r := newZoneRig(t)
+	rwx := hostarch.AccessType{Read: true, Write: true, Execute: true}
+	data := make([]uint32, 0x80)
+	data[0x100/4], data[0x104/4] = movz(4, 1), 0xd65f03c0
+	r.zoneProgram(zoneCode, append(append(loadAddr(1, zoneData), loadAddr(3, zoneData+0x100)...),
+		0xd63f0060, // blr x3, which runs code in the data block
+		movz(2, 0x55),
+		0xf9010022, // str x2, [x1, #0x200]
+		0xf9410020, // ldr x0, [x1, #0x200]
+		movz(8, 9), insnSVC0)...)
+	r.mapPage(zoneData, rwx, data...)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	x := &r.regs().Regs
+	if x[4] != 1 || x[0] != 0x55 {
+		t.Errorf("x4, x0 = %#x, %#x, want 1 from the call and 0x55 from the store", x[4], x[0])
+	}
+}
+
+func TestZoneStoreIntoTheOwnBlock(t *testing.T) {
+	// Code and data share one block of the zone. The store from the slot
+	// cannot run in the stub, so the Sentry writes both frames of the block.
+	r := newZoneRig(t)
+	rwx := hostarch.AccessType{Read: true, Write: true, Execute: true}
+	r.mapPage(zoneCode, rwx, append(loadAddr(1, zoneCode+0x400),
+		movz(2, 0x55),
+		0xf9000022, // str x2, [x1]
+		0xf9400020, // ldr x0, [x1]
+		movz(8, 9), insnSVC0)...)
+	r.mapPage(stackVA, hostarch.ReadWrite)
+	r.ac.SetIP(zoneCode)
+	r.ac.SetStack(stackVA + blockSize - 0x100)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	if got := r.regs().Regs[0]; got != 0x55 {
+		t.Errorf("x0 = %#x, want 0x55 from the load after the store", got)
+	}
+}
+
 func TestZoneFaultsReportGuestAddresses(t *testing.T) {
 	t.Run("an unmapped guest address of the zone", func(t *testing.T) {
 		r := newZoneRig(t)
@@ -252,6 +345,49 @@ func TestZoneRegisterOffsetAcceptsANegativeIndex(t *testing.T) {
 	x := &r.regs().Regs
 	if x[3] != 0x1111 || x[0] != 0x1111 {
 		t.Errorf("x3, x0 = %#x, %#x, want 0x1111 from the address 16 bytes below the base", x[3], x[0])
+	}
+}
+
+func TestZonePatchFaultKeepsVectorRegistersAndFlags(t *testing.T) {
+	// The first run of a load through a pointer of the zone faults, and the
+	// Sentry resumes the thread after it patches the load. The vector
+	// registers and the condition flags that the guest set before the load
+	// must still hold after it.
+	r := newZoneRig(t)
+	r.zoneProgram(zoneCode, append(loadAddr(1, zoneData),
+		0xd2822222, // mov x2, #0x1111
+		0x9e670040, // fmov d0, x2
+		0xd2844443, // mov x3, #0x2222
+		0x9e670061, // fmov d1, x3
+		0xd286666a, // mov x10, #0x3333
+		0x4e181d42, // mov v2.d[1], x10
+		0xd2800000, // mov x0, #0
+		0xf100041f, // cmp x0, #1, which sets N
+		0xf9400024, // ldr x4, [x1], the load that faults
+		0x1a9f57e9, // cset w9, mi
+		0x9e660006, // fmov x6, d0
+		0x9e660027, // fmov x7, d1
+		0x4e183c4b, // mov x11, v2.d[1]
+		0xd2800128, // mov x8, #9
+		insnSVC0)...)
+	mem := r.mapPage(zoneData, readWrite)
+	put64(mem, 0, 0x77)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	x := &r.regs().Regs
+	for _, tc := range []struct {
+		what      string
+		got, want uint64
+	}{
+		{"x4, the loaded word", x[4], 0x77},
+		{"the N flag after the load", x[9], 1},
+		{"d0, the low half of a vector register", x[6], 0x1111},
+		{"d1, the low half of a vector register", x[7], 0x2222},
+		{"v2.d[1], the high half of a vector register", x[11], 0x3333},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %#x, want %#x", tc.what, tc.got, tc.want)
+		}
 	}
 }
 

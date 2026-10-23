@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"sync"
 
 	"golang.org/x/arch/arm64/arm64asm"
 )
@@ -133,6 +134,18 @@ func movConst(rd uint8, v uint64) []uint32 {
 	return words
 }
 
+// decodeMu serializes decodeARM64. Decode of x/arch sets a flag in a package
+// level coverage array on every call, so two address spaces that patch at the
+// same time race on that array.
+var decodeMu sync.Mutex
+
+// decodeARM64 decodes one instruction. It is safe for concurrent use.
+func decodeARM64(b []byte) (arm64asm.Inst, error) {
+	decodeMu.Lock()
+	defer decodeMu.Unlock()
+	return arm64asm.Decode(b)
+}
+
 // planX18 decides whether the instruction w at address site names x18 and
 // returns the slot that replaces it. It returns nil for every other word.
 //
@@ -152,7 +165,7 @@ func planX18(w uint32, site uint64) *x18Plan {
 	}
 	var raw [4]byte
 	binary.LittleEndian.PutUint32(raw[:], w)
-	inst, err := arm64asm.Decode(raw[:])
+	inst, err := decodeARM64(raw[:])
 	if err != nil {
 		if isLSEAtomic(w) {
 			return planAtomic(w)
@@ -241,7 +254,7 @@ func planGeneric(w uint32, text string) *x18Plan {
 			cand := rewrite(mask)
 			var raw [4]byte
 			binary.LittleEndian.PutUint32(raw[:], cand)
-			got, err := arm64asm.Decode(raw[:])
+			got, err := decodeARM64(raw[:])
 			if err == nil && got.String() == want {
 				return &x18Plan{kind: siteX18, scratch: scratch, body: []uint32{cand}}
 			}

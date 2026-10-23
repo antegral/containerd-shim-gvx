@@ -79,6 +79,8 @@ type testMM struct {
 	mu   sync.Mutex
 	as   platform.AddressSpace
 	vmas []hostarch.AddrRange
+	// pages maps the start of a guest page to the Sentry view of its frame.
+	pages map[uint64][]byte
 }
 
 func (m *testMM) MMap(_ context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
@@ -105,6 +107,30 @@ func (m *testMM) reserve(start, length uint64) {
 	m.mu.Lock()
 	m.vmas = append(m.vmas, hostarch.AddrRange{Start: hostarch.Addr(start), End: hostarch.Addr(start + length)})
 	m.mu.Unlock()
+}
+
+// record remembers the Sentry view of the frame that backs the page at va.
+func (m *testMM) record(va uint64, mem []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pages == nil {
+		m.pages = make(map[uint64][]byte)
+	}
+	m.pages[va] = mem
+}
+
+// CopyIn reads guest memory from the recorded frames. A read must stay inside
+// one page.
+func (m *testMM) CopyIn(_ context.Context, addr hostarch.Addr, dst []byte, _ usermem.IOOpts) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	base := blockRound(uint64(addr))
+	page, ok := m.pages[base]
+	off := uint64(addr) - base
+	if !ok || off+uint64(len(dst)) > uint64(len(page)) {
+		return 0, unix.EFAULT
+	}
+	return copy(dst, page[off:]), nil
 }
 
 const (
@@ -183,6 +209,7 @@ func (r *rig) mapPage(va uint64, at hostarch.AccessType, words ...uint32) []byte
 		binary.LittleEndian.PutUint32(mem[i*4:], w)
 	}
 	r.mm.reserve(va, blockSize)
+	r.mm.record(va, mem)
 	if err := r.as.MapFile(hostarch.Addr(va), r.mf, fr, at, false); err != nil {
 		r.t.Fatalf("MapFile %#x: %v", va, err)
 	}
@@ -669,19 +696,56 @@ func TestSyscallKeepsTheWordsBelowTheStackPointer(t *testing.T) {
 		t.Errorf("the words below the stack pointer read back %#x and %#x, want 0x1234 and 0x1234", x[10], x[11])
 	}
 }
-func TestSelfWritingBlockFaults(t *testing.T) {
-	// A guest that stores to the block that it executes would make the engine
-	// swap the write permission and the execute permission forever. The
-	// engine reports SIGSEGV for the store instead.
+func TestStoreIntoTheOwnBlockRunsInTheSentry(t *testing.T) {
+	// A guest that stores to the block that it executes cannot run the store in
+	// the stub, because the engine gives a block write access or execute
+	// access, never both. The Sentry runs the store, writes both frames of the
+	// block, and applies the writeback of the addressing mode.
 	p := newPlatform(t)
 	r := newRig(t, p)
-	prog := append(loadAddr(1, codeVA+0x400), movz(2, 1), strW(2, 1))
+	prog := append(loadAddr(1, codeVA+0x400),
+		movz(2, 0x55), movz(3, 0x66),
+		strX(2, 1),
+		0xa9810c22, // stp x2, x3, [x1, #16]!
+		0xf85f0020, // ldur x0, [x1, #-16]
+		ldrX(4, 1),
+		0xf9400425, // ldr x5, [x1, #8]
+		movz(8, 9), insnSVC0)
+	r.mapPage(codeVA, hostarch.AccessType{Read: true, Write: true, Execute: true}, prog...)
+	r.mapPage(stackVA, hostarch.ReadWrite)
+	r.ac.SetIP(codeVA)
+	r.ac.SetStack(stackVA + blockSize - 0x100)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	x := &r.regs().Regs
+	for _, tc := range []struct {
+		what      string
+		got, want uint64
+	}{
+		{"x0, the word of the plain store", x[0], 0x55},
+		{"x4, the first word of the pair store", x[4], 0x55},
+		{"x5, the second word of the pair store", x[5], 0x66},
+		{"x1, the base after the pre-index writeback", x[1], codeVA + 0x410},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %#x, want %#x", tc.what, tc.got, tc.want)
+		}
+	}
+}
+
+func TestStoreOverPatchedCodeOfTheOwnBlockFaults(t *testing.T) {
+	// The patcher replaced the system call instruction in the executable copy.
+	// A store over it would turn the patch into data, so the engine reports
+	// SIGSEGV and does not run the store.
+	p := newPlatform(t)
+	r := newRig(t, p)
+	prog := append(loadAddr(1, codeVA+24), movz(2, 1), strW(2, 1), movz(8, 9), insnSVC0)
 	r.mapPage(codeVA, hostarch.AccessType{Read: true, Write: true, Execute: true}, prog...)
 	r.mapPage(stackVA, hostarch.ReadWrite)
 	r.ac.SetIP(codeVA)
 	r.ac.SetStack(stackVA + blockSize - 0x100)
 	si, at, err := r.run()
-	wantSignal(t, si, at, err, linux.SIGSEGV, 2, codeVA+0x400, hostarch.Write)
+	wantSignal(t, si, at, err, linux.SIGSEGV, 2, codeVA+24, hostarch.Write)
 }
 
 func TestStoreFromAnotherBlockStillSucceeds(t *testing.T) {
@@ -696,6 +760,23 @@ func TestStoreFromAnotherBlockStillSucceeds(t *testing.T) {
 	mustSyscall(t, si, err, 9, r.ac)
 	if got := r.regs().Regs[0]; got != 0x55 {
 		t.Errorf("the load returned %#x, want 0x55", got)
+	}
+}
+
+// BenchmarkSyscallRoundTrip measures one guest system call from the trap of
+// the guest thread to the next trap. The Sentry does no work for the call, so
+// the time is the cost of the handoff between the stub and the Sentry.
+func BenchmarkSyscallRoundTrip(b *testing.B) {
+	p := newPlatform(b)
+	r := newRig(b, p)
+	r.program(movz(8, 9), insnSVC0, 0x17fffffe /* b -8 */)
+	if si, _, err := r.run(); si != nil || err != nil {
+		b.Fatalf("first run = (%s, %v), want a system call", describe(si), err)
+	}
+	for b.Loop() {
+		if si, _, err := r.run(); si != nil || err != nil {
+			b.Fatalf("run = (%s, %v), want a system call", describe(si), err)
+		}
 	}
 }
 

@@ -34,6 +34,9 @@ func libcSyscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err sysca
 
 func libcCallTramp()
 func addrOfLibcCall() uintptr
+
+// procyield executes the YIELD hint instruction n times.
+func procyield(n uint32)
 func dlsymTramp()
 func addrOfDlsym() uintptr
 func taskSelfTrampoline()

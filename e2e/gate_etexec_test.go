@@ -39,11 +39,16 @@ import (
 // They are a static Go program, a static C program, the herdr schema command,
 // and the herdr server with one request. The macOS systrap engine cannot hold
 // such an image, because every arm64 task there has a 4GB PAGEZERO. Its
-// subtests skip while the error names that cause. The skip ends when the
-// engine runs them.
+// subtests skip while the error names that cause. The extra backend
+// systrap-zone turns on the prototype zone mode of that engine, and it runs
+// the four programs.
+
+// zoneBackend names the macOS systrap engine with the prototype zone mode.
+const zoneBackend = "systrap-zone"
 
 // fixedAddressBackends lists each backend once. On Linux the hardware entry
-// and the systrap entry are the same platform.
+// and the systrap entry are the same platform. On macOS the list ends with the
+// systrap engine in zone mode.
 func fixedAddressBackends() []gateBackend {
 	var out []gateBackend
 	seen := map[gvx.PlatformType]bool{}
@@ -52,6 +57,9 @@ func fixedAddressBackends() []gateBackend {
 			seen[b.plat] = true
 			out = append(out, b)
 		}
+	}
+	if runtime.GOOS == "darwin" {
+		out = append(out, gateBackend{zoneBackend, gvx.PlatformSystrap})
 	}
 	return out
 }
@@ -68,6 +76,9 @@ func requireFixedAddressBackend(t *testing.T, b gateBackend) {
 		return
 	}
 	requireBackend(t, b)
+	if b.name == zoneBackend {
+		t.Setenv("GVX_SYSTRAP_FIXED_IMAGES", "1")
+	}
 }
 
 // skipWhenFixedAddressRefused skips the test when err is the refusal of an
@@ -77,7 +88,7 @@ func skipWhenFixedAddressRefused(t *testing.T, what string, err error) {
 	if err == nil {
 		return
 	}
-	if strings.Contains(err.Error(), "not position-independent") {
+	if msg := err.Error(); strings.Contains(msg, "not position-independent") || strings.Contains(msg, "cannot hold the zone") {
 		t.Skipf("this engine cannot hold an executable that links at a fixed address: %v", err)
 	}
 	t.Fatalf("%s: %v", what, err)

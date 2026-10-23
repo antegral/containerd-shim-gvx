@@ -169,7 +169,7 @@ var machCalls struct {
 	spawnattrSetPgroup                                                      libcFunc
 	ulockWait, ulockWake, icacheInvalidate                                  libcFunc
 	taskSetExceptionPorts                                                   libcFunc
-	vmRegion                                                                libcFunc
+	vmRegion, vmMachineAttribute                                            libcFunc
 }
 
 func init() {
@@ -204,6 +204,7 @@ func init() {
 	c.icacheInvalidate = mustResolve("sys_icache_invalidate")
 	c.taskSetExceptionPorts = mustResolve("task_set_exception_ports")
 	c.vmRegion = mustResolve("mach_vm_region")
+	c.vmMachineAttribute = mustResolve("mach_vm_machine_attribute")
 }
 
 // vmRemap maps size bytes of srcTask at srcAddr into dstTask at dstAddr and
@@ -270,6 +271,26 @@ func vmProtect(task machPort, addr, size uint64, setMax bool, prot int) error {
 		m = 1
 	}
 	return kr("mach_vm_protect", machCalls.vmProtect.call(uintptr(task), uintptr(addr), uintptr(size), m, uintptr(prot)))
+}
+
+// The machine attribute call that synchronizes the caches of a range.
+const (
+	// mattrCache is MATTR_CACHE.
+	mattrCache = 1
+	// mattrValCacheSync is MATTR_VAL_CACHE_SYNC, which synchronizes the
+	// instruction cache and the data cache.
+	mattrValCacheSync = 9
+)
+
+// vmSyncCode asks the kernel to synchronize the instruction cache and the data
+// cache for the pages that task maps in [addr, addr+size). The kernel finds the
+// physical pages and does not depend on the address that the caller used to
+// write the code.
+func vmSyncCode(task machPort, addr, size uint64) error {
+	val := int32(mattrValCacheSync)
+	r := machCalls.vmMachineAttribute.call(uintptr(task), uintptr(addr), uintptr(size), mattrCache, uintptr(unsafe.Pointer(&val)))
+	runtime.KeepAlive(&val)
+	return kr("mach_vm_machine_attribute", r)
 }
 
 // vmDeallocate unmaps a range of a task.

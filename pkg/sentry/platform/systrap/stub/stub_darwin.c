@@ -34,6 +34,7 @@ _Static_assert(offsetof(struct gv_sysmsg, addr) == SM_ADDR, "addr");
 _Static_assert(offsetof(struct gv_sysmsg, code) == SM_CODE, "code");
 _Static_assert(offsetof(struct gv_sysmsg, mc) == SM_MC, "mc");
 _Static_assert(offsetof(struct gv_sysmsg, cold) == SM_COLD, "cold");
+_Static_assert(offsetof(struct gv_sysmsg, waiter) == SM_WAITER, "waiter");
 _Static_assert(offsetof(struct gv_sysmsg, alt) == SM_ALT, "alt");
 _Static_assert(offsetof(struct gv_sysmsg, x18) == SM_X18, "x18");
 _Static_assert(offsetof(struct gv_sysmsg, spill) == SM_SPILL, "spill");
@@ -69,18 +70,45 @@ static inline struct gv_sysmsg *current_sysmsg(void) {
   return (struct gv_sysmsg *)(v & ~7ULL);
 }
 
-// gv_park publishes the trap reason, wakes the Sentry and blocks until the
-// Sentry resumes the thread. It returns the resume state.
+static inline int is_resume_state(uint32_t s) {
+  return s == GV_ST_RUN_HOT || s == GV_ST_RUN_COLD;
+}
+
+// gv_park publishes the trap reason and blocks until the Sentry resumes the
+// thread. It returns the resume state.
+//
+// The Sentry calls ulock_wait only after it sets GV_WAITER_SENTRY and reads
+// state again, so the stub calls ulock_wake only when the bit is set. The
+// stub then spins for GV_SPIN_ITERS iterations, because the Sentry often
+// answers a system call within that time. The stub sleeps after the spin, with
+// the same protocol in the other direction: it sets GV_WAITER_STUB, reads
+// state again, and calls ulock_wait only while state still holds that value.
+// Every flag access is sequentially consistent, so one side always sees the
+// store of the other side.
 uint32_t gv_park(struct gv_sysmsg *sm, uint32_t kind) {
   sm->kind = kind;
-  __atomic_store_n(&sm->state, GV_ST_TRAPPED, __ATOMIC_RELEASE);
-  raw_syscall4(SYS_ulock_wake, UL_COMPARE_AND_WAIT_SHARED, (long)&sm->state, 0, 0);
-  for (;;) {
+  __atomic_store_n(&sm->state, GV_ST_TRAPPED, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&sm->waiter, __ATOMIC_SEQ_CST) & GV_WAITER_SENTRY) {
+    raw_syscall4(SYS_ulock_wake, UL_COMPARE_AND_WAIT_SHARED, (long)&sm->state, 0, 0);
+  }
+  for (int i = 0; i < GV_SPIN_ITERS; i++) {
     uint32_t s = __atomic_load_n(&sm->state, __ATOMIC_ACQUIRE);
-    if (s == GV_ST_RUN_HOT || s == GV_ST_RUN_COLD) {
+    if (is_resume_state(s)) {
       return s;
     }
-    raw_syscall4(SYS_ulock_wait, UL_COMPARE_AND_WAIT_SHARED, (long)&sm->state, s, 0);
+    __asm__ volatile("yield");
+  }
+  for (;;) {
+    __atomic_fetch_or(&sm->waiter, GV_WAITER_STUB, __ATOMIC_SEQ_CST);
+    uint32_t s = __atomic_load_n(&sm->state, __ATOMIC_SEQ_CST);
+    if (!is_resume_state(s)) {
+      raw_syscall4(SYS_ulock_wait, UL_COMPARE_AND_WAIT_SHARED, (long)&sm->state, s, 0);
+    }
+    __atomic_fetch_and(&sm->waiter, ~(uint32_t)GV_WAITER_STUB, __ATOMIC_SEQ_CST);
+    s = __atomic_load_n(&sm->state, __ATOMIC_ACQUIRE);
+    if (is_resume_state(s)) {
+      return s;
+    }
   }
 }
 

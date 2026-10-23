@@ -28,6 +28,7 @@
 #define SM_CODE 56
 #define SM_MC 64
 #define SM_COLD 880
+#define SM_WAITER 884
 #define SM_ALT 888
 #define SM_X18 912
 #define SM_SPILL 920
@@ -52,6 +53,14 @@
 #define GV_ST_TRAPPED 2
 #define GV_ST_RUN_HOT 3
 #define GV_ST_RUN_COLD 4
+
+// Bits of gv_sysmsg.waiter. The Sentry sets GV_WAITER_SENTRY while it sleeps
+// on state, and the stub sets GV_WAITER_STUB while it sleeps on state.
+#define GV_WAITER_SENTRY 1
+#define GV_WAITER_STUB 2
+
+// Iterations of the spin loop of the stub before it sleeps.
+#define GV_SPIN_ITERS 1024
 
 // Reasons that gv_sysmsg.kind reports when the state becomes TRAPPED.
 #define GV_KIND_START 1
@@ -85,7 +94,9 @@ struct gv_sysmsg {
   // Darwin _STRUCT_MCONTEXT64 (816 bytes).
   uint8_t mc[MC_SIZE];
   uint32_t cold;
-  uint32_t pad;
+  // Bits that tell the other side to call ulock_wake. A side sets its bit
+  // before it sleeps on state, and it clears the bit when it wakes.
+  uint32_t waiter;
   uint64_t alt[3];
   // The guest x18. The kernel zeroes the real x18 whenever the thread returns
   // from an exception, so patched code keeps the guest value here.

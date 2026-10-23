@@ -76,6 +76,12 @@ func TestELFLayoutProblemAcceptsLayoutsThatMap(t *testing.T) {
 		{"two segments with the same permissions share a page", buildTestELF(typeExec,
 			testSegment{pfR, 0, 0x400000, 0x1200},
 			testSegment{pfR, 0x1300, 0x401300, 0x100}), 16384},
+		{"text and data share a page, which the loader merges", buildTestELF(typeExec,
+			testSegment{pfR | pfX, 0, 0x400000, 0x1200},
+			testSegment{pfR | pfW, 0x2100, 0x402100, 0x100}), 16384},
+		{"the table lists the higher segment first", buildTestELF(typeExec,
+			testSegment{pfR | pfW, 0x2100, 0x402100, 0x100},
+			testSegment{pfR | pfX, 0, 0x400000, 0x1200}), 16384},
 		{"a 4KB layout with 4KB pages", buildTestELF(typeExec,
 			testSegment{pfR | pfX, 0, 0x400000, 0x1000},
 			testSegment{pfR | pfW, 0x1f40, 0x412f40, 0x100}), 4096},
@@ -102,14 +108,6 @@ func TestELFLayoutProblemNamesTheSegment(t *testing.T) {
 			testSegment{pfR | pfX, 0, 0x400000, 0x1000},
 			testSegment{pfR | pfW, 0x1f40, 0x412f40, 0x100}),
 			[]string{"program header 1", "vaddr 0x412f40", "offset 0x1f40", "not congruent", "16384-byte"}},
-		{"text and data share a page", buildTestELF(typeExec,
-			testSegment{pfR | pfX, 0, 0x400000, 0x1200},
-			testSegment{pfR | pfW, 0x2100, 0x402100, 0x100}),
-			[]string{"program headers 0 and 1", "0x400000 and 0x402100", "different permissions", "page at 0x400000"}},
-		{"the table lists the higher segment first", buildTestELF(typeExec,
-			testSegment{pfR | pfW, 0x2100, 0x402100, 0x100},
-			testSegment{pfR | pfX, 0, 0x400000, 0x1200}),
-			[]string{"program headers 1 and 0", "0x400000 and 0x402100"}},
 	} {
 		problem := elfLayoutProblem(tc.file, 16384)
 		for _, want := range tc.want {

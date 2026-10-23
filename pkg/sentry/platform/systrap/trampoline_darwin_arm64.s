@@ -65,3 +65,14 @@ TEXT ·addrOfTaskSelf(SB),NOSPLIT,$0-8
 	MOVD	$·taskSelfTrampoline(SB), R0
 	MOVD	R0, ret+0(FP)
 	RET
+
+// func procyield(n uint32)
+TEXT ·procyield(SB),NOSPLIT,$0-4
+	MOVWU	n+0(FP), R0
+	CBZ	R0, done
+again:
+	YIELD
+	SUBW	$1, R0
+	CBNZ	R0, again
+done:
+	RET
