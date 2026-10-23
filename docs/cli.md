@@ -161,7 +161,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
-| Executables that link at a fixed address (non-PIE) | The macOS `systrap` engine refuses them, and the error names `-platform=hvf`. `hvf`, `whpx`, and the Windows `systrap` engine run them. |
+| Executables that link at a fixed address (non-PIE) | The macOS `systrap` engine refuses them by default, and the error names `-platform=hvf`. The environment variable `GVX_SYSTRAP_FIXED_IMAGES=1` turns on a prototype zone mode that runs them. `hvf`, `whpx`, and the Windows `systrap` engine run them. |
 | Executables with 4KB segment alignment | A build with `-tags pagesize_16k` has 16KB guest pages. `rungv` refuses an executable with a segment that is not congruent modulo 16KB. It also refuses one with a segment that shares a page with a segment of other permissions. The error names the program header. Relink with `-z max-page-size=16384`, use the build without the tag, or set `-elf-check=false`. The check reads the entry executable only. |
 | A store into the page of the storing instruction | A `systrap` engine gives a page write access or execute access, never both. A store from a writable and executable page into the same page ends with SIGSEGV, and the Sentry log names the instruction. `hvf` and `whpx` run such a guest. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |

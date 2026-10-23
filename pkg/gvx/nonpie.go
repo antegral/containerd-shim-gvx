@@ -59,6 +59,9 @@ func nonPIEHint(header []byte, guestMin uint64, goos string) string {
 	hint := fmt.Sprintf("the executable is not position-independent and links at %#x, below the lowest guest address %#x of the systrap engine", lowest, guestMin)
 	if hw := hardwareEngine(goos); hw != "" {
 		hint += fmt.Sprintf("; run it with -platform=%s", hw)
+		if goos == "darwin" {
+			hint += ", or set GVX_SYSTRAP_FIXED_IMAGES=1 to try the zone mode of the systrap engine"
+		}
 	}
 	return hint
 }

@@ -575,6 +575,11 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 		}
 	}
 	sm.MC = sm.FMC
+	if as.p.zone {
+		if act, done := c.zoneBodyFault(ctx, mm, as, sm.Sig, sm.MC.ES.ESR>>26, sm.MC.ES.FAR, sm.MC.SS.PC); done {
+			return act
+		}
+	}
 	if act, done := c.recoverX18Slot(as, sm); done {
 		return act
 	}
@@ -597,6 +602,12 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 			c.pull(th, ac, meta.site+4, kindSignal)
 			ac.StateData().OrigR0 = sm.MC.SS.X[0]
 			return signalAction{}
+		}
+	}
+
+	if as.p.zone {
+		if act, done := c.zoneFault(ctx, mm, as, th, ac, sig, ec, esr, far, pc); done {
+			return act
 		}
 	}
 
@@ -746,7 +757,7 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, sig uint64, ec uin
 	}
 	linuxSig, linuxCode := faultSignal(sig, esr)
 	si := &linux.SignalInfo{Signo: int32(linuxSig), Code: linuxCode}
-	si.SetAddr(far)
+	si.SetAddr(c.p.guestAddr(far))
 	return signalAction{si: si, at: at, err: platform.ErrContextSignal}
 }
 

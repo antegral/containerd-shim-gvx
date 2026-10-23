@@ -110,6 +110,9 @@ type addressSpace struct {
 	released bool
 	blocks   map[uint64]*execBlock
 	islands  map[uint64]*island
+	// zoneMapped holds the stub address of every block that the guest maps in
+	// the zone. It is empty outside the zone mode.
+	zoneMapped map[uint64]struct{}
 	// reserved holds island addresses that a pending mm.MMap call creates.
 	reserved map[uint64]struct{}
 	threads  map[*thread]struct{}
@@ -152,12 +155,13 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 		return nil, fmt.Errorf("create a stub task: %w", err)
 	}
 	as := &addressSpace{
-		p:        p,
-		proc:     proc,
-		blocks:   make(map[uint64]*execBlock),
-		islands:  make(map[uint64]*island),
-		reserved: make(map[uint64]struct{}),
-		threads:  make(map[*thread]struct{}),
+		p:          p,
+		proc:       proc,
+		blocks:     make(map[uint64]*execBlock),
+		islands:    make(map[uint64]*island),
+		zoneMapped: make(map[uint64]struct{}),
+		reserved:   make(map[uint64]struct{}),
+		threads:    make(map[*thread]struct{}),
 	}
 	wake := as.wakeAll
 	proc.onDead.Store(&wake)
@@ -225,11 +229,15 @@ func (as *addressSpace) taskErr(err error) error {
 //
 // Every mapping covers whole host pages. The memory file frames must also
 // start on a host page boundary, because Mach maps pages and not bytes. A
-// build with 16KB guest pages guarantees both.
+// build with 16KB guest pages guarantees both. In zone mode a mapping inside
+// the zone lands at the guest address plus the bias.
 func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error {
 	guest := uint64(addr)
 	if err := checkAligned("map", guest, fr.Length()); err != nil {
 		return err
+	}
+	if as.p.zone && guest < zoneLimit && (guest < zoneMin || guest+fr.Length() > zoneLimit) {
+		return fmt.Errorf("map [%#x, %#x) crosses the edge of the zone [%#x, %#x)", guest, guest+fr.Length(), uint64(zoneMin), uint64(zoneLimit))
 	}
 	if as.dead.Load() {
 		return errDeadStub
@@ -243,7 +251,7 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	if as.released {
 		return errAddressSpaceReleased
 	}
-	va := guest
+	va := as.p.stubAddr(guest)
 	for ; !bs.IsEmpty(); bs = bs.Tail() {
 		b := bs.Head()
 		src, n := uint64(uintptr(b.Addr())), uint64(b.Len())
@@ -278,6 +286,9 @@ func (as *addressSpace) mapRangeLocked(va, n, src uint64, at hostarch.AccessType
 	}
 	for base := va; base < va+n; base += blockSize {
 		as.dropBlockLocked(base)
+		if inZoneStub(base) {
+			as.zoneMapped[base] = struct{}{}
+		}
 		if at.Execute {
 			as.blocks[base] = &execBlock{base: base, src: src + (base - va), at: at, state: blockData}
 		}
@@ -311,13 +322,42 @@ func (as *addressSpace) islandOverlapLocked(va, n uint64) *island {
 // aligned unmaps whole pages around it, which can only remove more than the
 // request and never leaves access that the memory manager revoked.
 func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
-	start := blockRound(uint64(addr))
-	end := (uint64(addr) + length + blockSize - 1) &^ (blockSize - 1)
+	guestStart := blockRound(uint64(addr))
+	guestEnd := (uint64(addr) + length + blockSize - 1) &^ (blockSize - 1)
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	if as.released || as.dead.Load() {
 		return
 	}
+	for _, r := range as.p.stubRanges(guestStart, guestEnd) {
+		as.unmapStubLocked(r[0], r[1])
+	}
+}
+
+// stubRanges splits the guest range [start, end) into the ranges that the stub
+// holds. In zone mode the part inside the zone moves by the bias, and the
+// hole between the zone and the guest mappings above the biased zone is not
+// part of any guest mapping. The biased zone lies in the hole, so a guest
+// range that spans the hole must not unmap it as it is.
+func (p *Platform) stubRanges(start, end uint64) [][2]uint64 {
+	if !p.zone {
+		return [][2]uint64{{start, end}}
+	}
+	var out [][2]uint64
+	if start < zoneMin {
+		out = append(out, [2]uint64{start, min(end, zoneMin)})
+	}
+	if lo, hi := max(start, zoneMin), min(end, zoneLimit); lo < hi {
+		out = append(out, [2]uint64{lo + zoneBias, hi + zoneBias})
+	}
+	if above := uint64(zoneBias + zoneLimit); end > above {
+		out = append(out, [2]uint64{max(start, above), end})
+	}
+	return out
+}
+
+// unmapStubLocked removes the stub range [start, end).
+func (as *addressSpace) unmapStubLocked(start, end uint64) {
 	if err := vmDeallocate(as.proc.task, start, end-start); err != nil && !as.proc.dead.Load() {
 		// The kernel rejects only a malformed range here, which is a Sentry bug.
 		panic(fmt.Sprintf("systrap: unmap [%#x, %#x): %v", start, end, err))
@@ -333,6 +373,11 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	} else {
 		for base := start; base < end; base += blockSize {
 			as.dropBlockLocked(base)
+		}
+	}
+	for base := range as.zoneMapped {
+		if base >= start && base < end {
+			delete(as.zoneMapped, base)
 		}
 	}
 	for base, isl := range as.islands {
@@ -446,10 +491,11 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		}
 		items = append(items, it)
 	}
-	scope := as.p.scopeOf(ctx, mm, base)
+	gbase := as.p.guestAddr(base)
+	scope := as.p.scopeOf(ctx, mm, gbase)
 	for _, x := range scanX18(copyBuf, base, func(off int) bool {
 		_, taken := claimed[off]
-		return taken || !scope.contains(base+uint64(off))
+		return taken || !scope.contains(gbase+uint64(off))
 	}) {
 		items = append(items, patchItem{
 			patchSite: patchSite{Offset: x.Offset, Kind: x.Plan.kind, Orig: binary.LittleEndian.Uint32(copyBuf[x.Offset:])},
@@ -502,6 +548,45 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 		isl.slots[off] = meta
 		as.mu.Unlock()
 		touched[isl] = struct{}{}
+	}
+	if as.p.zone {
+		taken := claimed
+		for _, it := range items {
+			taken[int(it.Offset)] = struct{}{}
+		}
+		for _, z := range scanZone(copyBuf, base, func(off int) bool { _, t := taken[off]; return t }) {
+			site := base + uint64(z.offset)
+			size := adrpSlotSize
+			switch {
+			case z.kind == siteIndirect && z.link:
+				size = blrSlotSize
+			case z.kind == siteIndirect:
+				size = brSlotSize
+			}
+			isl, off, slotVA, err := as.allocSlot(ctx, mm, site, size)
+			if err != nil {
+				return fmt.Errorf("allocate a zone slot for %#x: %w", site, err)
+			}
+			buf := pageBytes(isl.page)[off:]
+			switch z.kind {
+			case siteAdrp:
+				err = encodeAdrpSlot(buf, slotVA, site, z.reg, z.value)
+			default:
+				_, err = encodeIndirectSlot(buf, slotVA, site, z.reg, z.link)
+			}
+			if err != nil {
+				return fmt.Errorf("encode the zone slot for %#x: %w", site, err)
+			}
+			br, err := encodeBranch(site, slotVA)
+			if err != nil {
+				return err
+			}
+			putWord(copyBuf[z.offset:], br)
+			as.mu.Lock()
+			isl.slots[off] = slotMeta{site: site, kind: z.kind, reg: z.reg, size: uint32(size)}
+			as.mu.Unlock()
+			touched[isl] = struct{}{}
+		}
 	}
 	for isl := range touched {
 		flushCode(pageBytes(isl.page))
@@ -618,6 +703,18 @@ func absDiff(a, b uint64) uint64 {
 // manager and maps a private page of slots there.
 func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager, near uint64) error {
 	minAddr, maxAddr := as.p.userMin, as.p.userMax
+	// A site in the zone gets an island in the zone, at a guest address that
+	// maps to a stub address within reach. Every other site gets an island
+	// above the biased zone.
+	var shift uint64
+	switch {
+	case as.p.zone && inZoneStub(near):
+		shift = zoneBias
+		near -= shift
+		minAddr, maxAddr = zoneMin, zoneLimit
+	case as.p.zone:
+		minAddr = max(minAddr, zoneBias+zoneLimit)
+	}
 	var lastErr error
 	for try := 0; try < 128; try++ {
 		off := (uint64(rand.Int64N(islandReach-(4<<20))) + 2<<20) &^ (blockSize - 1)
@@ -634,12 +731,13 @@ func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager
 		if cand < minAddr || cand+blockSize > maxAddr {
 			continue
 		}
+		stubCand := cand + shift
 		as.mu.Lock()
-		if _, busy := as.reserved[cand]; busy || as.islands[cand] != nil || as.released {
+		if _, busy := as.reserved[stubCand]; busy || as.islands[stubCand] != nil || as.released {
 			as.mu.Unlock()
 			continue
 		}
-		as.reserved[cand] = struct{}{}
+		as.reserved[stubCand] = struct{}{}
 		as.mu.Unlock()
 
 		_, err := mm.MMap(ctx, memmap.MMapOpts{
@@ -655,12 +753,12 @@ func (as *addressSpace) newIsland(ctx context.Context, mm platform.MemoryManager
 		})
 		if err != nil {
 			as.mu.Lock()
-			delete(as.reserved, cand)
+			delete(as.reserved, stubCand)
 			as.mu.Unlock()
 			lastErr = err
 			continue
 		}
-		if err := as.installIsland(cand); err != nil {
+		if err := as.installIsland(stubCand); err != nil {
 			return err
 		}
 		return nil
@@ -702,7 +800,10 @@ func (as *addressSpace) inIsland(pc uint64) bool {
 
 // maxSlotSize bounds the byte size of a slot, so that a lookup by an address
 // inside a slot looks back a limited distance.
-const maxSlotSize = 16 + 4*x18MaxBody + 16 + 4
+const maxSlotSize = memSlotSize
+
+// The longest slot of the x18 classes must fit in maxSlotSize.
+var _ = [maxSlotSize - (16 + 4*x18MaxBody + 16 + 4)]struct{}{}
 
 // isTrap reports whether a slot kind parks the thread in the Sentry.
 func (k siteKind) isTrap() bool {
