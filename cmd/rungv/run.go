@@ -20,8 +20,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"z.gfire.dev/gvx/pkg/gvx"
@@ -182,6 +184,13 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 	var memoryFlag string
 	alias([]string{"m", "memory"}, func(n string) { fs.StringVar(&memoryFlag, n, "", "Memory limit, such as 512m or 1g") })
 	cpusFlag := fs.String("cpus", "", "CPU quota, such as 1.5")
+	readOnlyRootFlag := fs.Bool("read-only", false, "Mount the root file system of the guest read-only")
+	var volumeFlags, mountFlags, tmpfsFlags listFlag
+	alias([]string{"v", "volume"}, func(n string) {
+		fs.Var(&volumeFlags, n, "Mount a host directory or a named volume: src:dst[:ro|rw]")
+	})
+	fs.Var(&mountFlags, "mount", "Mount with Docker syntax: type=bind|volume|tmpfs,src=...,dst=...,readonly")
+	fs.Var(&tmpfsFlags, "tmpfs", "Mount a tmpfs: /path[:size=64m,ro]")
 
 	var portSpecs multiStringFlag
 	alias([]string{"p", "publish"}, func(n string) {
@@ -251,6 +260,29 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		}
 	}
 
+	var mounts []gvx.Mount
+	for _, spec := range volumeFlags {
+		m, err := gvx.ParseVolume(spec)
+		if err != nil {
+			return usageError("-v: %v", err)
+		}
+		mounts = append(mounts, m)
+	}
+	for _, spec := range mountFlags {
+		m, err := gvx.ParseMount(spec)
+		if err != nil {
+			return usageError("--mount: %v", err)
+		}
+		mounts = append(mounts, m)
+	}
+	for _, spec := range tmpfsFlags {
+		m, err := gvx.ParseTmpfs(spec)
+		if err != nil {
+			return usageError("--tmpfs: %v", err)
+		}
+		mounts = append(mounts, m)
+	}
+
 	var resources gvx.Resources
 	if memoryFlag != "" {
 		n, err := gvx.ParseMemory(memoryFlag)
@@ -299,6 +331,8 @@ func parseRunArgs(args []string, stdin io.Reader, stdout, stderr io.Writer) (rc 
 		BinaryPath:          binPath,
 		WorkspacePath:       strings.TrimSpace(*workspaceFlag),
 		WorkspaceReadOnly:   *readOnlyFlag,
+		Mounts:              mounts,
+		ReadOnlyRoot:        *readOnlyRootFlag,
 		WorkDir:             strings.TrimSpace(workDirFlag),
 		Envv:                envv,
 		User:                strings.TrimSpace(userFlag),
@@ -364,8 +398,16 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	if rc.cfg.DisableHostLockdown {
 		_, _ = fmt.Fprintln(stderr, "rungv: warning: host lockdown disabled")
 	}
+	reportPublishedPorts(stderr, sb)
+	if rc.cfg.Resources.CPUMillis > 0 && !sb.Limits().CPUTime {
+		_, _ = fmt.Fprintf(stderr, "rungv: warning: --cpus sets the number of CPUs that the guest sees; this host does not cap the CPU time\n")
+	}
 
 	exitCode, err = sb.Run(ctx)
+	if errors.Is(err, gvx.ErrMemoryLimit) {
+		_, _ = fmt.Fprintf(stderr, "rungv: the guest was killed: it passed the memory limit of %d bytes\n", rc.cfg.Resources.MemoryBytes)
+		return exitCode
+	}
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "rungv run: %v\n", err)
 		if exitCode == 0 {
@@ -374,6 +416,14 @@ func runSubcommand(ctx context.Context, args []string, stdin io.Reader, stdout, 
 		return exitCode
 	}
 	return exitCode
+}
+
+// reportPublishedPorts tells the user which host port serves each guest port,
+// because a free port that the host picked is not known to the user.
+func reportPublishedPorts(w io.Writer, sb *gvx.Sandbox) {
+	for _, p := range sb.PublishedPorts() {
+		_, _ = fmt.Fprintf(w, "rungv: publishing %s -> %d/%s\n", net.JoinHostPort(p.HostAddr, strconv.Itoa(int(p.HostPort))), p.GuestPort, p.Protocol)
+	}
 }
 
 func isHostELFFile(p string) bool {

@@ -64,6 +64,11 @@ type Options struct {
 	// Ignored when AllowOutboundNet is true.
 	OutboundUDPPorts []uint16
 
+	// CPUQuotaMillis caps the CPU time of the process, in thousandths of a CPU.
+	// Zero means no cap. Only Windows enforces it, with a hard cap on the
+	// containment job. Status.CPUQuotaEnforced reports whether Apply did.
+	CPUQuotaMillis int64
+
 	// InstallSyscallFilter installs the seccomp program of the embedder. Only
 	// Linux uses it, and Apply fails there when it is nil. The caller builds the
 	// program, because the allowlist depends on the Sentry platform, which this
@@ -93,6 +98,11 @@ type Status struct {
 	// absolute path opened through such a descriptor still reaches the host
 	// root, so the field stays false.
 	UnboundFileOpenBlocked bool
+
+	// CPUQuotaEnforced reports that the OS caps the CPU time of the process at
+	// Options.CPUQuotaMillis. It is false when the option is zero and on a host
+	// OS that has no such cap. Windows reads the cap back from the job.
+	CPUQuotaEnforced bool
 
 	// IntegrityDowngraded reports a Low integrity primary token. Windows only.
 	IntegrityDowngraded bool
@@ -169,4 +179,13 @@ func validateMounts(mounts []HostMount) error {
 // IsLockedDown reports whether Apply has succeeded in the current process.
 func IsLockedDown() bool {
 	return lockedDownFlag.Load()
+}
+
+// jobCPURate converts a CPU quota in thousandths of a CPU into the CpuRate of a
+// Windows job object: hundredths of a percent of the total CPU time of the
+// host, from 1 to 10000. A quota above the host capacity gives 10000.
+func jobCPURate(quotaMillis int64, hostCPUs int) uint32 {
+	hostCPUs = max(1, hostCPUs)
+	rate := quotaMillis * 10000 / (int64(hostCPUs) * 1000)
+	return uint32(min(10000, max(1, rate)))
 }

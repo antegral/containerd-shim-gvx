@@ -15,6 +15,7 @@
 package gvx
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	gvcontext "z.gfire.dev/gvx/pkg/context"
@@ -374,10 +376,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		Timekeeper:           tk,
 		RootUserNamespace:    creds.UserNamespace,
 		RootNetworkNamespace: rootNetNS,
-		ApplicationCores:     uint(maxCPUs),
+		ApplicationCores:     uint(guestCPUs(s.cfg.Resources.CPUMillis, maxCPUs)),
 		Vdso:                 vdso,
 		VdsoParams:           vdsoParams,
-		RootUTSNamespace:     kernel.NewUTSNamespace("gvx", "localdomain", creds.UserNamespace),
+		RootUTSNamespace:     kernel.NewUTSNamespace(s.hostname(), "localdomain", creds.UserNamespace),
 		RootIPCNamespace:     kernel.NewIPCNamespace(creds.UserNamespace),
 		RootPIDNamespace:     kernel.NewRootPIDNamespace(creds.UserNamespace),
 		MaxFDLimit:           kernel.MaxFdLimit,
@@ -424,6 +426,10 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err != nil {
 		return 1, err
 	}
+	user, procCreds, err := s.guestUser(sctxWithRoot, vfsObj, creds, root)
+	if err != nil {
+		return 1, err
+	}
 
 	fdTable := k.NewFDTable()
 	defer fdTable.DecRef(sctx)
@@ -458,14 +464,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		workDir = "/"
 	}
 
-	envv := s.cfg.Envv
-	if len(envv) == 0 {
-		envv = []string{
-			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-			"HOME=/root",
-			"TERM=xterm",
-		}
-	}
+	envv := finalizeEnv(s.cfg.Envv, guestEnvDefaults{Home: user.Home, Hostname: s.hostname(), TTY: tty != nil})
 
 	mntns.IncRef()
 	procArgs := kernel.CreateProcessArgs{
@@ -473,7 +472,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		Argv:                 argv,
 		Envv:                 envv,
 		WorkingDirectory:     workDir,
-		Credentials:          creds,
+		Credentials:          procCreds,
 		FDTable:              fdTable,
 		MountNamespace:       mntns,
 		Umask:                0o022,
@@ -482,7 +481,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		UTSNamespace:         k.RootUTSNamespace(),
 		IPCNamespace:         k.RootIPCNamespace(),
 		Origin:               kernel.OriginExec,
-		ContainerID:          "gvx-default",
+		ContainerID:          cmp.Or(s.cfg.Name, "gvx-default"),
 		PIDNamespace:         k.RootPIDNamespace(),
 	}
 
@@ -504,12 +503,43 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 		}
 	}()
 
+	var memoryExceeded atomic.Bool
+	if limit := s.cfg.Resources.MemoryBytes; limit > 0 {
+		guard := memoryGuard{
+			limit: uint64(limit),
+			// The accounting counts a committed page only after a scan of the
+			// memory file. UpdateUsage limits its own scan rate.
+			used: func() uint64 {
+				_ = mf.UpdateUsage(nil)
+				return usage.MemoryAccounting.Total()
+			},
+			interval: memoryPollInterval,
+			kill: func() {
+				memoryExceeded.Store(true)
+				_ = k.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
+			},
+		}
+		guardCtx, stopGuard := context.WithCancel(ctx)
+		guardDone := make(chan struct{})
+		go func() {
+			defer close(guardDone)
+			guard.run(guardCtx)
+		}()
+		defer func() {
+			stopGuard()
+			<-guardDone
+		}()
+	}
+
 	k.WaitExited()
 	close(doneCh)
 	k.Pause()
 
 	if ctx.Err() != nil {
 		return 1, ctx.Err()
+	}
+	if memoryExceeded.Load() {
+		return 137, ErrMemoryLimit
 	}
 
 	ws := tg.ExitStatus()
@@ -582,6 +612,14 @@ func (s *Sandbox) buildKernelRootMountNamespace(sctx gvcontext.Context, vfsObj *
 }
 
 func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, root vfs.VirtualDentry) error {
+	// The tmpfs that holds the writes of the guest has the mode 01777, and the
+	// overlay shows it as the mode of "/". A guest user that is not root could
+	// then create files in "/". Images use the mode 0755 for "/".
+	if err := vfsObj.SetStatAt(sctx, creds, &vfs.PathOperation{Root: root, Start: root, Path: makeFPath("/")}, &vfs.SetStatOptions{
+		Stat: linux.Statx{Mask: linux.STATX_MODE, Mode: 0o755},
+	}); err != nil {
+		return fmt.Errorf("gvx: set the mode of the guest root: %w", err)
+	}
 	for _, dir := range []string{"/proc", "/sys", "/dev", "/etc", "/root", "/workspace", "/bin", "/usr/bin"} {
 		if err := vfsEnsureDirAll(sctx, vfsObj, creds, root, dir, 0o755); err != nil {
 			return fmt.Errorf("gvx: create guest directory %s: %w", dir, err)
@@ -641,6 +679,10 @@ func (s *Sandbox) setupKernelSubmountsAndFiles(sctx gvcontext.Context, vfsObj *v
 		if err := ensureGuestFileIfAbsent(sctx, vfsObj, creds, root, f.path, []byte(f.data), 0o644); err != nil {
 			return fmt.Errorf("gvx: create guest file %s: %w", f.path, err)
 		}
+	}
+
+	if err := s.writeGuestHostFiles(sctx, vfsObj, creds, root); err != nil {
+		return err
 	}
 
 	// s.mounts is ordered by increasing path depth, so a mount point below

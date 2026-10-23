@@ -91,11 +91,12 @@ func applyOSLockdown(opts Options) (st Status, err error) {
 	st.UnboundFileOpenBlocked = true
 
 	// Steps 5 to 7: containment job.
-	job, err := createContainmentJob()
+	job, err := createContainmentJob(opts.CPUQuotaMillis)
 	if err != nil {
 		return Status{}, err
 	}
 	st.SubprocessBlocked = true
+	st.CPUQuotaEnforced = opts.CPUQuotaMillis > 0
 
 	// Step 8: disallow win32k system calls.
 	if err := disableWin32kSystemCalls(); err != nil {

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -293,7 +294,11 @@ func TestApplyLockdownWindows(t *testing.T) {
 }
 
 func runLockedChild(mode string) error {
-	if mode != "files" {
+	switch mode {
+	case "files":
+	case "cpu":
+		return runCPUChild()
+	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
 	ws, outside := os.Getenv(childWSEnv), os.Getenv(childOutEnv)
@@ -363,4 +368,35 @@ func runLockedChild(mode string) error {
 		errs = append(errs, errors.New("cmd.exe ran after Apply"))
 	}
 	return errors.Join(errs...)
+}
+
+// TestApplyCapsTheCPUTimeOfTheJob proves that the lockdown puts the hard CPU cap
+// on the job of the process, by reading the cap back in the locked child.
+func TestApplyCapsTheCPUTimeOfTheJob(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), childModeEnv+"=cpu")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("lockdown child failed: %v\n%s", err, out)
+	}
+}
+
+func runCPUChild() error {
+	const quota = 500
+	st, err := Apply(Options{CPUQuotaMillis: quota})
+	if err != nil {
+		return fmt.Errorf("Apply: %w", err)
+	}
+	if !st.CPUQuotaEnforced {
+		return fmt.Errorf("status = %+v, want CPUQuotaEnforced", st)
+	}
+	// A NULL job handle names the job of the calling process.
+	var got jobCPURateControl
+	if err := queryJobInformation(0, jobObjectCPURateControlInformation, unsafe.Pointer(&got), unsafe.Sizeof(got)); err != nil {
+		return fmt.Errorf("QueryInformationJobObject: %w", err)
+	}
+	want := jobCPURate(quota, runtime.NumCPU())
+	if got.CPURate != want || got.ControlFlags&jobCPURateControlHardCap == 0 {
+		return fmt.Errorf("job CPU cap = %+v, want a hard cap with rate %d", got, want)
+	}
+	return nil
 }
