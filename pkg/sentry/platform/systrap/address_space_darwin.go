@@ -271,19 +271,42 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 }
 
 // mapRangeLocked installs [va, va+n) from the Sentry address src.
+//
+// An island lives in a sealed VMA that the memory manager populates like any
+// other mapping. The island keeps its own private page, so the frame of the VMA
+// stays unused and the range skips the block of every island, including an
+// island that the memory manager still populates. The memory manager can hand
+// over a range that spans an island when it maps a whole map unit of one
+// pma. The sealed VMA protects the island, so no mapping can replace it.
 func (as *addressSpace) mapRangeLocked(va, n, src uint64, at hostarch.AccessType) error {
-	if _, pending := as.reserved[va]; pending && n == blockSize {
-		// The memory manager populates the island VMA while mm.MMap runs.
-		return nil
-	}
-	if isl := as.islandOverlapLocked(va, n); isl != nil {
-		// An island lives in a sealed VMA that the memory manager populates
-		// like any other mapping. The island keeps its own private page, so the
-		// frame of the VMA stays unused.
-		if va == isl.base && n == blockSize {
-			return nil
+	runStart := va
+	for base := va; base < va+n; base += blockSize {
+		if !as.isIslandBlockLocked(base) {
+			continue
 		}
-		return fmt.Errorf("mapping [%#x, %#x) overlaps the trampoline island at %#x", va, va+n, isl.base)
+		if err := as.mapRunLocked(runStart, base-runStart, src+(runStart-va), at); err != nil {
+			return err
+		}
+		runStart = base + blockSize
+	}
+	return as.mapRunLocked(runStart, va+n-runStart, src+(runStart-va), at)
+}
+
+// isIslandBlockLocked reports whether the block at base holds an island or
+// will hold one when the pending mapping of its VMA completes.
+func (as *addressSpace) isIslandBlockLocked(base uint64) bool {
+	if _, pending := as.reserved[base]; pending {
+		return true
+	}
+	_, ok := as.islands[base]
+	return ok
+}
+
+// mapRunLocked installs [va, va+n), a range without an island, from the Sentry
+// address src.
+func (as *addressSpace) mapRunLocked(va, n, src uint64, at hostarch.AccessType) error {
+	if n == 0 {
+		return nil
 	}
 	if err := as.mapPages(va, n, src, stubProt(at)); err != nil {
 		return fmt.Errorf("map [%#x, %#x): %w", va, va+n, err)
@@ -308,18 +331,6 @@ func (as *addressSpace) dropBlockLocked(base uint64) {
 		}
 		delete(as.blocks, base)
 	}
-}
-
-func (as *addressSpace) islandOverlapLocked(va, n uint64) *island {
-	if len(as.islands) == 0 {
-		return nil
-	}
-	for base, isl := range as.islands {
-		if base < va+n && va < base+blockSize {
-			return isl
-		}
-	}
-	return nil
 }
 
 // Unmap implements platform.AddressSpace.Unmap. A range that is not host page

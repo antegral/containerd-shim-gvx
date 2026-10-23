@@ -200,8 +200,10 @@ func (p *Platform) Close() error {
 // memory file only.
 func (*Platform) SupportsAddressSpaceIO() bool { return false }
 
-// MapUnit implements platform.Platform.MapUnit.
-func (*Platform) MapUnit() uint64 { return blockSize }
+// MapUnit implements platform.Platform.MapUnit. MapFile maps a whole range with
+// one remap and one protection call, so a fault maps up to 256KB of its pma at
+// once. A larger unit would map pages that the guest never touches.
+func (*Platform) MapUnit() uint64 { return mapUnit }
 
 // MinUserAddress implements platform.Platform.MinUserAddress. In zone mode the
 // guest range starts at the bottom of the zone, where a fixed-address
@@ -264,3 +266,6 @@ func (*Platform) SeccompInfo() platform.SeccompInfo {
 // ConcurrencyCount implements platform.Platform.ConcurrencyCount. Each guest
 // thread has its own host thread, so the platform never makes Switch wait.
 func (*Platform) ConcurrencyCount() int { return math.MaxInt }
+
+// mapUnit is the alignment that the memory manager uses to widen a fault.
+const mapUnit = 256 << 10

@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -760,6 +762,51 @@ func TestStoreFromAnotherBlockStillSucceeds(t *testing.T) {
 	mustSyscall(t, si, err, 9, r.ac)
 	if got := r.regs().Regs[0]; got != 0x55 {
 		t.Errorf("the load returned %#x, want 0x55", got)
+	}
+}
+
+func TestMapFileOverAnIslandSkipsTheIsland(t *testing.T) {
+	// A map unit of 256KB lets the memory manager hand over one pma that
+	// spans the block of an island. The range must not replace the island, or
+	// the next system call of the guest would jump into the new frame.
+	p := newPlatform(t)
+	r := newRig(t, p)
+	r.program(movz(8, 9), insnSVC0, movz(8, 10), insnSVC0)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	var island uint64
+	r.as.mu.Lock()
+	for base := range r.as.islands {
+		island = base
+	}
+	r.as.mu.Unlock()
+	if island == 0 {
+		t.Fatal("the first system call created no island")
+	}
+	fr, err := r.mf.Allocate(4*blockSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	if err := r.as.MapFile(hostarch.Addr(island-blockSize), r.mf, fr, hostarch.ReadWrite, false); err != nil {
+		t.Fatalf("MapFile over an island: %v", err)
+	}
+	// The stub fetches the slots through its own mapping of the island. Map
+	// that view into the Sentry and compare it with the page that holds the
+	// slots. A hot resume does not prove anything here, because the Sentry
+	// recovers a fault on the tail of a trap slot.
+	view, err := vmRemapFrom(r.as.proc.task, island, blockSize)
+	if err != nil {
+		t.Fatalf("map the island of the stub task: %v", err)
+	}
+	defer vmDeallocate(selfTask(), view, blockSize)
+	r.as.mu.Lock()
+	want := pageBytes(r.as.islands[island].page)
+	r.as.mu.Unlock()
+	if got := unsafe.Slice((*byte)(addrPtr(view)), blockSize); !bytes.Equal(got, want) {
+		t.Error("the stub sees other bytes in the island after MapFile covered it, so the range replaced the island")
+	}
+	if _, ok, err := vmRegion(r.as.proc.task, island-blockSize); err != nil || !ok {
+		t.Errorf("vmRegion below the island = (%v, %v), want a mapping of the new frame", ok, err)
 	}
 }
 
