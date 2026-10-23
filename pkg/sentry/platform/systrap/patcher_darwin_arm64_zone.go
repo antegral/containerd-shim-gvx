@@ -109,16 +109,24 @@ type memAccess struct {
 // fixesValue reports whether the slot must replace a stored register.
 func (a memAccess) fixesValue() bool { return a.storeFirst || a.storeSecond }
 
-// classifyMemAccess decodes a load or store instruction. It returns false for
-// every instruction that no slot covers. Examples are a literal load, an
-// access through the stack pointer, and a form whose registers collide with
-// the base.
+// classifyMemAccess decodes a load, a store, or a cache maintenance
+// instruction by address. It returns false for every instruction that no slot
+// covers. Examples are a literal load, an access through the stack pointer,
+// and a form whose registers collide with the base.
 func classifyMemAccess(insn uint32) (memAccess, bool) {
 	rn := uint8(insn >> 5 & 31)
 	rt := uint8(insn & 31)
 	rt2 := uint8(insn >> 10 & 31)
 	rm := uint8(insn >> 16 & 31)
 	acc := memAccess{base: rn, index: 31}
+	if isCacheMaintenanceByAddress(insn) {
+		// The address register is Rt. Rt 31 is the zero register, which names
+		// no address.
+		if rt == 31 {
+			return acc, false
+		}
+		return memAccess{base: rt, index: 31}, true
+	}
 	if rn == 31 {
 		return acc, false
 	}
@@ -189,6 +197,26 @@ func classifyMemAccess(insn uint32) (memAccess, bool) {
 	return acc, true
 }
 
+// isCacheMaintenanceByAddress reports whether insn is a system instruction
+// that names an address in Rt: DC ZVA, DC IVAC, DC CVAC, DC CVAU, DC CVAP,
+// DC CVADP, DC CIVAC, and IC IVAU. Such an instruction faults on an address
+// that is not mapped, like a store does. The forms by set and way name no
+// address, and they are not in the list.
+func isCacheMaintenanceByAddress(insn uint32) bool {
+	switch insn &^ 31 {
+	case 0xd50b7420, // dc zva
+		0xd5087620, // dc ivac
+		0xd50b7a20, // dc cvac
+		0xd50b7b20, // dc cvau
+		0xd50b7c20, // dc cvap
+		0xd50b7d20, // dc cvadp
+		0xd50b7e20, // dc civac
+		0xd50b7520: // ic ivau
+		return true
+	}
+	return false
+}
+
 // classifySingle sets the collision flags of a single-register access. A
 // vector register never collides with the base.
 func (a *memAccess) classifySingle(insn, v uint32, rt, rn uint8) {
@@ -202,9 +230,13 @@ func (a *memAccess) classifySingle(insn, v uint32, rt, rn uint8) {
 	}
 }
 
-func encodeBiasTBNZ(rt uint8, delta int) uint32 {
-	return 0xb7000000 | 14<<19 | uint32(delta/4)&0x3fff<<5 | uint32(rt)
+// encodeTBNZ returns tbnz xt, #bit with a branch of delta bytes. The bit
+// number must be 32 or more, which is the case for every bit that a slot tests.
+func encodeTBNZ(rt uint8, bit uint, delta int) uint32 {
+	return 0x37000000 | 1<<31 | uint32(bit-32)<<19 | uint32(delta/4)&0x3fff<<5 | uint32(rt)
 }
+
+func encodeBiasTBNZ(rt uint8, delta int) uint32 { return encodeTBNZ(rt, zoneBiasBit, delta) }
 
 func encodeBiasOrr(rd, rn uint8) uint32      { return zoneBiasOrr | uint32(rn)<<5 | uint32(rd) }
 func encodeBiasAnd(rd, rn uint8) uint32      { return zoneBiasAnd | uint32(rn)<<5 | uint32(rd) }
@@ -217,18 +249,21 @@ func encodeMovK(rd uint8, imm uint64, shift uint) uint32 {
 // returns the byte size of the slot and the word index of the biased copy of
 // the instruction.
 //
-// The biased path tests the bias bit of the base register and, for the
-// register offset form, of the index register. A set bit leads to the plain
-// copy of the instruction. A clear bit means the guest holds a pointer of the
-// zone, so the slot adds the bias, runs the instruction, and removes it.
+// The biased path tests the bias bit of the base register. A set bit leads to
+// the plain copy of the instruction. A clear bit means the guest holds a
+// pointer of the zone, so the slot adds the bias, runs the instruction, and
+// removes it. In the register offset form the index can hold the pointer or an
+// offset. A negative index is an offset, so only the base decides. Another
+// index with the bias bit set is a pointer outside the zone, and the plain copy
+// runs.
 func encodeMemSlot(buf []byte, slotVA, site uint64, insn uint32, acc memAccess) (size, body int, err error) {
-	var w []uint32
-	tests := []int{len(w)}
-	w = append(w, 0)
+	// The first words test the registers. One word tests the base register.
+	// The register offset form has two more words that test the index.
+	tests := 1
 	if acc.hasIndex {
-		tests = append(tests, len(w))
-		w = append(w, 0)
+		tests = 3
 	}
+	w := make([]uint32, tests, memSlotSize/4)
 	biased := insn
 	if acc.fixesValue() {
 		w = append(w, arm64STPx16x17)
@@ -265,12 +300,14 @@ func encodeMemSlot(buf []byte, slotVA, site uint64, insn uint32, acc memAccess) 
 	if len(w)*4 > memSlotSize || len(buf) < memSlotSize {
 		return 0, 0, fmt.Errorf("memory slot has %d words in a buffer of %d bytes", len(w), len(buf))
 	}
-	for k, i := range tests {
-		reg := acc.base
-		if k == 1 {
-			reg = acc.index
-		}
-		w[i] = encodeBiasTBNZ(reg, (plain-i)*4)
+	// The tests lie at the start of the slot. In the register offset form the
+	// first test skips the test of the index when the index is negative.
+	if acc.hasIndex {
+		w[0] = encodeTBNZ(acc.index, 63, 2*4)
+		w[1] = encodeTBNZ(acc.index, zoneBiasBit, (plain-1)*4)
+		w[2] = encodeTBNZ(acc.base, zoneBiasBit, (plain-2)*4)
+	} else {
+		w[0] = encodeTBNZ(acc.base, zoneBiasBit, plain*4)
 	}
 	for len(w)*4 < memSlotSize {
 		w = append(w, arm64NOP)

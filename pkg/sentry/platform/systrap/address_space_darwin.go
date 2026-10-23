@@ -113,6 +113,10 @@ type addressSpace struct {
 	// zoneMapped holds the stub address of every block that the guest maps in
 	// the zone. It is empty outside the zone mode.
 	zoneMapped map[uint64]struct{}
+	// zoneImageDone records that the first block of the zone prepared the
+	// image, and goText bounds the code of a Go image as guest addresses.
+	zoneImageDone bool
+	goText        [2]uint64
 	// reserved holds island addresses that a pending mm.MMap call creates.
 	reserved map[uint64]struct{}
 	threads  map[*thread]struct{}
@@ -446,6 +450,9 @@ func (as *addressSpace) patchBlock(ctx context.Context, mm platform.MemoryManage
 	as.patchMu.Lock()
 	defer as.patchMu.Unlock()
 	base := blockRound(addr)
+	if as.p.zone && inZoneStub(base) {
+		as.prepareZoneImage(ctx, mm, base)
+	}
 	for attempt := 0; attempt < 4; attempt++ {
 		err := as.patchBlockOnce(ctx, mm, base)
 		if !errors.Is(err, errPatchRaced) {
@@ -555,6 +562,12 @@ func (as *addressSpace) patchBlockOnce(ctx context.Context, mm platform.MemoryMa
 			taken[int(it.Offset)] = struct{}{}
 		}
 		for _, z := range scanZone(copyBuf, base, func(off int) bool { _, t := taken[off]; return t }) {
+			if z.kind == siteAdrp && as.isGoCode(z.value) {
+				// The Go runtime compares a function address with the code range
+				// of its module data, and the zone mode biased that range. An
+				// adr or adrp that yields a code address keeps the biased value.
+				continue
+			}
 			site := base + uint64(z.offset)
 			size := adrpSlotSize
 			switch {

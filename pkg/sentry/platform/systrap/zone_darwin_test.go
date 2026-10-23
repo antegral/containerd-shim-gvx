@@ -203,6 +203,58 @@ func TestZoneAccessThroughAnX18SlotBody(t *testing.T) {
 	}
 }
 
+func TestZoneCacheMaintenanceThroughGuestPointers(t *testing.T) {
+	// memset of musl zeroes a large block with dc zva, and a code generator
+	// cleans the data cache and invalidates the instruction cache by address.
+	// Each instruction names a guest pointer of the zone, so each faults at
+	// its first run and needs a slot.
+	r := newZoneRig(t)
+	r.zoneProgram(zoneCode, append(loadAddr(1, zoneData+0x400),
+		0xd50b7421, // dc zva, x1
+		0xd50b7b21, // dc cvau, x1
+		0xd50b7521, // ic ivau, x1
+		0xd5033b9f, // dsb ish
+		0xd5033fdf, // isb
+		movz(8, 9), insnSVC0)...)
+	mem := r.mapPage(zoneData, readWrite)
+	for i := range mem {
+		mem[i] = 0xff
+	}
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	if got := get64(mem, 0x400); got != 0 {
+		t.Errorf("word at the zeroed address = %#x, want 0", got)
+	}
+	if got := get64(mem, 0x2000); got != ^uint64(0) {
+		t.Errorf("word far from the zeroed block = %#x, want it unchanged", got)
+	}
+	if got := r.regs().Regs[1]; got != zoneData+0x400 {
+		t.Errorf("x1 = %#x after the instructions, want the guest address %#x", got, zoneData+0x400)
+	}
+}
+
+func TestZoneRegisterOffsetAcceptsANegativeIndex(t *testing.T) {
+	// A negative index sets the bias bit, like a pointer outside the zone does.
+	// The slot must still treat the base as the pointer of the zone. The
+	// dynamic linker of musl runs ldr x0, [x0, x2] with a negative x2 when it
+	// walks back from a pointer to the header of a chunk.
+	r := newZoneRig(t)
+	r.zoneProgram(zoneCode, append(loadAddr(0, zoneData+0x40),
+		0x928001e2, // mov x2, #-16
+		0xf8626803, // ldr x3, [x0, x2]
+		0xf8626800, // ldr x0, [x0, x2]
+		movz(8, 9), insnSVC0)...)
+	mem := r.mapPage(zoneData, readWrite)
+	put64(mem, 0x30, 0x1111)
+	put64(mem, 0x40, 0x2222)
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	x := &r.regs().Regs
+	if x[3] != 0x1111 || x[0] != 0x1111 {
+		t.Errorf("x3, x0 = %#x, %#x, want 0x1111 from the address 16 bytes below the base", x[3], x[0])
+	}
+}
+
 func TestUnmapAcrossTheHoleKeepsTheBiasedZone(t *testing.T) {
 	// The memory manager unmaps a range that starts in the zone and ends near
 	// the top of the address range. The biased zone lies inside that range as

@@ -127,6 +127,9 @@ type rig struct {
 
 func newPlatform(t testing.TB) *Platform {
 	t.Helper()
+	// A developer can export the variable of the zone mode in a shell. The
+	// tests of the default mode must not see it.
+	t.Setenv(ZoneEnv, "")
 	p, err := New()
 	if err != nil {
 		t.Fatalf("New: %v", err)
