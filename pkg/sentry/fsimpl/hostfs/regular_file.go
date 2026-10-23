@@ -211,8 +211,8 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if err := fd.dentry.inode.data.flushRange(uint64(offset), end); err != nil {
 		return 0, translateHostError(err)
 	}
-	r := io.NewSectionReader(fd.h.f, offset, math.MaxInt64-offset)
-	read, err := dst.CopyOutFrom(ctx, safemem.FromIOReader{Reader: r})
+	r := hostFileReader{f: fd.h.f, off: offset}
+	read, err := dst.CopyOutFrom(ctx, &r)
 	switch {
 	case err == nil:
 		return read, nil
@@ -224,6 +224,48 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	default:
 		return read, translateHostError(err)
 	}
+}
+
+// hostFileReader reads a host file at an offset straight into the blocks of a
+// destination. It replaces io.NewSectionReader and safemem.FromIOReader, which
+// together allocate two objects for each read.
+type hostFileReader struct {
+	f   *os.File
+	off int64
+}
+
+// ReadToBlocks implements safemem.Reader.ReadToBlocks. A short read returns
+// the error of ReadAt, which is io.EOF at the end of the file.
+func (r *hostFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
+	var done uint64
+	var scratch []byte
+	for ; !dsts.IsEmpty(); dsts = dsts.Tail() {
+		dst := dsts.Head()
+		var n int
+		var err error
+		if !dst.NeedSafecopy() {
+			n, err = r.f.ReadAt(dst.ToSlice(), r.off)
+		} else {
+			// ReadAt cannot write to memory that faults, so it reads into a
+			// scratch buffer first.
+			if len(scratch) < dst.Len() {
+				scratch = make([]byte, dst.Len())
+			}
+			var rn int
+			rn, err = r.f.ReadAt(scratch[:dst.Len()], r.off)
+			var werr error
+			n, werr = safemem.Copy(dst, safemem.BlockFromSafeSlice(scratch[:rn]))
+			if werr != nil {
+				err = werr
+			}
+		}
+		r.off += int64(n)
+		done += uint64(n)
+		if n != dst.Len() {
+			return done, err
+		}
+	}
+	return done, nil
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
