@@ -426,6 +426,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 	if err != nil {
 		return 1, err
 	}
+	readGuest := func(path string, maxBytes int) ([]byte, error) {
+		return readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
+	}
+	if err := s.checkELFLayout(readGuest, execPath, hostarch.PageSize); err != nil {
+		return 1, err
+	}
 	user, procCreds, err := s.guestUser(sctxWithRoot, vfsObj, creds, root)
 	if err != nil {
 		return 1, err
@@ -487,10 +493,7 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	tg, _, err := k.CreateProcess(procArgs)
 	if err != nil {
-		read := func(path string, maxBytes int) ([]byte, error) {
-			return readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
-		}
-		if hint := s.nonPIEHintForGuestFile(read, execPath); hint != "" {
+		if hint := s.nonPIEHintForGuestFile(readGuest, execPath); hint != "" {
 			err = fmt.Errorf("%w; %s", err, hint)
 		}
 		return 1, fmt.Errorf("gvx: create guest process %q: %w", execPath, err)

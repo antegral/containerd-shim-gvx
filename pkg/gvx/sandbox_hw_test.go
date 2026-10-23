@@ -19,6 +19,8 @@ package gvx
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -32,6 +34,7 @@ import (
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
+	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 // hostTestConfig returns a Config for in-process tests. The default host
@@ -475,5 +478,48 @@ func TestSandboxStartsStaticExecutablesAtLowAddresses(t *testing.T) {
 				t.Errorf("error %q does not name the cause and the engine that works", msg)
 			}
 		})
+	}
+}
+
+// TestSandboxRefusesAnExecutableThatThePageSizeCannotMap starts an executable
+// with a segment that is not congruent modulo the guest page size. The 4KB
+// build runs such a file, so the test needs a build with larger guest pages.
+// The run must fail before the guest starts, and the error must name the
+// segment.
+func TestSandboxRefusesAnExecutableThatThePageSizeCannotMap(t *testing.T) {
+	if hostarch.PageSize <= basePageSize {
+		t.Skip("the layout check runs only with guest pages above 4KB")
+	}
+	systraptest.Require(t)
+	elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, systrapBase(), 0, "must-not-run\n")
+	if err != nil {
+		t.Fatalf("BuildGuestELF64At failed: %v", err)
+	}
+	// The first program header starts right behind the 64-byte ELF header.
+	const vaddrField = elfHeaderSize + 16
+	binary.LittleEndian.PutUint64(elf[vaddrField:], binary.LittleEndian.Uint64(elf[vaddrField:])+basePageSize)
+	if elfLayoutProblem(elf, hostarch.PageSize) == "" {
+		t.Fatal("the test file has no layout problem; fix the file")
+	}
+	cfg := hostTestConfig(t)
+	cfg.Platform = PlatformSystrap
+	cfg.ELFBytes = elf
+	var outBuf bytes.Buffer
+	cfg.Stdout = &outBuf
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New(systrap) failed: %v", err)
+	}
+	defer func() {
+		if err := sb.Close(); err != nil {
+			t.Errorf("Close() failed: %v", err)
+		}
+	}()
+	_, err = sb.Run(context.Background())
+	if !errors.Is(err, ErrUnsupportedELFLayout) || !strings.Contains(err.Error(), "program header 0") {
+		t.Errorf("Run() error = %v, want ErrUnsupportedELFLayout that names program header 0", err)
+	}
+	if outBuf.Len() != 0 {
+		t.Errorf("stdout = %q, want no output because the guest must not start", outBuf.String())
 	}
 }

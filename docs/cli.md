@@ -73,6 +73,7 @@ The flag `-d` is refused with a message, because a run has no daemon.
 | `-registry-url URL` | Override the registry of the image reference. |
 | `-cache-dir DIR` | Select the layer cache directory. |
 | `-lockdown=false` | Skip the host lockdown. Use it only to debug. |
+| `-elf-check=false` | Start an executable although its segments do not fit the guest page size. Use it only to debug. |
 
 ## 4. Rules of `run`
 
@@ -161,6 +162,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
 | Executables that link at a fixed address (non-PIE) | The macOS `systrap` engine refuses them, and the error names `-platform=hvf`. `hvf`, `whpx`, and the Windows `systrap` engine run them. |
+| Executables with 4KB segment alignment | A build with `-tags pagesize_16k` has 16KB guest pages. `rungv` refuses an executable with a segment that is not congruent modulo 16KB. It also refuses one with a segment that shares a page with a segment of other permissions. The error names the program header. Relink with `-z max-page-size=16384`, use the build without the tag, or set `-elf-check=false`. The check reads the entry executable only. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
 
 ## 8. Examples

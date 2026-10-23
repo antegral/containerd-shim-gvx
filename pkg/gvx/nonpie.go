@@ -15,20 +15,8 @@
 package gvx
 
 import (
-	"encoding/binary"
 	"fmt"
 	"runtime"
-)
-
-// elfProbeBytes is the size of the file prefix that nonPIEHint reads. The
-// program headers of an executable lie right behind the ELF header.
-const elfProbeBytes = 16 << 10
-
-const (
-	elfHeaderSize  = 64
-	elfTypeExec    = 2
-	elfProgLoad    = 1
-	elfProgHdrSize = 56
 )
 
 // lowestLoadAddress returns the lowest address of a loadable segment of a
@@ -36,33 +24,15 @@ const (
 // It returns false for every other file, including a position-independent
 // executable, and for a header that the prefix cuts off.
 func lowestLoadAddress(header []byte) (uint64, bool) {
-	if len(header) < elfHeaderSize || string(header[:4]) != "\x7fELF" || header[4] != 2 || header[5] != 1 {
+	fileType, segments, ok := parseLoadSegments(header)
+	if !ok || fileType != elfTypeExec || len(segments) == 0 {
 		return 0, false
 	}
-	if binary.LittleEndian.Uint16(header[16:]) != elfTypeExec {
-		return 0, false
+	lowest := segments[0].vaddr
+	for _, seg := range segments[1:] {
+		lowest = min(lowest, seg.vaddr)
 	}
-	phoff := binary.LittleEndian.Uint64(header[32:])
-	phentsize := uint64(binary.LittleEndian.Uint16(header[54:]))
-	phnum := uint64(binary.LittleEndian.Uint16(header[56:]))
-	if phentsize < elfProgHdrSize {
-		return 0, false
-	}
-	lowest, found := uint64(0), false
-	for i := range phnum {
-		off := phoff + i*phentsize
-		if off+elfProgHdrSize > uint64(len(header)) {
-			return 0, false
-		}
-		ph := header[off : off+elfProgHdrSize]
-		if binary.LittleEndian.Uint32(ph[0:]) != elfProgLoad || binary.LittleEndian.Uint64(ph[40:]) == 0 {
-			continue
-		}
-		if vaddr := binary.LittleEndian.Uint64(ph[16:]); !found || vaddr < lowest {
-			lowest, found = vaddr, true
-		}
-	}
-	return lowest, found
+	return lowest, true
 }
 
 // hardwareEngine names the hardware engine of a host OS. It returns an empty
