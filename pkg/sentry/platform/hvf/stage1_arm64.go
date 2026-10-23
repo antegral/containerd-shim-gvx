@@ -14,12 +14,16 @@
 
 package hvf
 
-import "z.gfire.dev/gvx/pkg/hostarch"
+// userUpperStart is the first address of the TTBR1 range. The user tree
+// shares the root of the kernel tree for addresses from here up. TTBR0_EL1
+// translates every address below it.
+const userUpperStart uintptr = 0xffff_0000_0000_0000
 
-func makeTableDescriptor(gpa uint64) uint64 { return x86MakeTableDescriptor(gpa) }
-
-func tableDescriptorIPA(desc uint64) (uint64, bool) { return x86TableDescriptorGPA(desc) }
-
-func userLeafDescriptor(gpa uint64, at hostarch.AccessType) uint64 {
-	return x86UserLeafDescriptor(gpa, at)
+// RootIPA returns the guest physical address of the level-0 table for
+// TTBR0_EL1. The ASID is zero: the stub flushes the TLB on a table change.
+func (s *stage1Tables) RootIPA() uint64 {
+	return s.pt.TTBR0_EL1(false, 0)
 }
+
+// initPageTables prepares pkg/ring0/pagetables for the first tree.
+func initPageTables() {}

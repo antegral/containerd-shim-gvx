@@ -171,7 +171,7 @@ const x86SyscallFlagMask = 0x44700
 const preemptSlice = 10 * time.Millisecond
 
 type syncState struct {
-	pt  uint64 // GuestPageTable.id; zero means unknown.
+	pt  uint64 // stage1Tables.id; zero means unknown.
 	tlb uint64
 }
 
@@ -491,7 +491,7 @@ func (w *vcpuWorker) runSwitch(r *switchReq) (*linux.SignalInfo, hostarch.Access
 
 // begin prepares the vCPU for one Switch: address space, user state, and the
 // kernel-mode entry point.
-func (w *vcpuWorker) begin(pt *GuestPageTable, ac *arch.Context64) error {
+func (w *vcpuWorker) begin(pt *stage1Tables, ac *arch.Context64) error {
 	w.injected = false
 	if pt.dead.Load() {
 		return errPageTableReleased
@@ -528,7 +528,7 @@ func (w *vcpuWorker) begin(pt *GuestPageTable, ac *arch.Context64) error {
 
 // syncTLB invalidates the vCPU TLB when the table changed since the last
 // invalidation, and records the generation that the entry covers.
-func (w *vcpuWorker) syncTLB(pt *GuestPageTable) error {
+func (w *vcpuWorker) syncTLB(pt *stage1Tables) error {
 	tlb := pt.tlbGen.Load()
 	if w.synced.pt != pt.id || w.synced.tlb != tlb {
 		if err := hvInvalidateTLB(w.id); err != nil {
@@ -543,7 +543,7 @@ func (w *vcpuWorker) syncTLB(pt *GuestPageTable) error {
 
 // beginRun announces the entry to quiesce. It reports false when the table
 // changed after syncTLB.
-func (w *vcpuWorker) beginRun(pt *GuestPageTable) bool {
+func (w *vcpuWorker) beginRun(pt *stage1Tables) bool {
 	w.enterTLB.Store(w.entry.tlb)
 	w.inGuest.Store(true)
 	if pt.tlbGen.Load() != w.entry.tlb || pt.dead.Load() {
@@ -554,7 +554,7 @@ func (w *vcpuWorker) beginRun(pt *GuestPageTable) bool {
 }
 
 // runLoop enters the guest until an exit needs the Sentry.
-func (w *vcpuWorker) runLoop(r *switchReq, c *Context, pt *GuestPageTable, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (w *vcpuWorker) runLoop(r *switchReq, c *Context, pt *stage1Tables, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
 	for {
 		if w.quit.Load() {
 			return nil, hostarch.NoAccess, errPlatformClosed
@@ -624,7 +624,7 @@ func (w *vcpuWorker) exitReason() (uint64, error) {
 
 // dispatchExit decodes one exit. It reports done=false when the loop must
 // enter the guest again.
-func (w *vcpuWorker) dispatchExit(r *switchReq, c *Context, pt *GuestPageTable, ac *arch.Context64) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
+func (w *vcpuWorker) dispatchExit(r *switchReq, c *Context, pt *stage1Tables, ac *arch.Context64) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
 	reason, err := w.exitReason()
 	if err != nil {
 		w.invalidateState()
@@ -658,7 +658,7 @@ func (w *vcpuWorker) userMode() (bool, error) {
 }
 
 // onCancel resumes after a cancellation unless the Sentry needs the vCPU.
-func (w *vcpuWorker) onCancel(c *Context, pt *GuestPageTable) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
+func (w *vcpuWorker) onCancel(c *Context, pt *stage1Tables) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
 	pending := c.interrupted.Load()
 	quit := w.quit.Load()
 	if !pending && !quit {
@@ -705,7 +705,7 @@ func (w *vcpuWorker) onCancel(c *Context, pt *GuestPageTable) (bool, *linux.Sign
 }
 
 // onHLT decodes the HLT that ends the stub spill routine.
-func (w *vcpuWorker) onHLT(c *Context, pt *GuestPageTable, ac *arch.Context64) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
+func (w *vcpuWorker) onHLT(c *Context, pt *stage1Tables, ac *arch.Context64) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
 	rip, err := hvReadRegister(w.id, hvX86RIP)
 	if err != nil {
 		w.invalidateState()

@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 	"z.gfire.dev/gvx/pkg/abi/linux"
@@ -85,16 +87,16 @@ func TestAddressSpaceChurnReusesTablesWithoutLeakOrAliasing(t *testing.T) {
 	}
 
 	runOnce(0) // Warm up the slab and the worker.
-	before, blocksBefore := vm.slabStats(), vm.hostBlockCount()
+	before, blocksBefore := vm.slabStats(), vm.regions.regionCount()
 	for i := 1; i <= 400; i++ {
 		runOnce(i)
 	}
-	after, blocksAfter := vm.slabStats(), vm.hostBlockCount()
+	after, blocksAfter := vm.slabStats(), vm.regions.regionCount()
 	if after != before {
 		t.Errorf("slab after 400 address spaces = %+v, want %+v: table pages leak", after, before)
 	}
 	if blocksAfter != blocksBefore {
-		t.Errorf("host blocks after churn = %d, want %d: Stage-2 mappings leak", blocksAfter, blocksBefore)
+		t.Errorf("regions after churn = %d, want %d: Stage-2 mappings leak", blocksAfter, blocksBefore)
 	}
 }
 
@@ -133,58 +135,108 @@ func TestReleaseOfRunningAddressSpaceStopsTheGuest(t *testing.T) {
 	}
 }
 
-func TestHostBlocksAreReferenceCounted(t *testing.T) {
+func TestRegionsAreSharedAndOutliveUnmap(t *testing.T) {
 	plat := newTestPlatform(t)
-	vm := plat.vm
-	base := vm.hostBlockCount()
-	a := newGuest(t, plat)
-	if got := vm.hostBlockCount(); got != base+1 {
-		t.Fatalf("one arena maps %d blocks, want 1", got-base)
+	regions := plat.vm.regions
+	base := regions.regionCount()
+	a := newGuest(t, plat, insnLdrX1X0, insnSVC0)
+	if got := regions.regionCount(); got != base+1 {
+		t.Fatalf("one arena maps %d regions, want 1", got-base)
 	}
-	// A second address space maps the same host page: the block is shared.
+	// A second address space maps the same file: the region is shared.
 	asIface, err := plat.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	b := asIface.(*AddressSpace)
-	mapHostBytes(t, b, guestCodeAddr, a.code, hostarch.Read)
-	if got := vm.hostBlockCount(); got != base+1 {
-		t.Fatalf("a second mapping of the same page maps %d blocks, want 1", got-base)
+	if err := b.MapFile(guestCodeAddr, a.file, memmap.FileRange{Start: 0, End: pageSize4K}, hostarch.Read, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := regions.regionCount(); got != base+1 {
+		t.Fatalf("a second mapping of the same file maps %d regions, want 1", got-base)
 	}
 	a.as.Unmap(guestCodeAddr, 2*pageSize4K)
-	if got := vm.hostBlockCount(); got != base+1 {
-		t.Fatalf("the block went away while the second address space references it (%d)", got-base)
-	}
-	b.Unmap(guestCodeAddr, pageSize4K)
-	if got := vm.hostBlockCount(); got != base {
-		t.Fatalf("%d blocks stay mapped after the last reference left", got-base)
+	if got := regions.regionCount(); got != base+1 {
+		t.Fatalf("Unmap changed the region count to %d", got-base)
 	}
 	b.Release()
+	if got := regions.regionCount(); got != base+1 {
+		t.Fatalf("the region went away while the first address space uses it (%d)", got-base)
+	}
+	a.as.Release()
+	if got := regions.regionCount(); got != base {
+		t.Fatalf("%d regions stay mapped after the last user left", got-base)
+	}
 }
 
-func TestMapReplacementReleasesThePreviousBlock(t *testing.T) {
+func TestMapReplacementSwitchesTheGuestToTheNewMemory(t *testing.T) {
 	plat := newTestPlatform(t)
-	vm := plat.vm
-	g := newGuest(t, plat)
-	base := vm.hostBlockCount()
+	g := newGuest(t, plat, insnLdrX1X0, insnSVC0)
 	other, err := memutil.AllocateAnonymousArena(hostPageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer memutil.UnmapView(other)
-	mapHostBytes(t, g.as, guestDataAddr, other[:pageSize4K], hostarch.ReadWrite)
-	if got := vm.hostBlockCount(); got != base+1 {
-		t.Fatalf("blocks = %d, want %d: the replacement maps one new block", got, base+1)
-	}
-	// Replace it back: the replacement block must go away.
-	mapHostBytes(t, g.as, guestDataAddr, g.data, hostarch.ReadWrite)
-	if got := vm.hostBlockCount(); got != base {
-		t.Fatalf("blocks = %d, want %d: the replaced mapping still holds its block", got, base)
-	}
 	binary.LittleEndian.PutUint64(g.data[8:], 0x1122)
-	var buf [8]byte
-	if _, err := g.as.CopyIn(guestDataAddr+8, buf[:]); err != nil || binary.LittleEndian.Uint64(buf[:]) != 0x1122 {
-		t.Fatalf("CopyIn after replacement = %x, %v: the address space still sees the old page", buf, err)
+	binary.LittleEndian.PutUint64(other[8:], 0x3344)
+	for round := range 3 {
+		if got, sig, err := g.read64(guestDataAddr + 8); sig != nil || err != nil || got != 0x1122 {
+			t.Fatalf("round %d: the guest read (%#x, %v, %v) from the original page, want 0x1122", round, got, sig, err)
+		}
+		mapHostBytes(t, g.as, guestDataAddr, other[:pageSize4K], hostarch.ReadWrite)
+		if got, sig, err := g.read64(guestDataAddr + 8); sig != nil || err != nil || got != 0x3344 {
+			t.Fatalf("round %d: the guest read (%#x, %v, %v) after the replacement, want 0x3344", round, got, sig, err)
+		}
+		mapHostBytes(t, g.as, guestDataAddr, g.data, hostarch.ReadWrite)
+	}
+}
+
+// A vCPU can keep a cached translation of the old page while the Sentry
+// replaces a mapping. MapFile must stop that vCPU before it returns, because
+// the Sentry then reuses the old memory. The guest copies a word from the
+// mapped page into an observer page in a loop. The test poisons the old page
+// after each replacement and checks that the observer never shows the poison.
+func TestReplacementStopsVCPUsBeforeTheOldMemoryChanges(t *testing.T) {
+	plat := newTestPlatform(t)
+	const observerVA = hostarch.Addr(0x500000)
+	// LDR X1,[X0]; STR X1,[X2]; B .-8.
+	g := newGuest(t, plat, insnLdrX1X0, insnStrX1X2, 0x17fffffe)
+	observer, err := memutil.AllocateAnonymousArena(hostPageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memutil.UnmapView(observer)
+	mapHostBytes(t, g.as, observerVA, observer[:pageSize4K], hostarch.ReadWrite)
+	pages := [2][]byte{g.data, make([]byte, 0)}
+	other, err := memutil.AllocateAnonymousArena(hostPageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer memutil.UnmapView(other)
+	pages[1] = other[:pageSize4K]
+	binary.LittleEndian.PutUint64(pages[0], 1)
+	binary.LittleEndian.PutUint64(pages[1], 2)
+	g.regs().Regs[0] = uint64(guestDataAddr)
+	g.regs().Regs[2] = uint64(observerVA)
+
+	res := g.switchAsync()
+	waitInGuest(t, g.ctx)
+	const poison = 0xdead
+	cur := 0
+	for i := range 60 {
+		next := 1 - cur
+		mapHostBytes(t, g.as, guestDataAddr, pages[next], hostarch.ReadWrite)
+		binary.LittleEndian.PutUint64(pages[cur], poison)
+		time.Sleep(300 * time.Microsecond)
+		if got := atomic.LoadUint64((*uint64)(unsafe.Pointer(&observer[0]))); got != uint64(next+1) {
+			t.Fatalf("iteration %d: the observer holds %#x, want %d: a vCPU read the old page after MapFile returned", i, got, next+1)
+		}
+		binary.LittleEndian.PutUint64(pages[cur], uint64(cur+1))
+		cur = next
+	}
+	g.ctx.Interrupt()
+	if got := receive(t, res); !errors.Is(got.err, platform.ErrContextInterrupt) {
+		t.Fatalf("Switch = (%v, %v), want ErrContextInterrupt", got.sig, got.err)
 	}
 }
 
@@ -200,7 +252,7 @@ func (f *testFile) MapInternal(fr memmap.FileRange, _ hostarch.AccessType) (safe
 
 func TestReadOnlyFileDescriptorMappingUsesACopy(t *testing.T) {
 	plat := newTestPlatform(t)
-	vm := plat.vm
+	regions := plat.vm.regions
 
 	f, err := os.CreateTemp(t.TempDir(), "image")
 	if err != nil {
@@ -224,21 +276,17 @@ func TestReadOnlyFileDescriptorMappingUsesACopy(t *testing.T) {
 	defer unix.Munmap(mem)
 
 	g := newGuest(t, plat, insnLdrX1X0, insnSVC0)
-	base := vm.slabStats()
+	baseRegions, baseCopies := regions.regionCount(), regions.copyCount()
 	file := &testFile{mem: mem}
 	fr := memmap.FileRange{Start: 0, End: pageSize4K}
 	if err := g.as.MapFile(guestDataAddr+0x10000, file, fr, hostarch.Read, false); err != nil {
 		t.Fatalf("read-only MapFile: %v", err)
 	}
-	if got := vm.slabStats().pagesInUse; got <= base.pagesInUse {
-		t.Errorf("slab pages in use = %d: the read-only descriptor mapping did not use a copy", got)
+	if got := regions.copyCount(); got != baseCopies+1 {
+		t.Errorf("private copies = %d, want %d: the read-only descriptor mapping did not use a copy", got, baseCopies+1)
 	}
-	g.regs().Regs[0] = uint64(guestDataAddr) + 0x10000
-	if sig, _, err := g.switchOnce(); sig != nil || err != nil {
-		t.Fatalf("Switch = (%v, %v)", sig, err)
-	}
-	if got := g.regs().Regs[1]; got != 0xfeedc0de {
-		t.Errorf("the guest read %#x, want the file content 0xfeedc0de", got)
+	if got, sig, err := g.read64(guestDataAddr + 0x10000); sig != nil || err != nil || got != 0xfeedc0de {
+		t.Errorf("the guest read (%#x, %v, %v), want the file content 0xfeedc0de", got, sig, err)
 	}
 
 	// A writable mapping of the same memory must fail: a copy would diverge.
@@ -246,9 +294,20 @@ func TestReadOnlyFileDescriptorMappingUsesACopy(t *testing.T) {
 	if !errors.Is(err, errHostBlockRejected) {
 		t.Errorf("writable MapFile of read-only memory = %v, want errHostBlockRejected", err)
 	}
+	// Unmap changes only Stage-1: the copy stays for the next mapping.
 	g.as.Unmap(guestDataAddr+0x10000, pageSize4K)
-	if got := vm.slabStats().pagesInUse; got != base.pagesInUse {
-		t.Errorf("slab pages in use = %d after the unmap, want %d: the copy leaked", got, base.pagesInUse)
+	if got := regions.copyCount(); got != baseCopies+1 {
+		t.Errorf("private copies = %d after the unmap, want %d: Unmap changed Stage-2", got, baseCopies+1)
+	}
+	if _, sig, err := g.read64(guestDataAddr + 0x10000); sig == nil && err == nil {
+		t.Error("the guest read an unmapped page")
+	}
+	g.as.Release()
+	if got := regions.copyCount(); got != baseCopies {
+		t.Errorf("private copies = %d after Release, want %d: the copy leaked", got, baseCopies)
+	}
+	if got := regions.regionCount(); got != baseRegions-1 {
+		t.Errorf("regions = %d after Release, want %d: the last user left", got, baseRegions-1)
 	}
 }
 
@@ -257,7 +316,7 @@ func TestReadOnlyFileDescriptorMappingUsesACopy(t *testing.T) {
 // install every 4KB page of the range.
 func TestMapFileCoversWholeHostarchPages(t *testing.T) {
 	plat := newTestPlatform(t)
-	g := newGuest(t, plat)
+	g := newGuest(t, plat, insnLdrX1X0, insnSVC0)
 	const pages = 4
 	size := uint64(pages * hostarch.PageSize)
 	mem, err := memutil.AllocateAnonymousArena(int(size))
@@ -266,19 +325,23 @@ func TestMapFileCoversWholeHostarchPages(t *testing.T) {
 	}
 	defer memutil.UnmapView(mem)
 	for i := 0; i < len(mem); i += pageSize4K {
-		mem[i] = byte(i/pageSize4K + 1)
-		mem[i+pageSize4K-1] = byte(0xf0 + i/pageSize4K%16)
+		binary.LittleEndian.PutUint64(mem[i:], uint64(i/pageSize4K+1))
+		binary.LittleEndian.PutUint64(mem[i+pageSize4K-8:], uint64(0xf0+i/pageSize4K%16))
 	}
 	base := hostarch.Addr(0x1000000)
 	if err := g.as.MapFile(base, &testFile{mem: mem}, memmap.FileRange{Start: 0, End: size}, hostarch.ReadWrite, false); err != nil {
 		t.Fatalf("MapFile of %d bytes: %v", size, err)
 	}
-	got := make([]byte, size)
-	if n, err := g.as.CopyIn(base, got); err != nil || uint64(n) != size {
-		t.Fatalf("CopyIn = (%d, %v), want %d bytes", n, err, size)
-	}
-	if string(got) != string(mem) {
-		t.Fatal("the address space does not alias the mapped memory")
+	for i := 0; i < len(mem); i += pageSize4K {
+		first, second := binary.LittleEndian.Uint64(mem[i:]), binary.LittleEndian.Uint64(mem[i+pageSize4K-8:])
+		for _, c := range []struct {
+			off  hostarch.Addr
+			want uint64
+		}{{hostarch.Addr(i), first}, {hostarch.Addr(i + pageSize4K - 8), second}} {
+			if got, sig, err := g.read64(base + c.off); sig != nil || err != nil || got != c.want {
+				t.Fatalf("guest read at +%#x = (%#x, %v, %v), want %#x", uint64(c.off), got, sig, err, c.want)
+			}
+		}
 	}
 }
 
@@ -454,10 +517,7 @@ func TestUseAfterCloseFailsExplicitly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer memutil.UnmapView(mem)
-	var stale []pageEntry
-	g.as.mu.Lock()
-	err = g.as.mapPageLocked(0x800000, mem[:pageSize4K:pageSize4K], hostarch.Read, &stale)
-	g.as.mu.Unlock()
+	err = g.as.MapFile(0x800000, &testFile{mem: mem}, memmap.FileRange{Start: 0, End: pageSize4K}, hostarch.Read, false)
 	if !errors.Is(err, errPlatformClosed) {
 		t.Errorf("mapping after Close = %v, want errPlatformClosed", err)
 	}
@@ -531,8 +591,8 @@ func TestPlatformRegistrationAndLimits(t *testing.T) {
 	}
 	plat := p.(*Platform)
 	defer plat.Close()
-	if got := plat.MapUnit(); got != hostarch.PageSize {
-		t.Errorf("MapUnit() = %d, want hostarch.PageSize %d", got, hostarch.PageSize)
+	if got := plat.MapUnit(); got != 2<<20 || got%hostarch.PageSize != 0 || got&(got-1) != 0 {
+		t.Errorf("MapUnit() = %d, want 2 MiB, a power-of-two multiple of hostarch.PageSize %d", got, hostarch.PageSize)
 	}
 	if !FrameworkSymbolsLoaded() {
 		t.Error("FrameworkSymbolsLoaded() = false")

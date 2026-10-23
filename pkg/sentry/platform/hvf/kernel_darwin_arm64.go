@@ -15,8 +15,10 @@
 package hvf
 
 import (
-	"fmt"
 	"unsafe"
+
+	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/ring0/pagetables"
 )
 
 // The EL1-only mappings (the exception vector page and one CommPage per vCPU)
@@ -55,27 +57,38 @@ type kernelComm struct {
 
 // kernelMap is the immutable TTBR1 mapping set.
 type kernelMap struct {
-	tables *tableSet
-	comm   []kernelComm
-	// prefillRoot is nil: TTBR1_EL1 reaches the kernel tree, so user roots hold
-	// no kernel entries.
-	prefillRoot func(root []byte)
+	pt    *pagetables.PageTables
+	alloc *tableAlloc
+	comm  []kernelComm
 }
+
+// kernelPageKind selects the permissions of a TTBR1 page.
+type kernelPageKind int
+
+const (
+	// kernelCode is EL1 read-only and executable, and EL0 has no access.
+	kernelCode kernelPageKind = iota
+	// kernelData is EL1 read-write and never executable.
+	kernelData
+)
 
 // ttbr1 returns the TTBR1_EL1 value.
 func (k *kernelMap) ttbr1() uint64 {
-	return k.tables.rootIPA
+	return k.pt.TTBR1_EL1(false, 0)
 }
 
 // initKernel builds the TTBR1 tree with one CommPage per vCPU slot. It runs
 // before the VM state is visible to other goroutines.
 func (v *vmState) initKernel(slots int) error {
-	tables, err := newTableSet(v)
-	if err != nil {
+	initPageTables()
+	alloc := newTableAlloc(v)
+	if err := alloc.reserve(kernelTablePages); err != nil {
+		alloc.drain()
 		return err
 	}
 	k := &v.kernel
-	k.tables = tables
+	k.alloc = alloc
+	k.pt = pagetables.New(alloc)
 	k.comm = make([]kernelComm, slots)
 
 	vecPage, vecIPA, err := v.allocPage()
@@ -83,18 +96,14 @@ func (v *vmState) initKernel(slots int) error {
 		return err
 	}
 	copy(vecPage, buildVectorPage())
-	if err := k.mapPage(kernelVectorVA, vecIPA, kernelCode); err != nil {
-		return err
-	}
+	k.mapPage(kernelVectorVA, vecIPA, kernelCode)
 	for i := range k.comm {
 		page, ipa, err := v.allocPage()
 		if err != nil {
 			return err
 		}
 		va := kernelCommBaseVA + uint64(i)*kernelCommStride
-		if err := k.mapPage(va, ipa, kernelData); err != nil {
-			return err
-		}
+		k.mapPage(va, ipa, kernelData)
 		k.comm[i] = kernelComm{
 			page: page,
 			view: (*CommPage)(unsafe.Pointer(unsafe.SliceData(page))),
@@ -102,14 +111,16 @@ func (v *vmState) initKernel(slots int) error {
 			va:   va,
 		}
 	}
+	k.pt.MarkReadOnlyShared()
 	return nil
 }
 
-func (k *kernelMap) mapPage(va, ipa uint64, kind kernelPageKind) error {
-	table, idx, err := k.tables.leafSlot(va, true)
-	if err != nil {
-		return fmt.Errorf("hvf: build kernel tables: %w", err)
+// mapPage maps one global EL1-only page. The nG bit stays clear, so the entry
+// applies to every address space.
+func (k *kernelMap) mapPage(va, ipa uint64, kind kernelPageKind) {
+	at := hostarch.ReadWrite
+	if kind == kernelCode {
+		at = hostarch.AccessType{Read: true, Execute: true}
 	}
-	storePTE(table, idx, kernelLeafDescriptor(ipa, kind))
-	return nil
+	k.pt.Map(hostarch.Addr(va), pageSize4K, pagetables.MapOpts{AccessType: at, Global: true}, uintptr(ipa))
 }
