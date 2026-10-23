@@ -279,7 +279,27 @@ func (as *AddressSpace) Release() {
 	as.pt.Unmap(0, uintptr(as.p.maxUser()))
 	as.invalidate()
 	as.releasePages(old)
+	as.forgetIdleRoots()
 	as.alloc.drain()
+}
+
+// forgetIdleRoots invalidates the state of every idle processor that still
+// names as. The hardware root register of such a processor points to the
+// top-level table that drain recycles, and the next entry must not rely on
+// it. Platform.mu orders the scan with acquire, so no holder uses an idle
+// processor during the scan. The function skips a busy processor. Its holder
+// owns the state and writes the root register on the host when it switches
+// to another address space, because the identifier of as never returns.
+// The caller holds as.mu. No path takes as.mu while it holds Platform.mu.
+func (as *AddressSpace) forgetIdleRoots() {
+	p := as.p
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, v := range p.vps {
+		if !v.busy && v.st.asID == as.id {
+			v.st.invalidate()
+		}
+	}
 }
 
 // PreFork implements platform.AddressSpace.PreFork.
