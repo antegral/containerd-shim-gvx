@@ -32,16 +32,20 @@ import (
 // their cache maintenance loops. macOS raises SIGILL on that read, so
 // `mrs xN, ctr_el0` becomes a branch to a slot that loads a constant.
 const (
-	arm64SVC0       = 0xd4000001
-	arm64MRSTPIDR   = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
-	arm64MRSCTR     = 0xd53b0020 // mrs xN, ctr_el0 with N in bits 4:0.
-	arm64MOVZ       = 0xd2800000 // movz xN, #imm16 with imm16 in bits 20:5.
-	arm64MOVKLSL16  = 0xf2a00000 // movk xN, #imm16, lsl #16 with imm16 in bits 20:5.
-	arm64MSRTPIDR   = 0xd51bd040 // msr tpidr_el0, xN with N in bits 4:0.
-	arm64RegMask    = 0x1f
-	arm64NOP        = 0xd503201f
-	arm64STPx16x17  = 0xa93f47f0 // stp x16, x17, [sp, #-16]
-	arm64LDPx16x17  = 0xa97f47f0 // ldp x16, x17, [sp, #-16]
+	arm64SVC0      = 0xd4000001
+	arm64MRSTPIDR  = 0xd53bd040 // mrs xN, tpidr_el0 with N in bits 4:0.
+	arm64MRSCTR    = 0xd53b0020 // mrs xN, ctr_el0 with N in bits 4:0.
+	arm64MOVZ      = 0xd2800000 // movz xN, #imm16 with imm16 in bits 20:5.
+	arm64MOVKLSL16 = 0xf2a00000 // movk xN, #imm16, lsl #16 with imm16 in bits 20:5.
+	arm64MSRTPIDR  = 0xd51bd040 // msr tpidr_el0, xN with N in bits 4:0.
+	arm64RegMask   = 0x1f
+	arm64NOP       = 0xd503201f
+	// The trap slot saves x16 and x17 512 bytes below the guest stack pointer.
+	// Go assembly keeps live words up to 32 bytes below the stack pointer across
+	// a system call, as runtime.clone does for its child, so a spill right
+	// below the pointer would overwrite them.
+	arm64STPx16x17  = 0xa92047f0 // stp x16, x17, [sp, #-512]
+	arm64LDPx16x17  = 0xa96047f0 // ldp x16, x17, [sp, #-512]
 	arm64ADRx17     = 0x10000000 | 17
 	arm64LDRLitx16  = 0x58000000 | 16
 	arm64BRx16      = 0xd61f0200
@@ -113,6 +117,23 @@ func scanARM64(code []byte) []patchSite {
 		}
 	}
 	return sites
+}
+
+// arm64DCOps lists the `dc` operations by virtual address that a Linux kernel
+// lets EL0 run, with register 0: cvac, cvau, cvap, cvadp, and civac.
+var arm64DCOps = [...]uint32{0xd50b7a20, 0xd50b7b20, 0xd50b7c20, 0xd50b7d20, 0xd50b7e20}
+
+// isDataCacheMaintenance reports whether w is a `dc` operation by virtual
+// address that cleans or invalidates a cache line. Windows raises an illegal
+// instruction exception for it at EL0. The guest memory stays coherent, so the
+// operation has no effect that a guest can observe, and a NOP replaces it.
+func isDataCacheMaintenance(w uint32) bool {
+	for _, op := range arm64DCOps {
+		if w&^arm64RegMask == op {
+			return true
+		}
+	}
+	return false
 }
 
 // encodeBranch returns the B instruction at address from that jumps to to.

@@ -36,13 +36,24 @@ const (
 	winLimit = uint64(0x7EE000000000)
 
 	// internalSize is the part of the window that the engine keeps for itself,
-	// at the top. The guest never sees it, because MaxUserAddress lies below it.
-	internalSize = uint64(0x10000)
+	// at the top: the engine pages, then one area for each fast thread. The
+	// guest never sees it, because MaxUserAddress lies below it.
+	internalSize = uint64(winArenaSize)
 	internalBase = winLimit - internalSize
+
+	// lowBase and lowLimit bound the low guest window. A non-PIE executable
+	// runs at the address that it links to. Go links an arm64 program at
+	// 0x10000, and most linkers use 0x400000. lowBase is the lowest address of a
+	// Windows process. lowLimit is the address of KUSER_SHARED_DATA, which every
+	// process maps. The range was free in every suspended stub that the probes
+	// created on windows-latest and windows-11-arm. A placeholder over the range
+	// kept the loader out of it. The Sentry reserves it before the loader runs.
+	lowBase  = uint64(0x10000)
+	lowLimit = uint64(0x7FFE0000)
 
 	// codeSize is the size of the executable part of the engine pages. The
 	// data pages follow it.
-	codeSize = 0x4000
+	codeSize = winCodeSize
 
 	// startTimeout bounds the wait for a new stub process or thread to reach its
 	// first stop.
@@ -80,6 +91,13 @@ type stubProc struct {
 	// internal is the section behind the engine pages of the window.
 	internal *anonSection
 
+	// owner is the address space of the stub. The thread code reads the
+	// trampoline islands through it.
+	owner atomic.Pointer[addressSpace]
+
+	// fast holds the fast slots of the stub. Callers hold mu.
+	fast fastSlots
+
 	archProc
 }
 
@@ -90,13 +108,15 @@ func (sp *stubProc) thread(tid uint32) *thread {
 	return sp.threads[tid]
 }
 
-// markDead records the death of the stub and wakes every waiter.
+// markDead records the death of the stub and wakes every waiter, including a
+// Sentry thread that sleeps on the event of a fast thread.
 func (sp *stubProc) markDead(err error) {
 	if sp.dead.Swap(true) {
 		return
 	}
 	sp.deadErr.Store(&err)
 	close(sp.deadCh)
+	sp.wakeFastThreads()
 }
 
 func (sp *stubProc) deathError() error {
@@ -110,10 +130,12 @@ func (sp *stubProc) deathError() error {
 // has the guest window reserved, the loader finished, and its initial thread
 // parked for good.
 func (p *Platform) bringUpStub() (*stubProc, error) {
+	t0 := time.Now()
 	sh, err := p.host.newStub()
 	if err != nil {
 		return nil, err
 	}
+	bringUpStats.hostNs.Add(uint64(time.Since(t0)))
 	sp := &stubProc{
 		p: p, pid: sh.pid, proc: sh.proc, main: sh.thread, level: sh.level,
 		threads: make(map[uint32]*thread),
@@ -129,9 +151,17 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	th0.ctx = nil // The initial thread never runs guest code.
 	sp.threads[sh.tid] = th0
 	p.dbg.register(sp)
+	t1 := time.Now()
 	if err := virtualAllocPlaceholder(sp.proc, uintptr(winBase), uintptr(winLimit-winBase)); err != nil {
 		return fail(fmt.Errorf("%w: %v", errWindowTaken, err))
 	}
+	if p.lowWindow {
+		if err := virtualAllocPlaceholder(sp.proc, uintptr(lowBase), uintptr(lowLimit-lowBase)); err != nil {
+			return fail(fmt.Errorf("%w: low window: %v", errWindowTaken, err))
+		}
+	}
+	bringUpStats.windowNs.Add(uint64(time.Since(t1)))
+	t2 := time.Now()
 	if err := ntResumeThread(sp.main); err != nil {
 		return fail(err)
 	}
@@ -147,12 +177,102 @@ func (p *Platform) bringUpStub() (*stubProc, error) {
 	if err := p.dbg.reply(ev); err != nil {
 		return fail(err)
 	}
+	bringUpStats.loaderNs.Add(uint64(time.Since(t2)))
+	bringUpStats.stubs.Add(1)
 	return sp, nil
 }
 
-// newStubProc creates a stub. The reservation of the guest window can fail
-// when the loader placed something there, so the call retries with a new stub.
+// poolDepth is the number of ready stubs that the platform keeps. A stub takes
+// 10 to 20 ms to start, and each fork and each exec of a guest needs one.
+const poolDepth = 2
+
+// stubPool keeps ready stubs, so that a fork or an exec does not wait for the
+// loader of a new process. One goroutine fills the pool while the guests run.
+type stubPool struct {
+	ready chan *stubProc
+	stop  chan struct{}
+	done  chan struct{}
+}
+
+// startPool starts the goroutine that fills the pool.
+func (p *Platform) startPool() {
+	p.pool = &stubPool{
+		ready: make(chan *stubProc, poolDepth),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	go p.fillPool()
+}
+
+func (p *Platform) fillPool() {
+	pool := p.pool
+	defer close(pool.done)
+	for {
+		select {
+		case <-pool.stop:
+			return
+		default:
+		}
+		sp, err := p.newStubProcFresh()
+		if err != nil {
+			// The next call of NewAddressSpace reports the failure. Wait
+			// before the next try, so that a failing host does not make a busy loop.
+			select {
+			case <-pool.stop:
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+			continue
+		}
+		select {
+		case pool.ready <- sp:
+		case <-pool.stop:
+			sp.destroy()
+			return
+		}
+	}
+}
+
+// stopPool stops the goroutine and terminates the stubs that no guest took.
+func (p *Platform) stopPool() {
+	if p.pool == nil {
+		return
+	}
+	close(p.pool.stop)
+	<-p.pool.done
+	for {
+		select {
+		case sp := <-p.pool.ready:
+			sp.destroy()
+		default:
+			return
+		}
+	}
+}
+
+// newStubProc returns a ready stub from the pool, or creates one when the pool
+// is empty.
 func (p *Platform) newStubProc() (*stubProc, error) {
+	if p.pool != nil {
+		for {
+			select {
+			case sp := <-p.pool.ready:
+				if sp.dead.Load() {
+					sp.destroy()
+					continue
+				}
+				return sp, nil
+			default:
+			}
+			break
+		}
+	}
+	return p.newStubProcFresh()
+}
+
+// newStubProcFresh creates a stub. The reservation of the guest window can fail
+// when the loader placed something there, so the call retries with a new stub.
+func (p *Platform) newStubProcFresh() (*stubProc, error) {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		var sp *stubProc
@@ -188,11 +308,8 @@ func (sp *stubProc) destroy() {
 	sp.markDead(errStubReleased)
 	sp.p.dbg.unregister(sp.pid)
 	for _, th := range threads {
-		if th.h != sp.main {
-			_ = windows.CloseHandle(th.h)
-		}
+		th.closeHandle()
 	}
-	_ = windows.CloseHandle(sp.main)
 	_ = windows.CloseHandle(sp.proc)
 	sp.p.host.release(sp.pid)
 }
@@ -208,6 +325,8 @@ func (sp *stubProc) newGuestThread() (*thread, error) {
 	if sp.dead.Load() {
 		return nil, sp.deathError()
 	}
+	start := time.Now()
+	defer func() { bringUpStats.threadNs.Add(uint64(time.Since(start))) }()
 	h, err := ntCreateThreadEx(sp.proc, sp.p.breakAddr, true)
 	if err != nil {
 		return nil, err
@@ -221,7 +340,7 @@ func (sp *stubProc) newGuestThread() (*thread, error) {
 	sp.mu.Lock()
 	if sp.closed {
 		sp.mu.Unlock()
-		_ = windows.CloseHandle(h)
+		th.closeHandle()
 		return nil, errStubReleased
 	}
 	sp.threads[tid] = th

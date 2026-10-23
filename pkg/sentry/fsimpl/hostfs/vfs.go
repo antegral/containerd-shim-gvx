@@ -107,8 +107,10 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 }
 
 // filesystem implements vfs.FilesystemImpl. The host is the source of truth.
-// Every path step revalidates against the workspace. The dentry tree is only a
-// cache that keeps object identity stable for open files, mounts, and watches.
+// A path step revalidates against the workspace when its cached result has
+// expired or a mutation dropped it. The dentry tree also keeps object identity
+// stable for open files, mounts, and watches. The consistency contract is in
+// lookupChildLocked.
 type filesystem struct {
 	vfsfs    vfs.Filesystem
 	ws       *Workspace
@@ -219,10 +221,27 @@ type inode struct {
 	locks   vfs.FileLocks
 	watches vfs.Watches
 
-	// attrMu protects cur, the last entry observed for this inode. Unlinked
-	// files keep serving their last attributes to open file descriptors.
-	attrMu sync.Mutex
-	cur    entry
+	// attrMu protects cur, the last entry observed for this inode, and the
+	// validity of cur. Unlinked files keep serving their last attributes to
+	// open file descriptors.
+	//
+	// metaValid marks cur as current until metaUntil, so a lookup that finds
+	// the dentry of this inode makes no host call. Every mutation that
+	// changes the inode calls invalidateMeta, which also advances metaSeq.
+	// A lookup that started before the mutation then cannot mark the older
+	// entry valid again, because commitMeta compares metaSeq.
+	attrMu    sync.Mutex
+	cur       entry
+	metaValid bool
+	metaUntil int64
+	metaSeq   uint64
+
+	// negChildren holds the names that a lookup in this directory did not
+	// find, so a repeated lookup makes no host call. negUntil ends the life of
+	// the whole set. Protected by fs.mu. See lookupChildLocked for the
+	// consistency contract.
+	negChildren map[string]struct{}
+	negUntil    int64
 
 	// wmu serialises writes so that O_APPEND is atomic.
 	wmu sync.Mutex
@@ -240,6 +259,86 @@ func (i *inode) update(e entry) {
 	i.attrMu.Lock()
 	i.cur = e
 	i.attrMu.Unlock()
+}
+
+// metaFresh reports whether cur is valid at time now.
+func (i *inode) metaFresh(now int64) bool {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	return i.metaValid && now < i.metaUntil
+}
+
+// invalidateMeta marks cur as stale. Callers invoke it after every host
+// change of the inode: writes, truncation, attribute changes, link count
+// changes, and changes of the directory contents.
+func (i *inode) invalidateMeta() {
+	i.attrMu.Lock()
+	i.metaValid = false
+	i.metaSeq++
+	i.attrMu.Unlock()
+}
+
+// beginMeta returns the token that commitMeta needs. Call it before the host
+// lookup that produces the entry.
+func (i *inode) beginMeta() uint64 {
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	return i.metaSeq
+}
+
+// commitMeta stores e and marks it valid until the given time, unless a
+// mutation invalidated the inode after beginMeta returned seq. In that case it
+// stores e and leaves the inode invalid.
+func (i *inode) commitMeta(e entry, seq uint64, until int64) {
+	i.attrMu.Lock()
+	i.cur = e
+	if i.metaSeq == seq {
+		i.metaValid = true
+		i.metaUntil = until
+	}
+	i.attrMu.Unlock()
+}
+
+// markValid marks cur of a new inode as valid until the given time.
+func (i *inode) markValid(until int64) {
+	i.attrMu.Lock()
+	i.metaValid = true
+	i.metaUntil = until
+	i.attrMu.Unlock()
+}
+
+// maxNegChildren bounds the negative entries of one directory.
+const maxNegChildren = 1024
+
+// negHit reports whether a lookup of name in this directory failed recently.
+// Callers hold fs.mu.
+func (i *inode) negHit(name string, now int64) bool {
+	if len(i.negChildren) == 0 {
+		return false
+	}
+	if now >= i.negUntil {
+		i.negChildren = nil
+		return false
+	}
+	_, ok := i.negChildren[name]
+	return ok
+}
+
+// negAdd records that name does not exist in this directory. Callers hold
+// fs.mu.
+func (i *inode) negAdd(name string, now int64) {
+	if len(i.negChildren) == 0 || now >= i.negUntil {
+		i.negChildren = make(map[string]struct{})
+		i.negUntil = now + int64(cacheTTL)
+	} else if len(i.negChildren) >= maxNegChildren {
+		clear(i.negChildren)
+	}
+	i.negChildren[name] = struct{}{}
+}
+
+// negDel forgets the negative entry of name. Callers hold fs.mu.
+func (i *inode) negDel(name string) {
+	delete(i.negChildren, name)
 }
 
 func (i *inode) mode() linux.FileMode {
@@ -479,41 +578,74 @@ func (fs *filesystem) maybePruneLocked() {
 	}
 }
 
-// attachChildLocked creates the dentry for entry e below parent.
-func (fs *filesystem) attachChildLocked(parent *dentry, name, rel string, e entry) *dentry {
+// attachChildLocked creates the dentry for entry e below parent. A non-zero
+// until marks the metadata of a new inode as valid up to that time.
+func (fs *filesystem) attachChildLocked(parent *dentry, name, rel string, e entry, until int64) *dentry {
 	fs.maybePruneLocked()
-	return fs.newDentryLocked(parent, name, rel, fs.inodeForLocked(e, rel))
+	ino := fs.inodeForLocked(e, rel)
+	// An inode without dentries is new, so no other path can change it yet.
+	fresh := ino.refs == 0
+	d := fs.newDentryLocked(parent, name, rel, ino)
+	if fresh && until != 0 {
+		ino.markValid(until)
+	}
+	return d
 }
 
-// lookupChildLocked finds name in parent. It revalidates against the host, so
-// it reflects changes made outside the sandbox. The returned error is a Linux
-// errno.
+// lookupChildLocked finds name in parent. The returned error is a Linux errno.
+//
+// Consistency contract: a result that this filesystem produced or confirmed
+// stays valid for cacheTTL without a host call. A guest mutation of the entry,
+// of a hard link to it, or of its parent drops the result at once, and so
+// does a listing of the parent. A change by a host process, or through another
+// mount of the same host directory, shows up after cacheTTL at the latest.
 func (fs *filesystem) lookupChildLocked(parent *dentry, name string) (*dentry, error) {
-	rel := joinRelPath(parent.relPath, name)
+	now := fs.ws.nowNano()
 	child := parent.children[name]
-	e, err := fs.ws.lookup(rel)
+	if child != nil {
+		if child.inode.metaFresh(now) {
+			return child, nil
+		}
+	} else if parent.inode.negHit(name, now) {
+		return nil, linuxerr.ENOENT
+	}
+	var seq uint64
+	if child != nil {
+		seq = child.inode.beginMeta()
+	}
+	e, err := fs.ws.lookupIn(parent.relPath, name)
 	if err != nil {
-		if child != nil && errors.Is(err, iofs.ErrNotExist) {
-			fs.dropLocked(child)
+		if errors.Is(err, iofs.ErrNotExist) {
+			if child != nil {
+				fs.dropLocked(child)
+			}
+			parent.inode.negAdd(name, now)
 		}
 		return nil, translateLookupError(err)
 	}
+	until := now + int64(cacheTTL)
 	if child != nil {
 		if child.inode.matches(e) {
-			child.inode.update(e)
+			child.inode.commitMeta(e, seq, until)
 			return child, nil
 		}
 		fs.dropLocked(child)
 	}
-	return fs.attachChildLocked(parent, name, rel, e), nil
+	return fs.attachChildLocked(parent, name, joinRelPath(parent.relPath, name), e, until), nil
 }
 
-// refreshLocked revalidates d against the host.
+// refreshLocked revalidates d against the host. It makes no host call while
+// the cached metadata of d is valid.
 func (fs *filesystem) refreshLocked(d *dentry) error {
 	if d.dead {
 		return nil
 	}
-	e, err := fs.ws.lookup(d.relPath)
+	now := fs.ws.nowNano()
+	if d.inode.metaFresh(now) {
+		return nil
+	}
+	seq := d.inode.beginMeta()
+	e, err := fs.ws.lookupPath(d.relPath)
 	if err != nil {
 		if errors.Is(err, iofs.ErrNotExist) && d != fs.root {
 			fs.dropLocked(d)
@@ -526,7 +658,7 @@ func (fs *filesystem) refreshLocked(d *dentry) error {
 		}
 		return linuxerr.ENOENT
 	}
-	d.inode.update(e)
+	d.inode.commitMeta(e, seq, now+int64(cacheTTL))
 	return nil
 }
 
@@ -677,8 +809,14 @@ func (fs *filesystem) doCreateAt(ctx context.Context, rp *vfs.ResolvingPath, dir
 		return err
 	}
 	if err := create(parent, name, joinRelPath(parent.relPath, name)); err != nil {
+		if linuxerr.Equals(linuxerr.EEXIST, err) {
+			// The name exists on the host, so a negative entry is stale.
+			parent.inode.negDel(name)
+		}
 		return err
 	}
+	parent.inode.negDel(name)
+	parent.inode.invalidateMeta()
 	ev := linux.IN_CREATE
 	if dir {
 		ev |= linux.IN_ISDIR
@@ -757,6 +895,8 @@ func (fs *filesystem) LinkAt(ctx context.Context, rp *vfs.ResolvingPath, vd vfs.
 		if err := fs.ws.link(src.relPath, rel); err != nil {
 			return translateHostError(err)
 		}
+		// The link count of the shared inode changed.
+		src.inode.invalidateMeta()
 		src.inode.watches.Notify(ctx, "", linux.IN_ATTRIB, 0, vfs.InodeEvent, false)
 		return nil
 	})
@@ -850,6 +990,7 @@ func (fs *filesystem) OpenAt(ctx context.Context, rp *vfs.ResolvingPath, opts vf
 		unlock()
 		return start.open(ctx, rp, &opts, nil)
 	}
+	retriedExist := false
 afterTrailingSymlink:
 	parent, err := fs.walkParentDirLocked(ctx, rp, start)
 	if err != nil {
@@ -887,10 +1028,20 @@ afterTrailingSymlink:
 		rel := joinRelPath(parent.relPath, name)
 		uid, gid, _ := newOwner(parent.inode, rp.Credentials())
 		f, e, err := fs.ws.createFile(rel, uint32(opts.Mode)&0o7777, uint32(uid), uint32(gid))
+		if errors.Is(err, iofs.ErrExist) && !mustCreate && !retriedExist {
+			// A host process created the name after the negative entry. Drop
+			// the entry and resolve the name again, once.
+			retriedExist = true
+			parent.inode.negDel(name)
+			start = parent
+			goto afterTrailingSymlink
+		}
 		if err != nil {
 			return nil, translateHostError(err)
 		}
-		child = fs.attachChildLocked(parent, name, rel, e)
+		parent.inode.negDel(name)
+		parent.inode.invalidateMeta()
+		child = fs.attachChildLocked(parent, name, rel, e, fs.ws.nowNano()+int64(cacheTTL))
 		child.IncRef()
 		defer child.DecRef(ctx)
 		unlock()
@@ -1100,7 +1251,16 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		vfsObj.AbortRenameDentry(&handle, &renamed.vfsd, replacedVFSD)
 		return translateHostError(err)
 	}
+	// The moved inode, the replaced inode, and both parents change times or
+	// link counts. The old name is gone, and the new name is taken.
+	now := fs.ws.nowNano()
+	renamed.inode.invalidateMeta()
+	oldParent.inode.invalidateMeta()
+	newParent.inode.invalidateMeta()
+	oldParent.inode.negAdd(oldName, now)
+	newParent.inode.negDel(newName)
 	if replaced != nil {
+		replaced.inode.invalidateMeta()
 		fs.detachLocked(replaced)
 	}
 	fs.moveLocked(renamed, newParent, newName, newRel)
@@ -1182,6 +1342,8 @@ func (fs *filesystem) RmdirAt(ctx context.Context, rp *vfs.ResolvingPath) error 
 		vfsObj.AbortDeleteDentry(&child.vfsd)
 		return translateHostError(err)
 	}
+	parent.inode.invalidateMeta()
+	parent.inode.negAdd(name, fs.ws.nowNano())
 	for _, c := range child.children {
 		fs.dropLocked(c)
 	}
@@ -1236,6 +1398,10 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 		vfsObj.AbortDeleteDentry(&child.vfsd)
 		return translateHostError(err)
 	}
+	// The link count of the shared inode and the times of the parent change.
+	child.inode.invalidateMeta()
+	parent.inode.invalidateMeta()
+	parent.inode.negAdd(name, fs.ws.nowNano())
 	// Notify before the dentry dies, or the watches would be dropped first.
 	vfs.InotifyRemoveChild(ctx, &child.inode.watches, &parent.inode.watches, name)
 	fs.detachLocked(child)
@@ -1334,6 +1500,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, mnt *vfs.
 			return translateHostError(err)
 		}
 	}
+	d.inode.invalidateMeta()
 	return d.refresh()
 }
 
@@ -1357,6 +1524,7 @@ func (d *dentry) setAttr(mode, uid, gid *uint32) error {
 		if err := d.fs.ws.setAttr(d.path(), mode, uid, gid); err != nil {
 			return translateHostError(err)
 		}
+		d.inode.invalidateMeta()
 		return nil
 	}
 	d.inode.attrMu.Lock()
@@ -1374,17 +1542,23 @@ func (d *dentry) setAttr(mode, uid, gid *uint32) error {
 	return nil
 }
 
-// refresh updates the inode snapshot from the host after a change.
+// refresh updates the inode snapshot from the host after a change. It makes
+// no host call while the cached snapshot is valid.
 func (d *dentry) refresh() error {
 	if d.isDead() {
 		return nil
 	}
-	e, err := d.fs.ws.lookup(d.path())
+	now := d.fs.ws.nowNano()
+	if d.inode.metaFresh(now) {
+		return nil
+	}
+	seq := d.inode.beginMeta()
+	e, err := d.fs.ws.lookupPath(d.path())
 	if err != nil {
 		return translateHostError(err)
 	}
 	if d.inode.matches(e) {
-		d.inode.update(e)
+		d.inode.commitMeta(e, seq, now+int64(cacheTTL))
 	}
 	return nil
 }
@@ -1526,7 +1700,7 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 		if mnt == vfsroot.Mount() && &d.vfsd == vfsroot.Dentry() {
 			return vfs.PrependPathAtVFSRootError{}
 		}
-		if &d.vfsd == mnt.Root() {
+		if mnt != nil && &d.vfsd == mnt.Root() {
 			return nil
 		}
 		if d.dead {

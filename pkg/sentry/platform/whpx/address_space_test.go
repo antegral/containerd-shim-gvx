@@ -22,17 +22,26 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
-	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
 // translate returns the guest physical address that the page tables of as
-// map for va, and the permissions of the entry.
+// map for va, and the permissions of the entry. Lookup reports the address of
+// the page that it was asked for and the physical address of the start of the
+// entry. A large entry starts at the address of va rounded down to its size.
 func translate(as *AddressSpace, va uint64) (gpa uint64, opts hostarch.AccessType, user, ok bool) {
 	_, phys, size, o := as.pt.Lookup(hostarch.Addr(va), false)
 	if size == 0 {
 		return 0, hostarch.AccessType{}, false, false
 	}
-	return uint64(phys), o.AccessType, o.User, true
+	entryStart := va &^ (uint64(size) - 1)
+	return uint64(phys) + (va &^ pageMask) - entryStart, o.AccessType, o.User, true
+}
+
+// hostOf returns the host address that the partition backs guest physical
+// address gpa with.
+func hostOf(fb *fakeBackend, gpa uint64) (unsafe.Pointer, bool) {
+	_, host, ok := fb.mappingOf(gpa)
+	return host, ok
 }
 
 func TestMapHostBuildsExactPageTableEntries(t *testing.T) {
@@ -51,7 +60,7 @@ func TestMapHostBuildsExactPageTableEntries(t *testing.T) {
 	if err := as.mapHost(0x402000, mem[2*pageSize:], hostarch.Read); err != nil {
 		t.Fatal(err)
 	}
-	for _, c := range []struct {
+	for i, c := range []struct {
 		va   uint64
 		want hostarch.AccessType
 	}{
@@ -66,11 +75,13 @@ func TestMapHostBuildsExactPageTableEntries(t *testing.T) {
 		if got.Write != c.want.Write || got.Execute != c.want.Execute {
 			t.Errorf("page %#x has permissions %+v, want %+v", c.va, got, c.want)
 		}
-		if _, mapped := fb.mapped[gpa]; !mapped {
+		host, mapped := hostOf(fb, gpa)
+		if !mapped {
 			t.Errorf("guest page %#x of %#x is not mapped in the partition", gpa, c.va)
+		} else if host != unsafe.Pointer(&mem[i*pageSize]) {
+			t.Errorf("guest page %#x of %#x maps host %p, want %p", gpa, c.va, host, &mem[i*pageSize])
 		}
 	}
-	// Execute-only and write-only requests keep the exact bits.
 	if _, _, _, ok := translate(as, 0x403000); ok {
 		t.Error("a neighbouring page is mapped")
 	}
@@ -102,89 +113,46 @@ func TestTwoAddressSpacesNeverAlias(t *testing.T) {
 	if ga == gb {
 		t.Fatalf("both address spaces map guest page %#x at 0x400000", ga)
 	}
-	if fb.mapped[ga].host != unsafe.Pointer(&memA[0]) || fb.mapped[gb].host != unsafe.Pointer(&memB[0]) {
+	if h, _ := hostOf(fb, ga); h != unsafe.Pointer(&memA[0]) {
 		t.Error("a guest page maps the wrong host memory")
 	}
-
-	// Sharing a host page between address spaces shares the guest page.
-	if err := b.mapHost(0x500000, memA, hostarch.Read); err != nil {
-		t.Fatal(err)
-	}
-	if gs, _, _, _ := translate(b, 0x500000); gs != ga {
-		t.Errorf("shared host page maps to %#x and %#x", gs, ga)
-	}
-	// Unmapping in one address space keeps the page for the other.
-	b.Unmap(0x500000, pageSize)
-	if _, ok := fb.mapped[ga]; !ok {
-		t.Error("the shared page was unmapped while address space a still uses it")
-	}
-	a.Unmap(0x400000, pageSize)
-	if _, ok := fb.mapped[ga]; ok {
-		t.Error("the page stays mapped after its last user unmapped it")
+	if h, _ := hostOf(fb, gb); h != unsafe.Pointer(&memB[0]) {
+		t.Error("a guest page maps the wrong host memory")
 	}
 }
 
-func TestCopyInOutEnforcePermissions(t *testing.T) {
+func TestAddressSpacesShareOneRegistrationOfAHostRange(t *testing.T) {
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
-	as := newTestAS(t, p)
-	mem := mustHost(t, fb, 2)
-	if err := as.mapHost(0x400000, mem[:pageSize], hostarch.ReadWrite); err != nil {
+	a, b := newTestAS(t, p), newTestAS(t, p)
+	mem := mustHost(t, fb, 4)
+
+	maps0, _ := fb.calls()
+	if err := a.mapHost(0x400000, mem, hostarch.ReadWrite); err != nil {
 		t.Fatal(err)
 	}
-	if err := as.mapHost(0x401000, mem[pageSize:], hostarch.Read); err != nil {
+	if err := b.mapHost(0x800000, mem, hostarch.ReadWrite); err != nil {
 		t.Fatal(err)
 	}
-
-	if n, err := as.CopyOut(0x400ff8, []byte("12345678")); n != 8 || err != nil {
-		t.Fatalf("CopyOut returned %d, %v", n, err)
+	if err := b.mapHost(0xA00000, mem[pageSize:3*pageSize], hostarch.Read); err != nil {
+		t.Fatal(err)
 	}
-	if string(mem[pageSize-8:pageSize]) != "12345678" {
-		t.Error("CopyOut did not reach the host page")
+	maps, unmaps := fb.calls()
+	if maps-maps0 != 1 || unmaps != 0 {
+		t.Errorf("three mappings of one host range made %d map calls and %d unmap calls, want 1 and 0", maps-maps0, unmaps)
 	}
-	// A copy that crosses into a read-only page copies the first part and
-	// reports the fault address.
-	n, err := as.CopyOut(0x400ffc, []byte("abcdefgh"))
-	var sf platform.SegmentationFault
-	if n != 4 || !errors.As(err, &sf) || sf.Addr != 0x401000 {
-		t.Errorf("CopyOut across a permission boundary returned %d, %v", n, err)
+	ga, _, _, _ := translate(a, 0x400000)
+	gb, _, _, _ := translate(b, 0x800000)
+	if ga != gb {
+		t.Errorf("a shared host page maps to %#x and %#x", ga, gb)
 	}
-	dst := make([]byte, 8)
-	if n, err := as.CopyIn(0x400ffc, dst); n != 8 || err != nil || string(dst[:4]) != "abcd" {
-		t.Errorf("CopyIn returned %d, %v, %q", n, err, dst)
+	if gs, _, _, _ := translate(b, 0xA00000); gs != ga+pageSize {
+		t.Errorf("a read-only view of the second page maps to %#x, want %#x", gs, ga+pageSize)
 	}
-	if n, err := as.CopyIn(0x401ffc, dst); n != 4 || err == nil {
-		t.Errorf("CopyIn past the end returned %d, %v", n, err)
-	}
-	if z, err := as.ZeroOut(0x400ff0, 16); z != 16 || err != nil {
-		t.Errorf("ZeroOut returned %d, %v", z, err)
-	} else if mem[pageSize-1] != 0 {
-		t.Error("ZeroOut left data behind")
-	}
-	if z, err := as.ZeroOut(0x400ff0, 0x20); z != 0x10 || err == nil {
-		t.Errorf("ZeroOut over a read-only page returned %d, %v", z, err)
-	}
-
-	if old, err := as.SwapUint32(0x400100, 7); old != 0 || err != nil {
-		t.Errorf("SwapUint32 returned %d, %v", old, err)
-	}
-	if cur, err := as.CompareAndSwapUint32(0x400100, 6, 9); cur != 7 || err != nil {
-		t.Errorf("failed CompareAndSwapUint32 returned %d, %v", cur, err)
-	}
-	if cur, err := as.CompareAndSwapUint32(0x400100, 7, 9); cur != 7 || err != nil {
-		t.Errorf("CompareAndSwapUint32 returned %d, %v", cur, err)
-	}
-	if v, err := as.LoadUint32(0x400100); v != 9 || err != nil {
-		t.Errorf("LoadUint32 returned %d, %v", v, err)
-	}
-	if _, err := as.SwapUint32(0x401000, 1); err == nil {
-		t.Error("SwapUint32 wrote a read-only page")
-	}
-	if _, err := as.LoadUint32(0x400101); err == nil {
-		t.Error("LoadUint32 accepted a misaligned address")
-	}
-	if _, err := as.LoadUint32(0x600000); err == nil {
-		t.Error("LoadUint32 read an unmapped page")
+	// Unmapping in one address space keeps the page for the other.
+	b.Unmap(0x800000, 4*pageSize)
+	if gpa, _, _, ok := translate(a, 0x400000); !ok || gpa != ga {
+		t.Error("an Unmap in one address space changed the other")
 	}
 }
 
@@ -192,7 +160,7 @@ func TestMapFileUsesTheRequestedAccessAndRejectsBadHostMemory(t *testing.T) {
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
 	as := newTestAS(t, p)
-	mem := mustHost(t, fb, 4)
+	mem := mustHost(t, fb, 5)
 	fr := memmap.FileRange{Start: 0, End: 2 * pageSize}
 
 	f := &fakeFile{blocks: []safemem.Block{safemem.BlockFromSafeSlice(mem[:2*pageSize])}}
@@ -206,6 +174,15 @@ func TestMapFileUsesTheRequestedAccessAndRejectsBadHostMemory(t *testing.T) {
 		if _, got, _, ok := translate(as, va); !ok || !got.Write {
 			t.Errorf("page %#x is not writable", va)
 		}
+	}
+
+	// A read-only request asks MapInternal for a view without write access.
+	r := &fakeFile{blocks: []safemem.Block{safemem.BlockFromSafeSlice(mem[2*pageSize : 4*pageSize])}}
+	if err := as.MapFile(0x440000, r, fr, hostarch.Read, false); err != nil {
+		t.Fatal(err)
+	}
+	if !r.lastAT.Read || r.lastAT.Write {
+		t.Errorf("MapInternal got %+v, want a read-only request", r.lastAT)
 	}
 
 	// A MapInternal failure is an error. There is no silent read-only retry.
@@ -222,11 +199,10 @@ func TestMapFileUsesTheRequestedAccessAndRejectsBadHostMemory(t *testing.T) {
 	}
 
 	// A host slice that is not page aligned fails the whole call. The first
-	// block must not stay mapped.
-	before := len(fb.mapped)
+	// block must not reach the page tables.
 	bad := &fakeFile{blocks: []safemem.Block{
-		safemem.BlockFromSafeSlice(mem[2*pageSize : 3*pageSize]),
-		safemem.BlockFromSafeSlice(mem[3*pageSize+8 : 4*pageSize+8-8]),
+		safemem.BlockFromSafeSlice(mem[4*pageSize : 5*pageSize]),
+		safemem.BlockFromSafeSlice(mem[5*pageSize+8 : 6*pageSize+8]),
 	}}
 	if err := as.MapFile(0x600000, bad, fr, hostarch.Read, false); err == nil {
 		t.Fatal("MapFile accepted unaligned host memory")
@@ -234,8 +210,11 @@ func TestMapFileUsesTheRequestedAccessAndRejectsBadHostMemory(t *testing.T) {
 	if _, _, _, ok := translate(as, 0x600000); ok {
 		t.Error("the aligned block of a failed MapFile stays mapped")
 	}
-	if len(fb.mapped) != before {
-		t.Errorf("a failed MapFile leaks %d partition mappings", len(fb.mapped)-before)
+
+	// A file that returns more or fewer bytes than the range fails.
+	short := &fakeFile{blocks: []safemem.Block{safemem.BlockFromSafeSlice(mem[:pageSize])}}
+	if err := as.MapFile(0x700000, short, fr, hostarch.Read, false); err == nil {
+		t.Error("MapFile accepted a host block shorter than the range")
 	}
 
 	for _, c := range []struct {
@@ -274,9 +253,6 @@ func TestMapFileFailureKeepsExistingMappings(t *testing.T) {
 	if got, _, _, ok := translate(as, 0x400000); !ok || got != gpa {
 		t.Error("a failed remap changed the existing mapping")
 	}
-	if n, err := as.CopyOut(0x400000, []byte{1}); n != 1 || err != nil {
-		t.Errorf("the old mapping stopped working: %d, %v", n, err)
-	}
 }
 
 // activeVP simulates a processor that runs guest code for as. It returns the
@@ -305,7 +281,40 @@ func waitCancels(fb *fakeBackend, v *vcpu, n int) {
 	}
 }
 
-func TestUnmapStopsRunningProcessorsBeforeReleasingPages(t *testing.T) {
+// stopsBeforeReturn runs change while a processor runs guest code for as. It
+// checks that change does not return before the processor left the guest, that
+// the entry of va is gone or replaced by then, and that the generation
+// advanced. A change that returns early would let the Sentry reuse a page
+// that the processor can still reach.
+func stopsBeforeReturn(t *testing.T, p *Platform, fb *fakeBackend, as *AddressSpace, va uint64, oldGPA uint64, change func()) {
+	t.Helper()
+	v, leave := activeVP(t, p, fb, as)
+	genBefore := as.gen.Load()
+	done := make(chan struct{})
+	go func() {
+		change()
+		close(done)
+	}()
+	waitCancels(fb, v, 1)
+	select {
+	case <-done:
+		t.Fatal("the change returned while the processor still ran guest code")
+	default:
+	}
+	// The kick follows the page-table change, and the change still holds
+	// as.mu while it waits, so the test reads the tables without the lock.
+	gpa, _, _, ok := translate(as, va)
+	if ok && gpa == oldGPA {
+		t.Error("the old entry still names the page while the processor is being stopped")
+	}
+	if as.gen.Load() == genBefore {
+		t.Error("the change did not advance the TLB generation")
+	}
+	leave()
+	<-done
+}
+
+func TestUnmapStopsRunningProcessorsAndKeepsThePartitionMapped(t *testing.T) {
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
 	as := newTestAS(t, p)
@@ -314,36 +323,18 @@ func TestUnmapStopsRunningProcessorsBeforeReleasingPages(t *testing.T) {
 		t.Fatal(err)
 	}
 	gpa, _, _, _ := translate(as, 0x400000)
-	v, leave := activeVP(t, p, fb, as)
-	genBefore := as.gen.Load()
+	maps0, unmaps0 := fb.calls()
 
-	done := make(chan struct{})
-	go func() {
-		as.Unmap(0x400000, pageSize)
-		close(done)
-	}()
-	waitCancels(fb, v, 1)
-	select {
-	case <-done:
-		t.Fatal("Unmap returned while the processor still ran guest code")
-	default:
+	stopsBeforeReturn(t, p, fb, as, 0x400000, gpa, func() { as.Unmap(0x400000, pageSize) })
+
+	if _, _, _, ok := translate(as, 0x400000); ok {
+		t.Error("the page stays mapped in the page tables after Unmap")
 	}
-	fb.mu.Lock()
-	_, stillMapped := fb.mapped[gpa]
-	fb.mu.Unlock()
-	if !stillMapped {
-		t.Error("the guest page was unmapped before the processor left the guest")
+	if maps, unmaps := fb.calls(); maps != maps0 || unmaps != unmaps0 {
+		t.Errorf("Unmap made %d map calls and %d unmap calls, want none", maps-maps0, unmaps-unmaps0)
 	}
-	if as.gen.Load() == genBefore {
-		t.Error("Unmap did not advance the TLB generation")
-	}
-	leave()
-	<-done
-	fb.mu.Lock()
-	_, stillMapped = fb.mapped[gpa]
-	fb.mu.Unlock()
-	if stillMapped {
-		t.Error("the guest page stays mapped after Unmap")
+	if _, ok := hostOf(fb, gpa); !ok {
+		t.Error("the registration of the host memory is gone after Unmap")
 	}
 }
 
@@ -374,7 +365,7 @@ func TestFreedPageTablesWaitForTheInvalidation(t *testing.T) {
 	}
 }
 
-func TestReplacingAMappingInvalidatesAndReleasesTheOldPage(t *testing.T) {
+func TestReplacingAMappingStopsProcessorsBeforeItReturns(t *testing.T) {
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
 	as := newTestAS(t, p)
@@ -391,17 +382,21 @@ func TestReplacingAMappingInvalidatesAndReleasesTheOldPage(t *testing.T) {
 	if as.gen.Load() != gen {
 		t.Error("a fresh mapping advanced the generation")
 	}
-	if err := as.mapHost(0x400000, mem[pageSize:], hostarch.Read); err != nil {
-		t.Fatal(err)
+	maps0, unmaps0 := fb.calls()
+	stopsBeforeReturn(t, p, fb, as, 0x400000, oldGPA, func() {
+		if err := as.mapHost(0x400000, mem[pageSize:], hostarch.Read); err != nil {
+			t.Error(err)
+		}
+	})
+	newGPA, got, _, ok := translate(as, 0x400000)
+	if !ok || newGPA == oldGPA || got.Write {
+		t.Errorf("the replaced entry maps %#x with %+v, want another read-only page", newGPA, got)
 	}
-	if as.gen.Load() == gen {
-		t.Error("replacing a mapping did not advance the generation")
+	if _, unmaps := fb.calls(); unmaps != unmaps0 {
+		t.Error("replacing a mapping unmapped guest memory in the partition")
 	}
-	if _, ok := fb.mapped[oldGPA]; ok {
-		t.Error("the replaced page stays mapped in the partition")
-	}
-	if n, err := as.CopyOut(0x400000, []byte{1}); n != 0 || err == nil {
-		t.Error("the replaced page is still writable")
+	if maps, _ := fb.calls(); maps != maps0 {
+		t.Errorf("remapping registered host memory again: %d map calls", maps-maps0)
 	}
 }
 
@@ -425,40 +420,53 @@ func TestExecuteMappingsAdvanceTheCodeGeneration(t *testing.T) {
 	}
 }
 
-// pageMappings counts the single-page mappings of the fake. Page-table slabs
-// are larger and do not count.
-func pageMappings(fb *fakeBackend) int {
-	n := 0
-	for _, m := range fb.mapped {
-		if m.size == pageSize {
-			n++
-		}
-	}
-	return n
-}
-
-func TestReleaseUnmapsAllMemory(t *testing.T) {
+func TestReleaseLeavesNoReachableMapping(t *testing.T) {
 	fb := newFakeBackend()
 	p := newTestPlatform(t, fb, Options{})
-	baseline := pageMappings(fb)
 	as, err := p.NewAddressSpace(platformASOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
 	a := as.(*AddressSpace)
 	mem := mustHost(t, fb, 4)
+	var gpas [4]uint64
 	for i := range 4 {
-		if err := a.mapHost(hostarch.Addr(0x400000+uint64(i)*0x100000), mem[i*pageSize:(i+1)*pageSize], hostarch.ReadWrite); err != nil {
+		va := 0x400000 + uint64(i)*0x100000
+		if err := a.mapHost(hostarch.Addr(va), mem[i*pageSize:(i+1)*pageSize], hostarch.ReadWrite); err != nil {
 			t.Fatal(err)
 		}
+		gpas[i], _, _, _ = translate(a, va)
 	}
-	if got := pageMappings(fb); got != baseline+4 {
-		t.Fatalf("%d page mappings, want %d", got, baseline+4)
+	maps0, unmaps0 := fb.calls()
+	slabs := len(p.pool.slabs)
+
+	// A processor that runs the address space must leave the guest before
+	// Release returns. The Sentry reuses the pages afterwards.
+	v, leave := activeVP(t, p, fb, a)
+	done := make(chan struct{})
+	go func() {
+		as.Release()
+		close(done)
+	}()
+	waitCancels(fb, v, 1)
+	select {
+	case <-done:
+		t.Fatal("Release returned while the processor still ran guest code")
+	default:
 	}
-	pagesUsed := p.gpa.inUse()
-	as.Release()
-	if got := pageMappings(fb); got != baseline {
-		t.Errorf("Release leaves %d guest pages mapped", got-baseline)
+	leave()
+	<-done
+
+	for i := range 4 {
+		if _, _, _, ok := translate(a, 0x400000+uint64(i)*0x100000); ok {
+			t.Errorf("page %d is still reachable through the page tables after Release", i)
+		}
+	}
+	if !a.dead.Load() {
+		t.Error("a released address space is not marked dead")
+	}
+	if maps, unmaps := fb.calls(); maps != maps0 || unmaps != unmaps0 {
+		t.Errorf("Release made %d map calls and %d unmap calls, want none", maps-maps0, unmaps-unmaps0)
 	}
 	as.Release() // A second Release does nothing.
 	if err := a.mapHost(0x400000, mem[:pageSize], hostarch.Read); err == nil {
@@ -466,14 +474,22 @@ func TestReleaseUnmapsAllMemory(t *testing.T) {
 	}
 	// The page-table pages return to the pool, so a new address space reuses them.
 	b := newTestAS(t, p)
-	if p.gpa.inUse() > pagesUsed {
-		t.Errorf("the guest physical window grew from %d to %d pages", pagesUsed, p.gpa.inUse())
+	if len(p.pool.slabs) != slabs {
+		t.Errorf("the pool grew from %d to %d slabs", slabs, len(p.pool.slabs))
 	}
 	if b.id == a.id {
 		t.Error("address spaces share an identifier")
 	}
-	if n, err := a.CopyIn(0x400000, make([]byte, 1)); n != 0 || err == nil {
-		t.Error("a released address space still serves reads")
+	// The new address space reaches no old page until it maps one itself.
+	for i := range 4 {
+		if _, _, _, ok := translate(b, 0x400000+uint64(i)*0x100000); ok {
+			t.Errorf("a new address space inherits the mapping of page %d", i)
+		}
+	}
+	for i, gpa := range gpas {
+		if _, ok := hostOf(fb, gpa); !ok {
+			t.Errorf("the registration of page %d is gone after Release", i)
+		}
 	}
 }
 
@@ -496,4 +512,6 @@ func TestUnmapOfLargeSparseRanges(t *testing.T) {
 	}
 	// A range past the user limit clamps instead of wrapping.
 	as.Unmap(hostarch.Addr(p.maxUser()-pageSize), 1<<50)
+	// A range that starts at or past the user limit does nothing.
+	as.Unmap(hostarch.Addr(p.maxUser()), pageSize)
 }

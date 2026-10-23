@@ -56,7 +56,13 @@ type testMM struct {
 	as platform.AddressSpace
 }
 
-func (*testMM) MMap(context.Context, memmap.MMapOpts) (hostarch.Addr, error) {
+// MMap accepts a mapping at a fixed address, which the trampoline islands of
+// the fast path need. The tests map their own pages at fixed addresses, and the
+// island allocator keeps 2MB away from the code that it serves.
+func (*testMM) MMap(_ context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
+	if opts.Fixed {
+		return opts.Addr, nil
+	}
 	return 0, unix.ENOSYS
 }
 
@@ -97,6 +103,14 @@ func newRig(t testing.TB, p *Platform) *rig {
 	if err != nil {
 		t.Fatalf("NewDefaultMemoryFile: %v", err)
 	}
+	t.Cleanup(mf.Destroy)
+	return newRigOn(t, p, mf)
+}
+
+// newRigOn returns a rig with a new address space and context that use the
+// memory file mf. The caller destroys mf.
+func newRigOn(t testing.TB, p *Platform, mf *pgalloc.MemoryFile) *rig {
+	t.Helper()
 	asI, err := p.NewAddressSpace(platform.AddressSpaceOptions{})
 	if err != nil {
 		t.Fatalf("NewAddressSpace: %v", err)
@@ -108,7 +122,6 @@ func newRig(t testing.TB, p *Platform) *rig {
 	t.Cleanup(func() {
 		r.ctx.Release()
 		as.Release()
-		mf.Destroy()
 	})
 	return r
 }
@@ -540,15 +553,22 @@ func TestManySystemCalls(t *testing.T) {
 
 func TestAddressSpacesAreIndependent(t *testing.T) {
 	p := newPlatform(t)
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	t.Cleanup(mf.Destroy)
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			r := newRig(t, p)
+			r := newRigOn(t, p, mf)
 			r.program(gSyscall(uint64(200+i), uint64(i)))
 			si, _, err := r.run()
-			mustSyscall(t, si, err, uint64(200+i), r.ac)
+			if si != nil || err != nil || regNr(r.ac) != uint64(200+i) {
+				t.Errorf("address space %d: Switch = (%s, %v), number %d", i, describe(si), err, regNr(r.ac))
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -581,7 +601,10 @@ func TestParkedThreadDoesNotFreezeTheProcess(t *testing.T) {
 	go func() {
 		defer close(done)
 		si, _, err := b.run()
-		mustSyscall(t, si, err, 9, b.ac)
+		if si != nil || err != nil || regNr(b.ac) != 9 {
+			t.Errorf("thread B: Switch = (%s, %v), number %d", describe(si), err, regNr(b.ac))
+			return
+		}
 		if got := regAcc(b.ac); got != 6_000_000 {
 			t.Errorf("sum = %d, want 6000000", got)
 		}
@@ -614,9 +637,50 @@ func TestConcurrentThreads(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < calls; i++ {
 				si, _, err := th.run()
-				mustSyscall(t, si, err, uint64(300+i), th.ac)
+				if si != nil || err != nil || regNr(th.ac) != uint64(300+i) {
+					t.Errorf("call %d: Switch = (%s, %v), number %d", i, describe(si), err, regNr(th.ac))
+					return
+				}
 			}
 		}()
+	}
+	wg.Wait()
+}
+
+func TestForkStorm(t *testing.T) {
+	// Many processes start and exit at once. Some tasks release the address
+	// space first and the context second, the way the Sentry does when a
+	// process exits while a thread still holds its context.
+	p := newPlatform(t)
+	// One memory file serves every task. A memory file takes a gigabyte of
+	// address space and disk space, and the hosted runners have little disk.
+	mf, err := pgalloc.NewDefaultMemoryFile(pgalloc.MemoryFileOpts{})
+	if err != nil {
+		t.Fatalf("NewDefaultMemoryFile: %v", err)
+	}
+	t.Cleanup(mf.Destroy)
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for round := 0; round < 4; round++ {
+				r := newRigOn(t, p, mf)
+				r.program(gSyscall(uint64(400 + i)))
+				si, _, err := r.run()
+				if si != nil || err != nil || regNr(r.ac) != uint64(400+i) {
+					t.Errorf("task %d round %d: Switch = (%s, %v), number %d", i, round, describe(si), err, regNr(r.ac))
+					return
+				}
+				if i%2 == 0 {
+					r.as.Release()
+					r.ctx.Release()
+				} else {
+					r.ctx.Release()
+					r.as.Release()
+				}
+			}
+		}(i)
 	}
 	wg.Wait()
 }
@@ -658,6 +722,63 @@ func TestCloseTerminatesStubs(t *testing.T) {
 			t.Fatalf("stub %d is still alive after Close", pid)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitPool waits until the pool of p holds poolDepth stubs and returns their
+// process IDs.
+func waitPool(t *testing.T, p *Platform) []uint32 {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for len(p.pool.ready) < poolDepth {
+		if time.Now().After(deadline) {
+			t.Fatalf("the pool holds %d stubs after 30 s, want %d", len(p.pool.ready), poolDepth)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	p.dbg.mu.Lock()
+	defer p.dbg.mu.Unlock()
+	var pids []uint32
+	for pid := range p.dbg.procs {
+		pids = append(pids, pid)
+	}
+	return pids
+}
+
+func TestPooledStubServesNewAddressSpace(t *testing.T) {
+	p := newPlatform(t)
+	pooled := waitPool(t, p)
+	asI, err := p.NewAddressSpace(platform.AddressSpaceOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	as := asI.(*addressSpace)
+	t.Cleanup(as.Release)
+	for _, pid := range pooled {
+		if pid == as.sp.pid {
+			return
+		}
+	}
+	t.Errorf("the address space runs in stub %d, which is not one of the pooled stubs %v", as.sp.pid, pooled)
+}
+
+func TestCloseTerminatesPooledStubs(t *testing.T) {
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pooled := waitPool(t, p)
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for _, pid := range pooled {
+		for alive(pid) {
+			if time.Now().After(deadline) {
+				t.Fatalf("pooled stub %d is still alive after Close", pid)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 }
 

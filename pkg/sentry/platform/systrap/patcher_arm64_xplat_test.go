@@ -107,9 +107,9 @@ func TestTrapSlotLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := func(i int) uint32 { return binary.LittleEndian.Uint32(buf[4*i:]) }
-	// Disassembly: stp x16, x17, [sp, #-16]; adr x17, .+12; ldr x16, .+16; br x16;
-	// ldp x16, x17, [sp, #-16]; b ret; .quad spill.
-	if w(0) != 0xa93f47f0 || w(1) != 0x10000071 || w(2) != 0x58000090 || w(3) != 0xd61f0200 || w(4) != 0xa97f47f0 {
+	// Disassembly: stp x16, x17, [sp, #-512]; adr x17, .+12; ldr x16, .+16; br x16;
+	// ldp x16, x17, [sp, #-512]; b ret; .quad spill.
+	if w(0) != 0xa92047f0 || w(1) != 0x10000071 || w(2) != 0x58000090 || w(3) != 0xd61f0200 || w(4) != 0xa96047f0 {
 		t.Errorf("slot words = %#x %#x %#x %#x %#x", w(0), w(1), w(2), w(3), w(4))
 	}
 	if target, ok := decodeBranch(slotVA+20, w(5)); !ok || target != ret {
@@ -226,5 +226,26 @@ func TestCtrSlotLoadsTheConstantAndReturns(t *testing.T) {
 	}
 	if err := encodeCTRSlot(make([]byte, loadSlotSize), 0, arm64BranchRange+64, 1); err == nil {
 		t.Error("an out-of-range return must be rejected")
+	}
+}
+
+func TestIsDataCacheMaintenance(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		word uint32
+		want bool
+	}{
+		{"dc civac, x3", 0xd50b7e23, true},
+		{"dc cvau, x0", 0xd50b7b20, true},
+		{"dc cvac, xzr", 0xd50b7a3f, true},
+		{"dc cvap, x30", 0xd50b7c3e, true},
+		{"dc zva, x1", 0xd50b7421, false},
+		{"ic ivau, x1", 0xd50b7521, false},
+		{"dc ivac, x1", 0xd5087621, false},
+		{"nop", 0xd503201f, false},
+	} {
+		if got := isDataCacheMaintenance(tc.word); got != tc.want {
+			t.Errorf("isDataCacheMaintenance(%#x), %s = %v, want %v", tc.word, tc.name, got, tc.want)
+		}
 	}
 }

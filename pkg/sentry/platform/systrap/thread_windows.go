@@ -19,6 +19,7 @@ package systrap
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -54,6 +55,23 @@ type thread struct {
 	// forced stop set. Callers hold mu.
 	stepping bool
 
+	// lastExecPC and execRepeats count the execute faults at one pc that the
+	// engine retried without a patch. Callers hold mu.
+	lastExecPC  uint64
+	execRepeats int
+
+	// closeOnce makes sure that the handle closes once. The stub process and
+	// the context can both release the thread, and a second CloseHandle could
+	// close a new object that reuses the handle value.
+	closeOnce sync.Once
+
+	// fast is the fast path state of the thread. It is nil when the platform
+	// runs without the fast path.
+	fast atomic.Pointer[fastThread]
+	// evQueued counts the events in the channel, so that a Sentry thread that
+	// polls the handoff word sees a stop that the debugger delivered.
+	evQueued atomic.Int32
+
 	archThread
 }
 
@@ -80,11 +98,13 @@ func (th *thread) waitEvent(limit time.Duration) (debugEvent, error) {
 	}
 	select {
 	case ev := <-th.events:
+		th.evQueued.Add(-1)
 		return ev, nil
 	case <-th.sp.deadCh:
 		select {
 		case ev := <-th.events:
 			// Prefer an exception that arrived before the death.
+			th.evQueued.Add(-1)
 			return ev, nil
 		default:
 		}
@@ -166,6 +186,21 @@ func (th *thread) continueEvent(ev debugEvent) error {
 	return nil
 }
 
+// continueUnchanged lets a thread run on after an exception that the engine
+// resolved without a change to the registers. The kernel context of the thread
+// already equals th.ctx, so the call skips NtSetContextThread. Callers hold mu.
+func (th *thread) continueUnchanged(ev debugEvent) error {
+	if err := th.sp.p.dbg.reply(ev); err != nil {
+		return th.ctxErr("NtDebugContinue", err)
+	}
+	return nil
+}
+
+// closeHandle closes the thread handle. It is safe to call more than once.
+func (th *thread) closeHandle() {
+	th.closeOnce.Do(func() { _ = windows.CloseHandle(th.h) })
+}
+
 // destroy terminates the thread and forgets it.
 func (th *thread) destroy() {
 	sp := th.sp
@@ -180,7 +215,8 @@ func (th *thread) destroy() {
 	if !sp.dead.Load() {
 		_ = ntTerminateThread(th.h)
 	}
-	_ = windows.CloseHandle(th.h)
+	th.releaseFast()
+	th.closeHandle()
 }
 
 // start loads the guest registers of ac into the scratch record of a parked
@@ -190,42 +226,59 @@ func (th *thread) destroy() {
 func (th *thread) start(ac *arch.Context64, loadFP bool) error {
 	th.mu.Lock()
 	defer th.mu.Unlock()
+	if f := th.fast.Load(); f != nil && f.inSpill {
+		return th.fastStart(f, ac, loadFP)
+	}
 	th.ctx.loadFrom(ac, loadFP)
 	th.stepping = false
+	th.lastExecPC, th.execRepeats = 0, 0
 	return th.archStart(ac)
 }
 
-// run starts the parked thread with the registers that start loaded.
+// run starts the thread with the registers that start loaded. A parked thread
+// resumes. A thread that waits in the spill routine gets its resume state.
 func (th *thread) run() error {
 	th.mu.Lock()
 	defer th.mu.Unlock()
+	if f := th.fast.Load(); f != nil && f.inSpill {
+		return th.fastRun(f)
+	}
 	return th.resumeParked()
 }
 
 // forceStop makes a running thread stop at the next instruction boundary. It
 // sets the single-step flag, so the thread raises a single-step exception
-// after one more instruction.
+// after one more instruction. It returns false when the thread runs the code
+// of a trap, which publishes its own stop. The caller tries again.
 //
 // WHY: a thread that runs a tight loop raises no exception by itself. Windows
 // has no signal to interrupt it. The step exception also reaches the Sentry
 // through the same event path as every other stop, so no stop can overtake an
 // exception that the thread raised before the Sentry suspended it.
-func (th *thread) forceStop() {
+func (th *thread) forceStop() bool {
 	th.mu.Lock()
 	defer th.mu.Unlock()
 	if th.parked || th.stepping || th.sp.dead.Load() {
-		return
+		return true
+	}
+	if f := th.fast.Load(); f != nil && f.inSpill {
+		// The thread waits in the spill routine. Switch sees the trap.
+		return true
 	}
 	if err := ntSuspendThread(th.h); err != nil {
-		return
+		return true
 	}
 	defer func() { _ = ntResumeThread(th.h) }()
 	if err := th.getContext(ctxFlagControl); err != nil {
-		return
+		return true
+	}
+	if th.inFastCode(th.ctx.pc()) {
+		return false
 	}
 	th.ctx.setSingleStep(true)
 	if err := th.setContext(); err != nil {
-		return
+		return true
 	}
 	th.stepping = true
+	return true
 }

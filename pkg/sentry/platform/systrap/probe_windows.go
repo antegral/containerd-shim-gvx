@@ -39,7 +39,12 @@ type probeMM struct {
 	as platform.AddressSpace
 }
 
-func (*probeMM) MMap(context.Context, memmap.MMapOpts) (hostarch.Addr, error) {
+// MMap accepts a mapping at a fixed address, which is what the trampoline
+// islands need. The probe has no memory manager that could place anything else.
+func (*probeMM) MMap(_ context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
+	if opts.Fixed {
+		return opts.Addr, nil
+	}
 	return 0, unix.ENOSYS
 }
 

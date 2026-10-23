@@ -89,6 +89,10 @@ type Platform struct {
 	// in [userMin, userMax), so every guest mapping in that range succeeds.
 	userMin, userMax uint64
 
+	// zone is true when the platform holds a fixed-address executable. See
+	// patcher_darwin_arm64_zone.go.
+	zone bool
+
 	// images caches the headers of the files that guests map as code.
 	images imageCache
 
@@ -119,7 +123,15 @@ func New() (*Platform, error) {
 		_ = pool.close()
 		return nil, err
 	}
-	return &Platform{pool: pool, host: host, userMin: userMin, userMax: userMax}, nil
+	zone := zoneModeRequested()
+	if zone {
+		if userMin > zoneBias+zoneMin || userMax < zoneBias+zoneLimit+blockSize {
+			_ = host.close()
+			_ = pool.close()
+			return nil, fmt.Errorf("the guest address range [%#x, %#x) cannot hold the zone for fixed-address executables at %#x", userMin, userMax, uint64(zoneBias))
+		}
+	}
+	return &Platform{pool: pool, host: host, userMin: userMin, userMax: userMax, zone: zone}, nil
 }
 
 // regionLister reports the first mapping that ends above addr.
@@ -188,14 +200,50 @@ func (p *Platform) Close() error {
 // memory file only.
 func (*Platform) SupportsAddressSpaceIO() bool { return false }
 
-// MapUnit implements platform.Platform.MapUnit.
-func (*Platform) MapUnit() uint64 { return blockSize }
+// MapUnit implements platform.Platform.MapUnit. MapFile maps a whole range with
+// one remap and one protection call, so a fault maps up to 256KB of its pma at
+// once. A larger unit would map pages that the guest never touches.
+func (*Platform) MapUnit() uint64 { return mapUnit }
 
-// MinUserAddress implements platform.Platform.MinUserAddress.
-func (p *Platform) MinUserAddress() hostarch.Addr { return hostarch.Addr(p.userMin) }
+// MinUserAddress implements platform.Platform.MinUserAddress. In zone mode the
+// guest range starts at the bottom of the zone, where a fixed-address
+// executable links.
+func (p *Platform) MinUserAddress() hostarch.Addr {
+	if p.zone {
+		return hostarch.Addr(zoneMin)
+	}
+	return hostarch.Addr(p.userMin)
+}
 
 // MaxUserAddress implements platform.Platform.MaxUserAddress.
 func (p *Platform) MaxUserAddress() hostarch.Addr { return hostarch.Addr(p.userMax) }
+
+// UserAddressHole implements platform.AddressHolePlatform. In zone mode the
+// range between the zone and the first address above the biased zone holds
+// either host reservations or the biased copy of the zone, and the memory
+// manager must not place a mapping there.
+func (p *Platform) UserAddressHole() hostarch.AddrRange {
+	if !p.zone {
+		return hostarch.AddrRange{}
+	}
+	return hostarch.AddrRange{Start: zoneLimit, End: zoneBias + zoneLimit}
+}
+
+// stubAddr returns the address in the stub task of a guest address.
+func (p *Platform) stubAddr(guest uint64) uint64 {
+	if p.zone && inZoneGuest(guest) {
+		return guest + zoneBias
+	}
+	return guest
+}
+
+// guestAddr returns the guest address of a stub address.
+func (p *Platform) guestAddr(stub uint64) uint64 {
+	if p.zone && inZoneStub(stub) {
+		return stub - zoneBias
+	}
+	return stub
+}
 
 // NewAddressSpace implements platform.Platform.NewAddressSpace. The platform
 // patches syscalls always, so the DisableSyscallPatching option has no effect.
@@ -218,3 +266,6 @@ func (*Platform) SeccompInfo() platform.SeccompInfo {
 // ConcurrencyCount implements platform.Platform.ConcurrencyCount. Each guest
 // thread has its own host thread, so the platform never makes Switch wait.
 func (*Platform) ConcurrencyCount() int { return math.MaxInt }
+
+// mapUnit is the alignment that the memory manager uses to widen a fault.
+const mapUnit = 256 << 10

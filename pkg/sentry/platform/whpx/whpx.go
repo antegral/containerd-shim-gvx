@@ -31,8 +31,10 @@
 //
 // Each address space owns its own guest page tables, built with
 // pkg/ring0/pagetables. All address spaces share the kernel region: stub
-// code, descriptor tables and the CommPages. Guest physical pages come from
-// one window, so address spaces never alias each other.
+// code, descriptor tables and the CommPages. Guest memory comes from the
+// host memory that MapFile receives. The partition maps that memory once, in
+// arenas of one guest physical window (gpa.go), and keeps it until Close.
+// An address space reaches only the pages that its own page tables name.
 package whpx
 
 import (
@@ -205,8 +207,8 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 	}()
 
 	archInit()
-	p.gpa = newGPAAllocator(gpaWindowBase, gpaWindowEnd)
-	p.mem = newMemoryMap(be, p.gpa)
+	p.gpa = newGPAAllocator(gpaWindowBase, gpaTableEnd)
+	p.mem = newMemoryMap(be, gpaTableEnd, gpaWindowEnd)
 	p.pool = newPTPool(be, p.gpa)
 	p.kernel, err = buildKernelRegion(be, p.gpa, p.pool, arm64, p.vpCount)
 	if err != nil {
@@ -222,6 +224,9 @@ func newPlatform(be backend, opts Options) (p *Platform, err error) {
 // processor in the hypervisor any more.
 func (p *Platform) teardown() error {
 	var errs []error
+	if p.mem != nil {
+		errs = append(errs, p.mem.close())
+	}
 	if p.kernel != nil {
 		errs = append(errs, p.kernel.release(p.be, p.gpa))
 	}
@@ -274,10 +279,14 @@ func (p *Platform) anyBusy(vps []*vcpu) bool {
 }
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
-func (*Platform) SupportsAddressSpaceIO() bool { return true }
+// The Sentry reads and writes guest memory through the host mappings of the
+// memory file, so the address space has no copy methods.
+func (*Platform) SupportsAddressSpaceIO() bool { return false }
 
-// MapUnit implements platform.Platform.MapUnit.
-func (*Platform) MapUnit() uint64 { return pageSize }
+// MapUnit implements platform.Platform.MapUnit. One fault maps up to 2 MiB.
+// MapFile registers host memory in the partition once. It writes one run of
+// page-table entries for each contiguous range.
+func (*Platform) MapUnit() uint64 { return 2 << 20 }
 
 // MinUserAddress implements platform.Platform.MinUserAddress.
 func (*Platform) MinUserAddress() hostarch.Addr { return hostarch.Addr(minUserAddr) }

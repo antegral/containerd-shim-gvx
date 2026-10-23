@@ -80,7 +80,7 @@ func TestNewPlatformMapsTheKernelRegion(t *testing.T) {
 	if p.ConcurrencyCount() != p.vpCount || p.vpCount < 1 || p.vpCount > maxVPs {
 		t.Fatalf("concurrency count is %d for %d processors", p.ConcurrencyCount(), p.vpCount)
 	}
-	if p.MapUnit() != pageSize || p.MinUserAddress() != minUserAddr || !p.SupportsAddressSpaceIO() {
+	if p.MapUnit() != 2<<20 || p.MinUserAddress() != minUserAddr || p.SupportsAddressSpaceIO() {
 		t.Error("platform constants are wrong")
 	}
 	wantMax := uint64(maxUserAddrX64)
@@ -156,6 +156,12 @@ func TestCloseReleasesEverything(t *testing.T) {
 	}
 	if err := p.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if len(fb.mapped) != 0 {
+		t.Errorf("Close leaves %d mappings in the partition", len(fb.mapped))
+	}
+	if err := as.(*AddressSpace).mapHost(0x500000, guestMem, hostarch.ReadWrite); !errors.Is(err, errClosed) {
+		t.Errorf("mapping after Close returned %v, want errClosed", err)
 	}
 	if len(fb.vps) != 0 || len(fb.deleted) != 1 {
 		t.Errorf("%d virtual processors remain, %d deleted", len(fb.vps), len(fb.deleted))

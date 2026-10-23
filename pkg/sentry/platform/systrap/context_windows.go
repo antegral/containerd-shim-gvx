@@ -18,7 +18,9 @@ package systrap
 
 import (
 	"fmt"
+	"runtime"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -64,6 +66,14 @@ func (c *Context) threadIn(as *addressSpace) (*thread, error) {
 	th, err := as.sp.newGuestThread()
 	if err != nil {
 		return nil, err
+	}
+	if as.p.fast {
+		// Every thread of a stub that runs patched code needs its slot, because
+		// the spill routine finds the winSysmsg of the thread through the TEB.
+		if err := as.attachFast(th); err != nil {
+			th.destroy()
+			return nil, err
+		}
 	}
 	c.th.Store(th)
 	c.needRestoreFP = true
@@ -126,15 +136,30 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 		// Switch tests the flag after it starts the thread, and a kick tests the
 		// state of the thread after it sets the flag, so one of the two sees the other.
 		if c.kicked.Load() {
-			th.forceStop()
+			c.stopThread(th)
 		}
 		for {
-			ev, err := th.waitEvent(0)
+			var waited time.Time
+			if traceEvents {
+				waited = time.Now()
+			}
+			ev, trapped, err := th.waitNext()
 			if err != nil {
 				return nil, hostarch.NoAccess, errDeadContext
 			}
-			out := c.handleEvent(ctx, mm, as, th, ac, ev)
+			var out outcome
+			if trapped {
+				out = c.fastTrap(as, th, ac)
+			} else {
+				if traceEvents {
+					stopStats.waitNs[kindOf(ev)].Add(uint64(time.Since(waited)))
+				}
+				out = c.handleEvent(ctx, mm, as, th, ac, ev)
+			}
 			if out.done {
+				if traceAll && !traceMuted.Load() {
+					tracef("pid %d thread %d: switch returns, signal %v, error %v", th.sp.pid, th.tid, out.si != nil, out.err)
+				}
 				// The stop copied the general-purpose registers. The vector
 				// registers stay in the parked thread until PullFullState.
 				c.fpInThread = true
@@ -158,8 +183,14 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 	if err := th.getContext(th.ctx.gprFlags()); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
-	if traceEvents && !traceMuted.Load() {
-		tracef("thread %d: state %d code %#x addr %#x info %#x first %d, pc %#x sp %#x code bytes % x", th.tid, ev.State, ev.Code, ev.Addr, ev.Info, ev.FirstChance, th.ctx.pc(), th.ctx.sp(), as.codeBytes(th.ctx.pc(), 16))
+	if traceEvents {
+		kind := kindOf(ev)
+		stopStats.count[kind].Add(1)
+		start := time.Now()
+		defer func() { stopStats.handleNs[kind].Add(uint64(time.Since(start))) }()
+	}
+	if traceAll && !traceMuted.Load() {
+		th.traceStop(as, ev)
 	}
 	if out, ok := th.archEvent(as, ac, ev); ok {
 		return out
@@ -173,29 +204,35 @@ func (c *Context) handleEvent(ctx context.Context, mm platform.MemoryManager, as
 		return c.faultStop(ctx, mm, as, th, ac, ev)
 	case statusIllegalInsn, statusPrivInsn:
 		sig, code := th.illegalSignal(as, th.ctx.pc())
-		return c.signalStop(th, ac, ev, linux.Signal(sig), code, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.Signal(sig), code, th.ctx.pc())
 	case statusBreakpoint:
-		return c.signalStop(th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGTRAP, linux.TRAP_BRKPT, th.ctx.pc())
 	case statusSingleStep:
 		return c.stepStop(th, ac, ev)
 	case statusDatatypeMis:
-		return c.signalStop(th, ac, ev, linux.SIGBUS, busAdrAln, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGBUS, busAdrAln, th.ctx.pc())
 	case statusIntDivZero:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeIntDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntDiv, th.ctx.pc())
 	case statusIntOverflow:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeIntOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeIntOvf, th.ctx.pc())
 	case statusFltDivZero:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltDiv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltDiv, th.ctx.pc())
 	case statusFltOverflow:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltOvf, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltOvf, th.ctx.pc())
 	case statusFltUnderflow:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltUnd, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltUnd, th.ctx.pc())
 	case statusFltInexact:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltRes, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltRes, th.ctx.pc())
 	case statusFltInvalid, statusFltDenormal, statusFltStack:
-		return c.signalStop(th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
+		return c.signalStop(as, th, ac, ev, linux.SIGFPE, fpeFltInv, th.ctx.pc())
 	}
 	return fatal(fmt.Errorf("the stub reported exception %#x at %#x (pc %#x)", ev.Code, ev.Addr, th.ctx.pc()), unix.EFAULT)
+}
+
+// traceStop prints one stop for GVX_SYSTRAP_TRACE.
+func (th *thread) traceStop(as *addressSpace, ev debugEvent) {
+	tracef("pid %d thread %d: state %d code %#x addr %#x info %#x first %d, pc %#x sp %#x code bytes % x",
+		th.sp.pid, th.tid, ev.State, ev.Code, ev.Addr, ev.Info, ev.FirstChance, th.ctx.pc(), th.ctx.sp(), as.codeBytes(th.ctx.pc(), 16))
 }
 
 // stopAndPull parks the thread at an exception and copies its registers into
@@ -217,10 +254,10 @@ func (th *thread) stopAndPull(ac *arch.Context64, ev debugEvent) error {
 // stepStop serves a single-step stop. The stop belongs to a forced stop of the
 // thread, so the Sentry reports an interrupt.
 func (c *Context) stepStop(th *thread, ac *arch.Context64, ev debugEvent) outcome {
-	if th.stepping && th.inEngineCode(th.ctx.pc()) {
+	if th.stepping && !th.rewindToSite() && th.inEngineCode(th.ctx.pc()) {
 		// The thread runs engine code that the Sentry planted. Step on until
 		// it reaches guest code, where its registers are the guest registers.
-		if err := th.continueEvent(ev); err != nil {
+		if err := th.continueUnchanged(ev); err != nil {
 			return fatal(err, unix.EFAULT)
 		}
 		return running
@@ -232,7 +269,11 @@ func (c *Context) stepStop(th *thread, ac *arch.Context64, ev debugEvent) outcom
 }
 
 // signalStop reports a signal of the guest at pc.
-func (c *Context) signalStop(th *thread, ac *arch.Context64, ev debugEvent, sig linux.Signal, code int32, addr uint64) outcome {
+func (c *Context) signalStop(as *addressSpace, th *thread, ac *arch.Context64, ev debugEvent, sig linux.Signal, code int32, addr uint64) outcome {
+	if traceEvents && !traceMuted.Load() {
+		tracef("signal %d code %d to the guest", sig, code)
+		th.traceStop(as, ev)
+	}
 	if err := th.stopAndPull(ac, ev); err != nil {
 		return fatal(err, unix.EFAULT)
 	}
@@ -273,6 +314,10 @@ const (
 	avExecute = 8
 )
 
+// execRetryLimit is the number of faults at one pc that the engine retries
+// without a patch before it reports SIGSEGV.
+const execRetryLimit = 3
+
 // faultStop serves an access violation. The engine repairs a fault that its
 // own page state caused and reports every other fault as SIGSEGV.
 func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *addressSpace, th *thread, ac *arch.Context64, ev debugEvent) outcome {
@@ -281,18 +326,41 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 	switch kind {
 	case avExecute:
 		addr = pc
-		if st, _, ok := as.blockStateOf(blockRound(pc)); ok {
-			if st == blockData {
-				if err := as.patchBlock(ctx, mm, pc); err != nil {
-					return fatal(fmt.Errorf("patch the code page at %#x: %w", blockRound(pc), err), unix.ENOMEM)
+		if _, _, ok := as.blockStateOf(blockRound(pc)); ok {
+			// An instruction can cross into the next block. The fault then
+			// names an address in the next block, and pc stays in the block
+			// that is already executable. The loop patches every block that
+			// the fetch window of the instruction touches.
+			patched := false
+			for base := blockRound(pc); base < pc+fetchWindow; base += blockSize {
+				if st, _, ok := as.blockStateOf(base); !ok || st != blockData {
+					continue
 				}
+				if err := as.patchBlock(ctx, mm, base); err != nil {
+					return fatal(fmt.Errorf("patch the code page at %#x: %w", base, err), unix.ENOMEM)
+				}
+				patched = true
 			}
-			// A block that is already executable means that another thread
-			// patched it after this thread faulted. Either way the thread retries.
-			if err := th.continueEvent(ev); err != nil {
-				return fatal(err, unix.EFAULT)
+			if patched {
+				th.execRepeats = 0
+			} else if th.lastExecPC == pc {
+				th.execRepeats++
+			} else {
+				th.lastExecPC, th.execRepeats = pc, 1
 			}
-			return running
+			// Without a patch, the fault can come from another thread that
+			// patched the block after this thread faulted, so the thread retries.
+			// A fault that repeats means that the fetch reaches a block that
+			// the guest did not map for execution.
+			if patched || th.execRepeats <= execRetryLimit {
+				if err := th.continueUnchanged(ev); err != nil {
+					return fatal(err, unix.EFAULT)
+				}
+				return running
+			}
+			if a := ev.Info[1]; a >= pc && a-pc < fetchWindow {
+				addr = a
+			}
 		}
 	case avWrite:
 		base := blockRound(addr)
@@ -307,7 +375,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		if ok, err := as.restoreData(base); err != nil {
 			return fatal(err, unix.ENOMEM)
 		} else if ok {
-			if err := th.continueEvent(ev); err != nil {
+			if err := th.continueUnchanged(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running
@@ -315,7 +383,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		// A writable data state means that another thread restored the block
 		// after this thread faulted, so the write retries.
 		if st, at, ok := as.blockStateOf(base); ok && st == blockData && at.Write {
-			if err := th.continueEvent(ev); err != nil {
+			if err := th.continueUnchanged(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running
@@ -374,7 +442,26 @@ func (c *Context) Interrupt() {
 func (c *Context) NotifyInterrupt() {
 	c.kicked.Store(true)
 	if th := c.th.Load(); th != nil {
-		th.forceStop()
+		c.stopThread(th)
+	}
+}
+
+// stopThread forces a stop of a running thread. A thread can run the code of a
+// trap, which publishes its own stop. The call tries again until the thread
+// leaves that code or publishes the trap, which Switch serves.
+func (c *Context) stopThread(th *thread) {
+	for i := 0; !th.forceStop(); i++ {
+		if f := th.fast.Load(); f != nil && f.slot.sm.loadState() == winStateTrapped {
+			return
+		}
+		if !c.kicked.Load() {
+			return
+		}
+		if i < 64 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(10 * time.Microsecond)
+		}
 	}
 }
 
@@ -391,10 +478,18 @@ func (c *Context) PullFullState(_ platform.AddressSpace, ac *arch.Context64) err
 	}
 	th.mu.Lock()
 	defer th.mu.Unlock()
-	if err := th.getContext(th.ctx.fpFlags()); err != nil {
-		return err
+	if f := th.fast.Load(); f != nil && f.inSpill {
+		// The thread waits in the spill routine. The arch code reads the vector
+		// state where the routine keeps it.
+		if err := th.archFastGetFP(f, ac); err != nil {
+			return err
+		}
+	} else {
+		if err := th.getContext(th.ctx.fpFlags()); err != nil {
+			return err
+		}
+		th.ctx.storeFP(ac)
 	}
-	th.ctx.storeFP(ac)
 	c.fpInThread = false
 	return nil
 }

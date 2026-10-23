@@ -407,7 +407,20 @@ func TestDirectoryReplacedBySymlinkDoesNotEscape(t *testing.T) {
 	if _, err := e.ws.OpenFile("d/f", os.O_RDONLY, 0); !errors.Is(err, ErrPathTraversal) {
 		t.Fatalf("OpenFile through swapped directory = %v, want ErrPathTraversal", err)
 	}
-	wantErrno(t, "vfs open through swapped directory", func() error { _, err := e.open("d/f", linux.O_RDONLY, 0); return err }(), linuxerr.EACCES)
+	// A lookup stays valid for cacheTTL, and the guest opened d before the swap,
+	// so the open may still reach the directory that the guest saw: the pinned
+	// handle names that object, not the path. It must never reach the outside
+	// file. TestHostSwapOfPinnedDirectoryIsNoticedAfterTheCacheLifetime covers
+	// the refusal after the cache expires.
+	fd, err := e.open("d/f", linux.O_RDONLY, 0)
+	if err != nil {
+		wantErrno(t, "vfs open through swapped directory", err, linuxerr.EACCES)
+		return
+	}
+	defer fd.DecRef(e.ctx)
+	if got := string(e.readAll(fd)); got == "outside" {
+		t.Fatalf("vfs open through the swapped directory read %q from outside the workspace", got)
+	}
 }
 
 func TestConcurrentRenameOpenStat(t *testing.T) {

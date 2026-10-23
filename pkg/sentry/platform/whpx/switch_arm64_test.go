@@ -136,12 +136,16 @@ func TestSwitchSyscallRoundTripAndResumeProtocol(t *testing.T) {
 	}
 
 	vp := e.fb.vps[0]
-	// Bring-up, the FP load and the park state are the three writes.
+	// Bring-up, the FP load and the park state are the three writes. The
+	// park state carries the root of the first address space.
 	if len(vp.setCalls) != 3 {
 		t.Fatalf("%d register writes, want bring-up, FP load and park state", len(vp.setCalls))
 	}
-	if park := vp.setCalls[2]; len(park) != 3 || park[0] != a64RegSpEl1 || park[1] != a64RegPstate || park[2] != a64RegPc {
+	if park := vp.setCalls[2]; len(park) != 4 || park[0] != a64RegSpEl1 || park[1] != a64RegPstate || park[2] != a64RegPc || park[3] != a64RegTtbr0 {
 		t.Errorf("park registers are %#x", park)
+	}
+	if vp.reg(a64RegTtbr0) != e.as.rootValue() {
+		t.Errorf("TTBR0_EL1 is %#x, want %#x", vp.reg(a64RegTtbr0), e.as.rootValue())
 	}
 	if vp.reg(a64RegSpEl1) != vp.regs[a64RegSpEl1][0] || vp.reg(a64RegSpEl1) != e.p.kernel.layout.comm(0) {
 		t.Errorf("SP_EL1 is %#x, want the CommPage address %#x", vp.reg(a64RegSpEl1), e.p.kernel.layout.comm(0))

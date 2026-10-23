@@ -23,6 +23,9 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"z.gfire.dev/gvx/pkg/ring0/pagetables"
+	"z.gfire.dev/gvx/pkg/safemem"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 )
 
 const (
@@ -36,13 +39,6 @@ const (
 	hostBaseIPA uint64 = 0x2_0000_0000
 )
 
-var (
-	errPlatformClosed = errors.New("hvf: platform closed")
-	// errHostBlockRejected reports that Hypervisor.framework refused a host
-	// memory region. It wraps the framework error.
-	errHostBlockRejected = errors.New("hvf: hv_vm_map rejected the host memory")
-)
-
 type slabPage struct {
 	page []byte
 	ipa  uint64
@@ -52,12 +48,6 @@ type slabPage struct {
 type slabBlock struct {
 	mem []byte
 	ipa uint64
-}
-
-// hostBlock is one 16KB host page mapped into Stage-2.
-type hostBlock struct {
-	ipa  uint64
-	refs int // Guest 4KB pages that reference the block.
 }
 
 // vmState owns one Hypervisor.framework VM from hv_vm_create to hv_vm_destroy.
@@ -76,11 +66,9 @@ type vmState struct {
 	freePages   []slabPage
 	pagesInUse  int
 
-	// Host blocks keyed by the 16KB-aligned host address.
-	blocks     map[uintptr]*hostBlock
-	blockByIPA map[uint64]uintptr
-	nextHost   uint64
-	freeHost   []uint64
+	// Stage-2 regions of Sentry memory and private copies.
+	stage2  stage2Backend
+	regions *regionMap
 
 	kernel kernelMap // Process-wide TTBR1 tables and vector page.
 	pool   workerPool
@@ -140,20 +128,25 @@ func newVMState() (*vmState, error) {
 	if err != nil {
 		return nil, err
 	}
-	v := &vmState{
-		maxIPA:      1 << bits,
-		nextSlabIPA: slabBaseIPA,
-		nextHost:    hostBaseIPA,
-		blocks:      make(map[uintptr]*hostBlock),
-		blockByIPA:  make(map[uint64]uintptr),
-	}
-	if hostBaseIPA >= v.maxIPA {
-		return nil, fmt.Errorf("hvf: guest physical address space of %d bits is too small", bits)
-	}
 	maxVCPUs, err := hvVMMaxVCPUs()
 	if err != nil {
 		return nil, err
 	}
+	return newVMStateOn(hvBackend{}, bits, maxVCPUs)
+}
+
+// newVMStateOn builds the VM state over a backend. Tests pass a backend that
+// counts calls instead of calling the hypervisor.
+func newVMStateOn(be stage2Backend, bits uint, maxVCPUs int) (*vmState, error) {
+	v := &vmState{
+		maxIPA:      1 << bits,
+		nextSlabIPA: slabBaseIPA,
+		stage2:      be,
+	}
+	if hostBaseIPA >= v.maxIPA {
+		return nil, fmt.Errorf("hvf: guest physical address space of %d bits is too small", bits)
+	}
+	v.regions = newRegionMap(be, hostPageSize, hostBaseIPA, v.maxIPA)
 	slots := min(maxVCPUs, kernelCommPages)
 	if slots < 1 {
 		return nil, fmt.Errorf("hvf: the VM allows %d vCPUs", maxVCPUs)
@@ -167,26 +160,22 @@ func newVMState() (*vmState, error) {
 }
 
 // shutdown stops every vCPU thread and destroys the VM. hv_vm_destroy removes
-// every Stage-2 mapping, so no per-block unmap is needed. Address spaces that
+// every Stage-2 mapping, so no per-region unmap is needed. Address spaces that
 // outlive the Platform keep their slab memory until they release it.
 func (v *vmState) shutdown() error {
 	v.mu.Lock()
 	v.closed = true
 	v.mu.Unlock()
+	v.regions.markClosed()
 
 	err := v.pool.stop()
-
-	v.mu.Lock()
-	clear(v.blocks)
-	clear(v.blockByIPA)
-	v.freeHost = nil
-	v.mu.Unlock()
 	if err != nil {
 		return err
 	}
 	if err := hvVMDestroy(); err != nil {
 		return err
 	}
+	v.regions.freeAfterDestroy()
 	v.mu.Lock()
 	v.destroyed = true
 	if v.users == 0 {
@@ -196,10 +185,10 @@ func (v *vmState) shutdown() error {
 	return nil
 }
 
-// rootPrefill returns the hook that links shared kernel mappings into a new
-// user root, or nil.
-func (v *vmState) rootPrefill() func(root []byte) {
-	return v.kernel.prefillRoot
+// kernelTables returns the read-only tree of the shared kernel mappings. Every
+// user tree shares it.
+func (v *vmState) kernelTables() *pagetables.PageTables {
+	return v.kernel.pt
 }
 
 // retain registers an address space that uses slab memory.
@@ -276,7 +265,7 @@ func (v *vmState) newSlabLocked() error {
 		return fmt.Errorf("hvf: allocate slab block: %w", err)
 	}
 	ipa := v.nextSlabIPA
-	if err := hvVMMap(uintptr(unsafe.Pointer(unsafe.SliceData(mem))), ipa, hostPageSize, hvMemoryRead|hvMemoryWrite|hvMemoryExec); err != nil {
+	if err := v.stage2.mapHost(uintptr(unsafe.Pointer(unsafe.SliceData(mem))), ipa, hostPageSize); err != nil {
 		return errors.Join(err, unix.Munmap(mem))
 	}
 	v.nextSlabIPA += hostPageSize
@@ -310,121 +299,46 @@ func (v *vmState) slabStats() slabStats {
 	return slabStats{blocks: len(v.slabs), pagesInUse: v.pagesInUse}
 }
 
-// mapHostPage maps the 16KB host page that contains the 4KB page into Stage-2
-// and returns the guest physical address of the 4KB page. Each call must pair
-// with one unmapHostPage. Blocks stay mapped while any guest page references
-// them, so a reused host address can never alias a stale guest physical page.
-func (v *vmState) mapHostPage(page []byte) (uint64, error) {
-	base := uintptr(unsafe.Pointer(unsafe.SliceData(page)))
-	if len(page) != pageSize4K || base&pageMask4K != 0 {
-		return 0, fmt.Errorf("hvf: host page %#x is not a 4KB aligned page", base)
-	}
-	block := base &^ hostPageMask
-	sub := uint64(base & hostPageMask)
-
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.closed {
-		return 0, errPlatformClosed
-	}
-	if b, ok := v.blocks[block]; ok {
-		b.refs++
-		return b.ipa + sub, nil
-	}
-	ipa, err := v.allocHostIPALocked()
-	if err != nil {
-		return 0, err
-	}
-	if err := hvVMMap(block, ipa, hostPageSize, hvMemoryRead|hvMemoryWrite|hvMemoryExec); err != nil {
-		v.freeHost = append(v.freeHost, ipa)
-		return 0, fmt.Errorf("%w: %w", errHostBlockRejected, err)
-	}
-	v.blocks[block] = &hostBlock{ipa: ipa, refs: 1}
-	v.blockByIPA[ipa] = block
-	return ipa + sub, nil
+// resolveMemory returns the guest physical runs of the host blocks of bs and
+// records the regions in u. See regionMap.resolve.
+func (v *vmState) resolveMemory(u *regionUser, f memmap.File, bs safemem.BlockSeq, write bool) ([]segment, error) {
+	return v.regions.resolve(u, f, bs, write)
 }
 
-// stagePage prepares one 4KB host page for a guest mapping. It returns the
-// guest physical address and the host view that the address space reads and
-// writes.
-//
-// Hypervisor.framework rejects every memory region whose backing file was
-// opened read-only: hv_vm_map returns HV_ERROR for RWX, RX and R requests alike
-// (probe on macOS 26: anonymous, shared and private mappings of a read-write
-// descriptor map, a MAP_SHARED PROT_READ mapping of an O_RDONLY descriptor does
-// not). In practice the EROFS layer images take this path: the Sentry maps each
-// image through a read-only descriptor, and every guest file page (ELF text,
-// libraries, read-only data) arrives here. The busybox, python and node image
-// tests copy about 5900 pages this way. For a read-only request only, stagePage
-// then copies the page into a slab page. The image is immutable, so the copy
-// stays equal to the file. A writable request never takes this path, because a
-// copy of writable shared memory would diverge from the original. Pages from
-// pgalloc memory files, which the Sentry maps read-write, always map directly.
-func (v *vmState) stagePage(page []byte, write bool) (ipa uint64, data []byte, copied bool, err error) {
-	ipa, err = v.mapHostPage(page)
-	if err == nil {
-		return ipa, page, false, nil
-	}
-	if code, ok := hvCode(err); write || !ok || code != hvErrGeneral {
-		return 0, nil, false, err
-	}
-	slab, slabIPA, aerr := v.allocPage()
-	if aerr != nil {
-		return 0, nil, false, errors.Join(err, aerr)
-	}
-	copy(slab, page)
-	return slabIPA, slab, true, nil
+// releaseMemory drops the region references of an address space after no vCPU
+// can run its page tables.
+func (v *vmState) releaseMemory(u *regionUser) {
+	v.regions.release(u)
 }
 
-// freeCopy returns the slab page of a private copy.
-func (v *vmState) freeCopy(data []byte, ipa uint64) {
-	v.freePage(data, ipa)
+// hvBackend is the stage2Backend of a real VM.
+type hvBackend struct{}
+
+func (hvBackend) mapHost(host uintptr, ipa uint64, size uintptr) error {
+	return hvVMMap(host, ipa, size, hvMemoryRead|hvMemoryWrite|hvMemoryExec)
 }
 
-// unmapHostPage drops one reference taken by mapHostPage and unmaps the block
-// with the last reference.
-func (v *vmState) unmapHostPage(ipa uint64) error {
-	blockIPA := ipa &^ hostPageMask
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	host, ok := v.blockByIPA[blockIPA]
-	if !ok {
-		if v.closed {
-			return nil // shutdown already removed every block.
-		}
-		return fmt.Errorf("hvf: guest physical page %#x has no host block", ipa)
-	}
-	b := v.blocks[host]
-	b.refs--
-	if b.refs > 0 {
-		return nil
-	}
-	delete(v.blocks, host)
-	delete(v.blockByIPA, blockIPA)
-	if err := hvVMUnmap(blockIPA, hostPageSize); err != nil {
-		return err // The address stays reserved: its mapping state is unknown.
-	}
-	v.freeHost = append(v.freeHost, blockIPA)
-	return nil
+func (hvBackend) unmapIPA(ipa uint64, size uintptr) error {
+	return hvVMUnmap(ipa, size)
 }
 
-func (v *vmState) allocHostIPALocked() (uint64, error) {
-	if n := len(v.freeHost); n > 0 {
-		ipa := v.freeHost[n-1]
-		v.freeHost = v.freeHost[:n-1]
-		return ipa, nil
-	}
-	if v.nextHost+hostPageSize > v.maxIPA {
-		return 0, errors.New("hvf: guest physical address space exhausted")
-	}
-	ipa := v.nextHost
-	v.nextHost += hostPageSize
-	return ipa, nil
+// refusedMemory reports the code that Hypervisor.framework returns for every
+// memory region whose backing file was opened read-only. hv_vm_map returns
+// HV_ERROR for RWX, RX and R requests alike (probe on macOS 26: anonymous,
+// shared and private mappings of a read-write descriptor map, and a MAP_SHARED
+// PROT_READ mapping of an O_RDONLY descriptor does not). The EROFS layer
+// images take this path: the Sentry maps each image through a read-only
+// descriptor, and every guest file page (ELF text, libraries, read-only data)
+// arrives here. A missing entitlement returns the same code.
+func (hvBackend) refusedMemory(err error) bool {
+	code, ok := hvCode(err)
+	return ok && code == hvErrGeneral
 }
 
-// hostBlockCount returns the number of mapped host blocks for tests.
-func (v *vmState) hostBlockCount() int {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	return len(v.blocks)
+func (hvBackend) allocCopy(size uintptr) ([]byte, error) {
+	return unix.Mmap(-1, 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+}
+
+func (hvBackend) freeCopy(mem []byte) error {
+	return unix.Munmap(mem)
 }

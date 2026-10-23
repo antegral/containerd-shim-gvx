@@ -15,8 +15,11 @@
 package hvf
 
 import (
-	"fmt"
 	"unsafe"
+
+	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/ring0/pagetables"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // The Ring-0 image (GDT, IDT, stub code, and one CommPage plus one kernel
@@ -67,25 +70,23 @@ func (k *x86KernelComm) frameSlotVA() uint64 {
 
 // x86KernelMap is the immutable Ring-0 mapping set.
 type x86KernelMap struct {
-	tables *tableSet
-	comm   []x86KernelComm
-	// prefillRoot links the kernel PML4 entry into a user root.
-	prefillRoot func(root []byte)
+	pt    *pagetables.PageTables
+	alloc *tableAlloc
+	comm  []x86KernelComm
 	// hltOffset is the page offset of the HLT that ends the spill routine.
 	hltOffset int
 }
 
 // buildX86KernelMap builds the kernel subtree with one CommPage and one stack
 // per vCPU slot. It has no other user until it returns.
-func buildX86KernelMap(alloc pageAllocator, slots int) (*x86KernelMap, error) {
-	tables, err := newTableSet(alloc)
-	if err != nil {
+func buildX86KernelMap(pages pageAllocator, slots int) (*x86KernelMap, error) {
+	initPageTables()
+	alloc := newTableAlloc(pages)
+	if err := alloc.reserve(kernelTablePages); err != nil {
+		alloc.drain()
 		return nil, err
 	}
-	k := &x86KernelMap{tables: tables, comm: make([]x86KernelComm, slots)}
-	k.prefillRoot = func(root []byte) {
-		storePTE(root, x86KernelPML4Slot, loadPTE(tables.root, x86KernelPML4Slot))
-	}
+	k := &x86KernelMap{pt: pagetables.New(alloc), alloc: alloc, comm: make([]x86KernelComm, slots)}
 
 	img := buildX86Kernel(x86KernelCodeVA)
 	k.hltOffset = img.HLTOffset
@@ -99,31 +100,25 @@ func buildX86KernelMap(alloc pageAllocator, slots int) (*x86KernelMap, error) {
 		{x86KernelIDTVA, img.IDT, "IDT", false},
 		{x86KernelCodeVA, img.Code, "code", true},
 	} {
-		page, ipa, err := alloc.allocPage()
+		page, ipa, err := pages.allocPage()
 		if err != nil {
 			return nil, err
 		}
 		copy(page, p.content)
-		if err := k.mapPage(p.va, ipa, false, p.executable); err != nil {
-			return nil, fmt.Errorf("hvf: map the kernel %s page: %w", p.kind, err)
-		}
+		k.mapPage(p.va, ipa, false, p.executable)
 	}
 	for i := range k.comm {
-		commPage, commIPA, err := alloc.allocPage()
+		commPage, commIPA, err := pages.allocPage()
 		if err != nil {
 			return nil, err
 		}
-		stackPage, stackIPA, err := alloc.allocPage()
+		stackPage, stackIPA, err := pages.allocPage()
 		if err != nil {
 			return nil, err
 		}
 		va := x86KernelCommBaseVA + uint64(i)*x86KernelCommStride
-		if err := k.mapPage(va, commIPA, true, false); err != nil {
-			return nil, err
-		}
-		if err := k.mapPage(va+pageSize4K, stackIPA, true, false); err != nil {
-			return nil, err
-		}
+		k.mapPage(va, commIPA, true, false)
+		k.mapPage(va+pageSize4K, stackIPA, true, false)
 		kc := x86KernelComm{
 			page:     commPage,
 			view:     (*x86CommPage)(unsafe.Pointer(unsafe.SliceData(commPage))),
@@ -133,17 +128,15 @@ func buildX86KernelMap(alloc pageAllocator, slots int) (*x86KernelMap, error) {
 			stackIPA: stackIPA,
 		}
 		kc.view.Stack = kc.stackTopVA()
-		x86FillTSS(kc.view.TSS[:], kc.stackTopVA())
+		hvcommon.FillTSS(kc.view.TSS[:], kc.stackTopVA())
 		k.comm[i] = kc
 	}
+	k.pt.MarkReadOnlyShared()
 	return k, nil
 }
 
-func (k *x86KernelMap) mapPage(va, ipa uint64, writable, executable bool) error {
-	table, idx, err := k.tables.leafSlot(va, true)
-	if err != nil {
-		return fmt.Errorf("hvf: build kernel tables: %w", err)
-	}
-	storePTE(table, idx, x86KernelLeafDescriptor(ipa, writable, executable))
-	return nil
+// mapPage maps one supervisor-only page.
+func (k *x86KernelMap) mapPage(va, ipa uint64, writable, executable bool) {
+	at := hostarch.AccessType{Read: true, Write: writable, Execute: executable}
+	k.pt.Map(hostarch.Addr(va), pageSize4K, pagetables.MapOpts{AccessType: at}, uintptr(ipa))
 }

@@ -70,10 +70,12 @@ type fakeBackend struct {
 	getErr   func(index uint32) error
 	setErr   func(index uint32) error
 
-	mapped  map[uint64]fakeMapping
-	hosts   map[uintptr][]byte
-	vps     map[uint32]*fakeVP
-	deleted []uint32
+	mapped     map[uint64]fakeMapping
+	mapCalls   int
+	unmapCalls int
+	hosts      map[uintptr][]byte
+	vps        map[uint32]*fakeVP
+	deleted    []uint32
 
 	partitionOpen bool
 	closeErr      error
@@ -145,13 +147,23 @@ func (fb *fakeBackend) freeHost(mem []byte) error {
 func (fb *fakeBackend) mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint32) error {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
+	// Guest memory always maps with execute permission. Page-table slabs and
+	// CommPages do not. The counter then ignores the growth of the slab pool.
+	if flags&mapFlagExecute != 0 {
+		fb.mapCalls++
+	}
 	if fb.mapErr != nil {
 		if err := fb.mapErr(gpa); err != nil {
 			return err
 		}
 	}
-	if gpa&pageMask != 0 || size&pageMask != 0 || uintptr(host)&pageMask != 0 {
+	if gpa&pageMask != 0 || size&pageMask != 0 || size == 0 || uintptr(host)&pageMask != 0 {
 		return fmt.Errorf("unaligned map gpa=%#x size=%#x host=%p", gpa, size, host)
+	}
+	for at, m := range fb.mapped {
+		if gpa < at+m.size && at < gpa+size {
+			return fmt.Errorf("map of gpa=%#x size=%#x overlaps the mapping at %#x size %#x", gpa, size, at, m.size)
+		}
 	}
 	fb.mapped[gpa] = fakeMapping{host: host, size: size, flags: flags}
 	return nil
@@ -160,6 +172,7 @@ func (fb *fakeBackend) mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint3
 func (fb *fakeBackend) unmapGPA(gpa, size uint64) error {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
+	fb.unmapCalls++
 	if fb.unmapErr != nil {
 		if err := fb.unmapErr(gpa); err != nil {
 			return err
@@ -171,6 +184,26 @@ func (fb *fakeBackend) unmapGPA(gpa, size uint64) error {
 	}
 	delete(fb.mapped, gpa)
 	return nil
+}
+
+// mappingOf returns the mapping that covers gpa and the host address that
+// gpa translates to.
+func (fb *fakeBackend) mappingOf(gpa uint64) (fakeMapping, unsafe.Pointer, bool) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	for at, m := range fb.mapped {
+		if gpa >= at && gpa < at+m.size {
+			return m, unsafe.Add(m.host, gpa-at), true
+		}
+	}
+	return fakeMapping{}, nil, false
+}
+
+// calls returns the number of mapGPA and unmapGPA calls so far.
+func (fb *fakeBackend) calls() (maps, unmaps int) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return fb.mapCalls, fb.unmapCalls
 }
 
 func (fb *fakeBackend) createVP(index uint32) error {

@@ -140,7 +140,7 @@ type vcpuWorker struct {
 	exited atomic.Bool
 
 	// State that other goroutines read to stop a vCPU that runs a table.
-	curPT      atomic.Pointer[GuestPageTable]
+	curPT      atomic.Pointer[stage1Tables]
 	inGuest    atomic.Bool
 	enterTLB   atomic.Uint64
 	cancelErr  atomic.Pointer[error]
@@ -159,7 +159,7 @@ func (w *vcpuWorker) cancel() {
 
 // quiesce returns when the vCPU no longer runs guest code that entered before
 // the table generation reached target.
-func (w *vcpuWorker) quiesce(pt *GuestPageTable, target uint64) {
+func (w *vcpuWorker) quiesce(pt *stage1Tables, target uint64) {
 	cancelled := false
 	for i := 1; ; i++ {
 		if w.curPT.Load() != pt || !w.inGuest.Load() || w.enterTLB.Load() >= target {
@@ -457,7 +457,7 @@ func (p *workerPool) stop() error {
 
 // quiesce stops every vCPU that runs pt with a translation older than the
 // current generation.
-func (p *workerPool) quiesce(pt *GuestPageTable) {
+func (p *workerPool) quiesce(pt *stage1Tables) {
 	target := pt.tlbGen.Load()
 	for i := range p.slots[:p.max] {
 		if w := p.slots[i].Load(); w != nil {
@@ -468,12 +468,12 @@ func (p *workerPool) quiesce(pt *GuestPageTable) {
 
 // quiesce implements the Unmap guarantee: after it returns, no vCPU
 // translates through a descriptor that was valid before the call.
-func (v *vmState) quiesce(pt *GuestPageTable) {
+func (v *vmState) quiesce(pt *stage1Tables) {
 	v.pool.quiesce(pt)
 }
 
 // retire frees a page table after no vCPU can run it.
-func (v *vmState) retire(pt *GuestPageTable) {
+func (v *vmState) retire(pt *stage1Tables) {
 	pt.markDead()
 	v.pool.quiesce(pt)
 	pt.release()

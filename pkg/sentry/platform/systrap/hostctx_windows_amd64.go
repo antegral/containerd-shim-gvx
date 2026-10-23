@@ -40,24 +40,6 @@ var (
 	procGetEnabledXStateFeatures = modKernel32.NewProc("GetEnabledXStateFeatures")
 )
 
-// xstateComponent describes one extended component: its Windows feature ID,
-// its offset in the Linux XSAVE image (the standard, non-compacted layout of
-// the Intel SDM), and its size.
-type xstateComponent struct {
-	id     uint32
-	offset int
-	size   int
-}
-
-var xstateComponents = []xstateComponent{
-	{2, 576, 256},   // AVX: YMM_Hi128
-	{5, 1088, 64},   // AVX-512: opmask registers
-	{6, 1152, 512},  // AVX-512: ZMM_Hi256
-	{7, 1664, 1024}, // AVX-512: Hi16_ZMM
-}
-
-const xsaveHeaderOffset = 512
-
 // xstateExt is the memory behind an extended record.
 type xstateExt struct {
 	raw []byte

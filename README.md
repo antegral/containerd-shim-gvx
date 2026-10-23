@@ -47,6 +47,7 @@ Use these steps to compile `rungv` and run an unmodified OCI image on Windows or
 3. Pass `-net=wg` with a WireGuard configuration file when strict L3 host LAN isolation is required.
 4. Select the guest architecture with `-arch`. The hardware backends accept only the host architecture.
 5. Run `rungv stub` to probe the `systrap` engine. The command exits with status 1 and prints the typed error when the engine is unavailable.
+6. Use the Docker flags `-e`, `-u`, `-v`, `-m`, `--cpus`, `-P`, `--read-only`, and `--tmpfs`, and the image commands `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, and `logout`. The reference [`docs/cli.md`](docs/cli.md) lists every flag and every difference from Docker.
 
 ```bash
 # Build on macOS (Apple Silicon arm64 or Intel amd64) and apply free ad-hoc hypervisor signature
@@ -166,7 +167,7 @@ Go generators emit the guest stubs for the Ring-0/EL1 vector and the fast-path s
 
 `pkg/sentry/platform/systrap` (Fallback, Milestone M5) runs guest code natively in forked stub tasks. The Sentry shares `sysmsg` memory with each stub through `mach_vm_remap` and hands control over with `__ulock_wait`. A lazy page-trap patcher rewrites `svc #0` to a branch into a trampoline slot. It also rewrites `TPIDR_EL0`, `CTR_EL0`, and `x18` accesses inside ELF code sections. The Seatbelt profile of each stub denies every host system call that the stub does not need, so an unpatched `svc` kills the stub.
 
-`systrap` runs on macOS `arm64` and on Windows. The macOS engine needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). A Linux `ET_EXEC` image at `0x400000` does not load. The Windows engine runs on `amd64` and `arm64`, needs no hypervisor, and puts the guest above 16TB. [`docs/systrap-windows.md`](docs/systrap-windows.md) records its measurements, design, and limits. The engine is not a syscall sandbox on Windows. On macOS `amd64`, the project dropped the Rosetta 2 engine. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
+`systrap` runs on macOS `arm64` and on Windows. The macOS engine needs `-tags pagesize_16k`. Without the tag, `systrap.New()` returns `*ErrUnsupportedPageSize`. Guest addresses start above the permanent host reservations that the Sentry reads from the template stub (448GB on the test host). The macOS engine cannot load an `ET_EXEC` image, because every `arm64` task has a 4GB `PAGEZERO`. Run such an image with `-platform=hvf`. The Windows engine runs on `amd64` and `arm64`, needs no hypervisor, and puts the guest above 16TB. It also holds the range from `0x10000` to `0x7FFE0000`, so an `ET_EXEC` image runs at the address that it links to. [`docs/systrap-windows.md`](docs/systrap-windows.md) records its measurements, design, and limits. The engine is not a syscall sandbox on Windows. On macOS `amd64`, the project dropped the Rosetta 2 engine. A syscall-number Seatbelt filter on a translated process panicked the host kernel. A stub without the filter would weaken isolation. `-platform=auto` never falls back to a software backend. `gvx` contains no instruction interpreter and no JIT.
 
 ### 3.2 Dual-Track Netstack and Port Forwarding (`pkg/netbackend`)
 
@@ -204,7 +205,7 @@ On Linux (`lockdown_linux.go` and `pkg/gvx/syscallfilter_linux.go`), it installs
 
 `tools/upstream` widens `//go:build linux` tags on allowlisted Sentry files after each `git merge upstream/go`, and it fences Linux-only files from the new targets. `-mode=audit` compares the tree with the pinned upstream archive and checks the SPEC import boundaries.
 
-The audit charges 22 of 2485 upstream files (0.89%) against the `< 5.0%` ceiling. It reports 604 Linux fences separately. Counted together with the fences, the modified share is 25%, so the strict reading of the ceiling is not met.
+The upstream baseline audit charged 16 of 2485 files (0.64%) against the `< 0.7%` ceiling. It reported 604 Linux fences separately. Including those fences, the modified share was 25%, above the ceiling under a strict count. These results do not verify the merged shim tree.
 
 ### 3.7 Optional Containerd Control Adapter
 
@@ -234,7 +235,8 @@ Read the architecture plan and agent operating manual before modifying any packa
 
 | Document | Audience | Scope Description |
 | :--- | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, upstream sync, M1-M5 milestones, and the optional containerd control adapter. |
+| [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync, M1-M5 milestones, and the optional containerd control adapter. |
+| [`docs/cli.md`](docs/cli.md) | Users & Engineers | Every `rungv` command, every flag of `rungv run`, the run rules, and the differences from Docker. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 rules, package import boundaries, and verification gates. |
 
 ---
@@ -247,7 +249,7 @@ Read the architecture plan and agent operating manual before modifying any packa
 
 1. Cross-compile all packages across the four Priority-0 targets (`windows/amd64`, `windows/arm64`, `darwin/arm64`, `darwin/amd64`).
 2. Run the unit test suite with the signing wrapper. The wrapper gives test binaries the `hvf` entitlement.
-3. Audit the upstream diff against `UPSTREAM_COMMIT` to verify the `< 5.0%` modification ceiling.
+3. Audit the upstream diff against `UPSTREAM_COMMIT` to verify the `< 0.7%` modification ceiling.
 
 ```bash
 # Compile across all four Priority-0 targets
@@ -258,7 +260,7 @@ GOOS=darwin  GOARCH=amd64 go build ./...
 
 # Run the tests and the upstream diff audit
 go test -race -exec "$PWD/scripts/codesign-exec.sh" ./...
-go run ./tools/upstream -mode=audit -max-ratio=0.05
+go run ./tools/upstream -mode=audit -max-ratio=0.007
 
 # Run the systrap engine tests on macOS arm64
 go test -race -tags pagesize_16k -exec "$PWD/scripts/codesign-exec.sh" ./pkg/sentry/platform/systrap/...

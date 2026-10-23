@@ -22,7 +22,10 @@ import (
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/ring0/pagetables"
+	"z.gfire.dev/gvx/pkg/safemem"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
+	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
 
@@ -45,7 +48,7 @@ func releaseVM(*vmState) error { return errUnsupportedOS }
 
 func (*vmState) concurrency() int { return 0 }
 
-func (*vmState) rootPrefill() func([]byte) { return nil }
+func (*vmState) kernelTables() *pagetables.PageTables { return nil }
 
 func (*vmState) retain() error { return errUnsupportedOS }
 
@@ -55,17 +58,15 @@ func (*vmState) allocPage() ([]byte, uint64, error) { return nil, 0, errUnsuppor
 
 func (*vmState) freePage([]byte, uint64) {}
 
-func (*vmState) stagePage([]byte, bool) (uint64, []byte, bool, error) {
-	return 0, nil, false, errUnsupportedOS
+func (*vmState) resolveMemory(*regionUser, memmap.File, safemem.BlockSeq, bool) ([]segment, error) {
+	return nil, errUnsupportedOS
 }
 
-func (*vmState) freeCopy([]byte, uint64) {}
+func (*vmState) releaseMemory(*regionUser) {}
 
-func (*vmState) unmapHostPage(uint64) error { return errUnsupportedOS }
+func (*vmState) quiesce(*stage1Tables) {}
 
-func (*vmState) quiesce(*GuestPageTable) {}
-
-func (*vmState) retire(pt *GuestPageTable) {
+func (*vmState) retire(pt *stage1Tables) {
 	pt.markDead()
 	pt.release()
 }

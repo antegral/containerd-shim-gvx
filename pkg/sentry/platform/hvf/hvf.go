@@ -94,15 +94,21 @@ func (p *Platform) Close() error {
 }
 
 // SupportsAddressSpaceIO implements platform.Platform.SupportsAddressSpaceIO.
+// The Sentry reaches guest memory through the memory file mappings, so the
+// address space needs no copy methods.
 func (*Platform) SupportsAddressSpaceIO() bool {
-	return true
+	return false
 }
 
-// MapUnit implements platform.Platform.MapUnit. The Stage-1 granule is 4KB,
-// but the interface requires a power-of-two multiple of hostarch.PageSize,
-// which is 16KB in a pagesize_16k build.
+// mapUnit is the size of the window that one page fault maps. MapFile changes
+// only Stage-1 tables over whole contiguous ranges, so a window of 2 MiB costs
+// one Stage-2 lookup and up to 512 Stage-1 descriptors. It is a power-of-two
+// multiple of hostarch.PageSize, which is 16KB in a pagesize_16k build.
+const mapUnit = 2 << 20
+
+// MapUnit implements platform.Platform.MapUnit.
 func (*Platform) MapUnit() uint64 {
-	return hostarch.PageSize
+	return mapUnit
 }
 
 // MinUserAddress implements platform.Platform.MinUserAddress.

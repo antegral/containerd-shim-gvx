@@ -133,7 +133,8 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	gen := as.gen.Load()
 	execGen := as.execGen.Load()
 	var cflags uint32
-	if !st.valid || st.asID != as.id || st.asGen != gen {
+	reloadRoot := rootStale(st, as, gen)
+	if reloadRoot {
 		cflags |= flagReloadRoot
 	}
 	if !st.valid || st.asID != as.id || st.execGen != execGen {
@@ -150,6 +151,13 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	case st.exitPC != v.reloadVA():
 		b.add64(a64RegPc, v.reloadVA())
 	}
+	// The stub loads TTBR0_EL1 from CommPage.Root. The host also writes the
+	// register, so the processor never enters the guest with a root that
+	// AddressSpace.Release freed. TTBR1_EL1 holds the shared kernel root
+	// from bring-up for every address space, so the batch leaves it alone.
+	if reloadRoot {
+		b.add64(a64RegTtbr0, as.rootValue())
+	}
 	if b.n > 0 {
 		if err := v.p.be.setRegs(v.index, b); err != nil {
 			st.invalidate()
@@ -159,6 +167,10 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	st.valid = true
 	st.parked = true
 	st.exitPC = v.reloadVA()
+	// Committing the address space before the run is safe. The batch above
+	// wrote TTBR0_EL1 on the host. A path that leaves without a run calls
+	// st.invalidate: the kick check in Context.run and a cancel inside the
+	// reload path in onCancel. The next entry then writes TTBR0_EL1 again.
 	st.asID, st.asGen, st.execGen = as.id, gen, execGen
 	return runResult{}, false
 }
@@ -256,7 +268,9 @@ func (v *vcpu) stubRanges() (entry, reload addrRange) {
 }
 
 // onCancel decides what to do after a cancelled run. The cancel context has
-// no program counter, so the function reads PC and PSTATE.
+// no program counter, so the function reads PC and PSTATE. A processor in the
+// reload path forgets the whole state, because the cancel can stop the reload
+// before its write to TTBR0_EL1.
 func (c *Context) onCancel(v *vcpu, _ exitInfo, ac *arch.Context64) (cancelAction, error) {
 	b := v.regs
 	b.reset()
@@ -278,7 +292,7 @@ func (c *Context) onCancel(v *vcpu, _ exitInfo, ac *arch.Context64) (cancelActio
 	case entry.contains(pc):
 		return cancelContinue, nil
 	case reload.contains(pc):
-		v.st.parked = false
+		v.st.invalidate()
 		return cancelInterrupt, nil
 	}
 	return cancelInterrupt, fmt.Errorf("whpx: virtual processor %d was cancelled at unknown kernel address %#x", v.index, pc)

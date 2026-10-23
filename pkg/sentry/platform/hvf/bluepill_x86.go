@@ -18,6 +18,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"unsafe"
+
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // This file generates the in-guest Ring-0 image of the x86 backend (the
@@ -33,11 +35,11 @@ import (
 // x86 segment selectors. The values match the Linux x86-64 layout, because the
 // Sentry stores them in the user registers.
 const (
-	x86KernelCS uint64 = 0x10
-	x86KernelSS uint64 = 0x18
-	x86UserCS32 uint64 = 0x23
-	x86UserSS   uint64 = 0x2b
-	x86UserCS64 uint64 = 0x33
+	x86KernelCS uint64 = hvcommon.SelKernelCS
+	x86KernelSS uint64 = hvcommon.SelKernelSS
+	x86UserCS32 uint64 = hvcommon.SelUserCS32
+	x86UserSS   uint64 = hvcommon.SelUserSS
+	x86UserCS64 uint64 = hvcommon.SelUserCS64
 )
 
 // Interrupt vectors and the SYSCALL marker.
@@ -68,16 +70,6 @@ const (
 	x86ExceptionVectors = 32
 )
 
-// vectorHasErrorCode reports whether the CPU pushes an error code for the
-// exception vector.
-func x86VectorHasErrorCode(vec int) bool {
-	switch vec {
-	case 8, 10, 11, 12, 13, 14, 17, 21, 29, 30:
-		return true
-	}
-	return false
-}
-
 // Offsets of the routines inside the code page.
 const (
 	x86CodeSyscall   = 0x000
@@ -103,6 +95,8 @@ const (
 type x86CodeBuilder struct {
 	page []byte
 	off  int
+	// scratch holds one instruction while an hvcommon appender encodes it.
+	scratch [16]byte
 }
 
 func (b *x86CodeBuilder) emit(bytes ...byte) {
@@ -116,39 +110,27 @@ func (b *x86CodeBuilder) emitLE32(v uint32) {
 }
 
 // swapgs: 0F 01 F8.
-func (b *x86CodeBuilder) swapgs() { b.emit(0x0f, 0x01, 0xf8) }
+func (b *x86CodeBuilder) swapgs() { b.emit(hvcommon.AppendSwapgs(b.scratch[:0])...) }
 
 // hlt: F4.
-func (b *x86CodeBuilder) hlt() { b.emit(0xf4) }
+func (b *x86CodeBuilder) hlt() { b.emit(hvcommon.AppendHlt(b.scratch[:0])...) }
 
 // iretq: 48 CF.
-func (b *x86CodeBuilder) iretq() { b.emit(0x48, 0xcf) }
+func (b *x86CodeBuilder) iretq() { b.emit(hvcommon.AppendIretq(b.scratch[:0])...) }
 
-// rex returns the REX.W prefix with REX.R for registers 8 to 15.
-func x86REX(reg int) byte {
-	if reg >= 8 {
-		return 0x4c
-	}
-	return 0x48
-}
-
-// movToGS stores a 64-bit register at GS:disp32. Encoding: 65 REX.W 89 /r with
-// a SIB byte that selects absolute disp32 addressing.
+// movToGS stores a 64-bit register at GS:disp32.
 func (b *x86CodeBuilder) movToGS(reg int, disp uintptr) {
-	b.emit(0x65, x86REX(reg), 0x89, byte(reg&7)<<3|0x04, 0x25)
-	b.emitLE32(uint32(disp))
+	b.emit(hvcommon.AppendMovToGS(b.scratch[:0], reg, uint32(disp))...)
 }
 
-// movFromGS loads a 64-bit register from GS:disp32: 65 REX.W 8B /r.
+// movFromGS loads a 64-bit register from GS:disp32.
 func (b *x86CodeBuilder) movFromGS(reg int, disp uintptr) {
-	b.emit(0x65, x86REX(reg), 0x8b, byte(reg&7)<<3|0x04, 0x25)
-	b.emitLE32(uint32(disp))
+	b.emit(hvcommon.AppendMovFromGS(b.scratch[:0], reg, uint32(disp))...)
 }
 
-// pushGS pushes the 64-bit value at GS:disp32: 65 FF /6.
+// pushGS pushes the 64-bit value at GS:disp32.
 func (b *x86CodeBuilder) pushGS(disp uintptr) {
-	b.emit(0x65, 0xff, 0x34, 0x25)
-	b.emitLE32(uint32(disp))
+	b.emit(hvcommon.AppendPushGS(b.scratch[:0], uint32(disp))...)
 }
 
 // pushImm pushes a sign-extended immediate: 6A ib or 68 id.
@@ -197,11 +179,11 @@ type x86KernelImage struct {
 // accessed bit is set, so the CPU never writes the read-only GDT page.
 var x86GDTEntries = [...]uint64{
 	0, 0,
-	0x00af9b000000ffff, // 0x10: kernel code, 64-bit, DPL 0.
-	0x00cf93000000ffff, // 0x18: kernel data, DPL 0.
-	0x00cffb000000ffff, // 0x20: user code, 32-bit compatibility, DPL 3 (selector 0x23).
-	0x00cff3000000ffff, // 0x28: user data, DPL 3 (selector 0x2b).
-	0x00affb000000ffff, // 0x30: user code, 64-bit, DPL 3 (selector 0x33).
+	hvcommon.DescKernelCode64, // 0x10: kernel code, 64-bit, DPL 0.
+	hvcommon.DescKernelData,   // 0x18: kernel data, DPL 0.
+	hvcommon.DescUserCode32,   // 0x20: user code, 32-bit compatibility, DPL 3 (selector 0x23).
+	hvcommon.DescUserData,     // 0x28: user data, DPL 3 (selector 0x2b).
+	hvcommon.DescUserCode64,   // 0x30: user code, 64-bit, DPL 3 (selector 0x33).
 }
 
 // x86GDTLimit is the GDTR limit for the descriptor table.
@@ -211,34 +193,7 @@ const x86GDTLimit = len(x86GDTEntries)*8 - 1
 const x86IDTLimit = 256*16 - 1
 
 // x86TSSLimit is the TSS limit: the 104-byte structure without an I/O bitmap.
-const x86TSSLimit = 103
-
-// x86TSSRSP0Offset is the offset of RSP0 inside the TSS.
-const x86TSSRSP0Offset = 4
-
-// x86TSSIOMapOffset is the offset of the I/O map base inside the TSS.
-const x86TSSIOMapOffset = 102
-
-// x86FillTSS writes the TSS template into the TSS array of a CommPage. The I/O
-// map base points past the limit, so user I/O instructions raise #GP.
-func x86FillTSS(tss []byte, kernelStackTop uint64) {
-	clear(tss)
-	binary.LittleEndian.PutUint64(tss[x86TSSRSP0Offset:], kernelStackTop)
-	binary.LittleEndian.PutUint16(tss[x86TSSIOMapOffset:], 104)
-}
-
-// x86IDTGate encodes a 64-bit interrupt gate at the kernel code segment. User
-// code reaches the gate with an INT instruction only when dpl is 3.
-func x86IDTGate(handler uint64, dpl int) [16]byte {
-	var g [16]byte
-	binary.LittleEndian.PutUint16(g[0:], uint16(handler))
-	binary.LittleEndian.PutUint16(g[2:], uint16(x86KernelCS))
-	g[4] = 0                     // IST 0: the TSS stack serves the gate.
-	g[5] = 0x8e | byte(dpl&3)<<5 // Present, interrupt gate.
-	binary.LittleEndian.PutUint16(g[6:], uint16(handler>>16))
-	binary.LittleEndian.PutUint32(g[8:], uint32(handler>>32))
-	return g
-}
+const x86TSSLimit = hvcommon.TSSLimit
 
 // buildX86Kernel generates the three kernel pages. codeVA is the virtual
 // address where the code page will be mapped, because the IDT gates hold
@@ -275,7 +230,7 @@ func buildX86Kernel(codeVA uint64) x86KernelImage {
 	// pushes none, push the vector, and join the common code.
 	for vec := range x86ExceptionVectors {
 		b.off = x86CodeStubs + vec*x86CodeStubSize
-		if !x86VectorHasErrorCode(vec) {
+		if !hvcommon.VectorHasErrorCode(vec) {
 			b.pushImm(0)
 		}
 		b.pushImm(int32(vec))
@@ -331,10 +286,10 @@ func buildX86Kernel(codeVA uint64) x86KernelImage {
 		if vec == x86VecBreakpoint {
 			dpl = 3
 		}
-		g := x86IDTGate(codeVA+uint64(x86CodeStubs+vec*x86CodeStubSize), dpl)
+		g := hvcommon.IDTGate(codeVA+uint64(x86CodeStubs+vec*x86CodeStubSize), dpl)
 		copy(img.IDT[vec*16:], g[:])
 	}
-	g := x86IDTGate(codeVA+x86CodeInt80, 3)
+	g := hvcommon.IDTGate(codeVA+x86CodeInt80, 3)
 	copy(img.IDT[x86VecInt80*16:], g[:])
 	return img
 }

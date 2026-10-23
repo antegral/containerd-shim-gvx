@@ -23,6 +23,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 func mustHex(t *testing.T, s string) []byte {
@@ -114,7 +115,7 @@ func TestX86ExceptionStubs(t *testing.T) {
 		off := stubAt(vec)
 		code := img.Code[off:]
 		pos := 0
-		if !x86VectorHasErrorCode(vec) {
+		if !hvcommon.VectorHasErrorCode(vec) {
 			if code[0] != 0x6a || code[1] != 0 {
 				t.Errorf("vector %d: no dummy error code push, bytes %x", vec, code[:4])
 				continue
@@ -309,67 +310,6 @@ func TestX86IDTGates(t *testing.T) {
 	// Interrupt gates only: trap gates keep IF set inside the stub.
 	if _, _, attr := gate(x86VecPageFault); attr&0xf != 0xe {
 		t.Errorf("page fault gate type = %#x, want an interrupt gate (0xe)", attr&0xf)
-	}
-}
-
-func TestX86TSS(t *testing.T) {
-	var tss [104]byte
-	tss[50] = 0xff
-	x86FillTSS(tss[:], 0xffffff8000012000)
-	if got := binary.LittleEndian.Uint64(tss[x86TSSRSP0Offset:]); got != 0xffffff8000012000 {
-		t.Errorf("RSP0 = %#x", got)
-	}
-	if tss[50] != 0 {
-		t.Error("the template keeps stale bytes")
-	}
-	if got := binary.LittleEndian.Uint16(tss[x86TSSIOMapOffset:]); got != 104 {
-		t.Errorf("I/O map base = %d, want 104 (past the limit)", got)
-	}
-}
-
-func TestX86PageTableDescriptors(t *testing.T) {
-	cases := []struct {
-		name string
-		at   hostarch.AccessType
-		w    bool
-		nx   bool
-	}{
-		{"read", hostarch.Read, false, true},
-		{"read write", hostarch.ReadWrite, true, true},
-		{"read execute", hostarch.AccessType{Read: true, Execute: true}, false, false},
-		{"execute only", hostarch.Execute, false, false},
-	}
-	for _, tc := range cases {
-		d := x86UserLeafDescriptor(0x2_0000_5000, tc.at)
-		if d&x86PTEAddrMask != 0x2_0000_5000 {
-			t.Errorf("%s: address %#x", tc.name, d&x86PTEAddrMask)
-		}
-		if d&x86PTEPresent == 0 || d&x86PTEUser == 0 || d&x86PTEAccessed == 0 || d&x86PTEDirty == 0 {
-			t.Errorf("%s: descriptor %#x lacks P, U, A or D", tc.name, d)
-		}
-		if (d&x86PTEWritable != 0) != tc.w || (d&x86PTENX != 0) != tc.nx {
-			t.Errorf("%s: descriptor %#x has W=%v NX=%v, want W=%v NX=%v", tc.name, d, d&x86PTEWritable != 0, d&x86PTENX != 0, tc.w, tc.nx)
-		}
-	}
-	if d := x86UserLeafDescriptor(0x1000, hostarch.NoAccess); d != 0 {
-		t.Errorf("a page without access has descriptor %#x", d)
-	}
-	k := x86KernelLeafDescriptor(0x3000, false, true)
-	if k&x86PTEUser != 0 || k&x86PTEWritable != 0 || k&x86PTENX != 0 {
-		t.Errorf("kernel code descriptor %#x must be supervisor, read-only, executable", k)
-	}
-	k = x86KernelLeafDescriptor(0x3000, true, false)
-	if k&x86PTEUser != 0 || k&x86PTEWritable == 0 || k&x86PTENX == 0 {
-		t.Errorf("kernel data descriptor %#x must be supervisor, writable, no-execute", k)
-	}
-	if td := x86MakeKernelTableDescriptor(0x5000); td&x86PTEUser != 0 {
-		t.Errorf("kernel table descriptor %#x is user-accessible", td)
-	}
-	if gpa, ok := x86TableDescriptorGPA(x86MakeTableDescriptor(0x7000)); !ok || gpa != 0x7000 {
-		t.Errorf("table descriptor round trip = (%#x, %v)", gpa, ok)
-	}
-	if _, ok := x86TableDescriptorGPA(0); ok {
-		t.Error("an empty descriptor decodes as a table")
 	}
 }
 

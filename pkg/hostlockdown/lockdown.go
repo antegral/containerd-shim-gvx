@@ -20,6 +20,8 @@ package hostlockdown
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 )
@@ -31,15 +33,24 @@ var ErrUnsupported = errors.New("hostlockdown: unsupported host OS")
 // ErrNotLockedDown reports that BindThread ran before a successful Apply.
 var ErrNotLockedDown = errors.New("hostlockdown: Apply has not succeeded")
 
+// HostMount names one host directory that the locked process may open files
+// below.
+type HostMount struct {
+	// Path is the host directory. It must exist when Apply runs. The root of a
+	// file system, such as "/" or "C:\", is refused.
+	Path string
+
+	// ReadOnly limits the locked process to read access below Path.
+	ReadOnly bool
+}
+
 // Options configures the host OS lockdown boundary.
 type Options struct {
-	// WorkspacePath is the optional host workspace directory. The locked
-	// process may open files below it. It must exist when Apply runs.
-	WorkspacePath string
-
-	// WorkspaceReadOnly limits the locked process to read access below
-	// WorkspacePath.
-	WorkspaceReadOnly bool
+	// Mounts lists the host directories that the locked process may open
+	// files below. Duplicate and nested entries are allowed. The lockdown only
+	// adds allow rules, so a path is writable when any entry that covers it is
+	// writable.
+	Mounts []HostMount
 
 	// AllowOutboundNet permits new outbound TCP and UDP connections and accept
 	// on pre-bound listeners when Track A (-net=nat) is active. Apply
@@ -52,6 +63,11 @@ type Options struct {
 	// port here. Seatbelt can match remote ports but not remote addresses.
 	// Ignored when AllowOutboundNet is true.
 	OutboundUDPPorts []uint16
+
+	// CPUQuotaMillis caps the CPU time of the process, in thousandths of a CPU.
+	// Zero means no cap. Only Windows enforces it, with a hard cap on the
+	// containment job. Status.CPUQuotaEnforced reports whether Apply did.
+	CPUQuotaMillis int64
 
 	// InstallSyscallFilter installs the seccomp program of the embedder. Only
 	// Linux uses it, and Apply fails there when it is nil. The caller builds the
@@ -72,16 +88,21 @@ type Status struct {
 	// with an active process limit of one.
 	SubprocessBlocked bool
 
-	// UnboundFileOpenBlocked reports that opens outside the workspace fail.
+	// UnboundFileOpenBlocked reports that opens outside every mount fail.
 	// macOS: probe opens failed in the whole process. Windows: probe opens
 	// failed on a thread that holds the restricted token, so only threads
 	// that call BindThread have this property. Linux: the seccomp filter
-	// rejects every open when no workspace exists. With a workspace, the filter
+	// rejects every open when no mount exists. With a mount, the filter
 	// rejects opens relative to the working directory but must allow opens
 	// relative to a directory descriptor, and seccomp cannot read the path. An
 	// absolute path opened through such a descriptor still reaches the host
 	// root, so the field stays false.
 	UnboundFileOpenBlocked bool
+
+	// CPUQuotaEnforced reports that the OS caps the CPU time of the process at
+	// Options.CPUQuotaMillis. It is false when the option is zero and on a host
+	// OS that has no such cap. Windows reads the cap back from the job.
+	CPUQuotaEnforced bool
 
 	// IntegrityDowngraded reports a Low integrity primary token. Windows only.
 	IntegrityDowngraded bool
@@ -111,8 +132,8 @@ var (
 // process can be partly locked and the caller must stop using it.
 //
 // Precondition: Open all hypervisor handles, cached .erofs layer descriptors,
-// network listeners/sockets, and the /workspace os.Root handle before calling
-// Apply.
+// network listeners/sockets, and the os.Root handle of every host mount before
+// calling Apply.
 func Apply(opts Options) (Status, error) {
 	lockdownMu.Lock()
 	defer lockdownMu.Unlock()
@@ -124,6 +145,9 @@ func Apply(opts Options) (Status, error) {
 			return Status{}, errors.New("hostlockdown: OutboundUDPPorts contains port 0")
 		}
 	}
+	if err := validateMounts(opts.Mounts); err != nil {
+		return Status{}, err
+	}
 	st, err := applyOSLockdown(opts)
 	if err != nil {
 		return st, err
@@ -134,7 +158,34 @@ func Apply(opts Options) (Status, error) {
 	return st, nil
 }
 
+// validateMounts refuses an empty path and the root of a file system. A root
+// mount would allow every host file.
+func validateMounts(mounts []HostMount) error {
+	for i, m := range mounts {
+		if m.Path == "" {
+			return fmt.Errorf("hostlockdown: mount %d has an empty path", i)
+		}
+		abs, err := filepath.Abs(m.Path)
+		if err != nil {
+			return fmt.Errorf("hostlockdown: resolve mount %q: %w", m.Path, err)
+		}
+		if filepath.Dir(abs) == abs {
+			return fmt.Errorf("hostlockdown: mount %q is the root of a file system and would allow every host file", m.Path)
+		}
+	}
+	return nil
+}
+
 // IsLockedDown reports whether Apply has succeeded in the current process.
 func IsLockedDown() bool {
 	return lockedDownFlag.Load()
+}
+
+// jobCPURate converts a CPU quota in thousandths of a CPU into the CpuRate of a
+// Windows job object: hundredths of a percent of the total CPU time of the
+// host, from 1 to 10000. A quota above the host capacity gives 10000.
+func jobCPURate(quotaMillis int64, hostCPUs int) uint32 {
+	hostCPUs = max(1, hostCPUs)
+	rate := quotaMillis * 10000 / (int64(hostCPUs) * 1000)
+	return uint32(min(10000, max(1, rate)))
 }

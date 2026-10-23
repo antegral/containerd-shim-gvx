@@ -262,6 +262,21 @@ func ptReserveFor(n int) int {
 	return pte + pmd + pud + 1
 }
 
+// ptSplitReserve is the number of page-table pages that one Map or Unmap
+// call can need to split large entries. A range has two ends. Each end can
+// split one 1 GiB entry and then one 2 MiB entry.
+const ptSplitReserve = 4
+
+// ptReserveForRuns returns the number of page-table pages that mapping runs
+// can allocate at most. Each run is a separate call of Map.
+func ptReserveForRuns(runs []gpaRun) int {
+	n := 0
+	for _, r := range runs {
+		n += ptSplitReserve + ptReserveFor(int(r.size/pageSize))
+	}
+	return n
+}
+
 var _ pagetables.Allocator = (*ptAllocator)(nil)
 
 // userPageOpts returns the page table options of a user page.

@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hvf
+//go:build !linux && !darwin && !windows
 
-import "z.gfire.dev/gvx/pkg/hostarch"
+package oci
 
-func makeTableDescriptor(gpa uint64) uint64 { return x86MakeTableDescriptor(gpa) }
+import (
+	"errors"
+	"os"
+)
 
-func tableDescriptorIPA(desc uint64) (uint64, bool) { return x86TableDescriptorGPA(desc) }
+// No terminal support exists on this host OS. Standard input then reads as a
+// pipe, and a password comes from one line of input.
+func isTerminalFile(*os.File) bool { return false }
 
-func userLeafDescriptor(gpa uint64, at hostarch.AccessType) uint64 {
-	return x86UserLeafDescriptor(gpa, at)
+func readPasswordFile(*os.File) (string, error) {
+	return "", errors.New("oci: reading a password from a terminal is not supported on this OS")
 }

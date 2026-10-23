@@ -104,19 +104,13 @@ func limitWorkers(t testing.TB, p *Platform, n int) {
 	pool.limit = n
 }
 
-// mapHostBytes maps 4KB host pages at addr. It is the test counterpart of
-// MapFile for plain host memory.
+// mapHostBytes maps host memory at addr through MapFile. Each call uses a new
+// memmap.File, so the registry treats the memory as a new owner.
 func mapHostBytes(t testing.TB, as *AddressSpace, addr hostarch.Addr, mem []byte, at hostarch.AccessType) {
 	t.Helper()
-	as.mu.Lock()
-	defer as.mu.Unlock()
-	var stale []pageEntry
-	for off := 0; off < len(mem); off += pageSize4K {
-		if err := as.mapPageLocked(uint64(addr)+uint64(off), mem[off:off+pageSize4K:off+pageSize4K], at, &stale); err != nil {
-			t.Fatalf("map page at %#x: %v", uint64(addr)+uint64(off), err)
-		}
+	if err := as.MapFile(addr, &testFile{mem: mem}, memmap.FileRange{Start: 0, End: uint64(len(mem))}, at, false); err != nil {
+		t.Fatalf("MapFile at %#x: %v", uint64(addr), err)
 	}
-	as.finishInvalidation(stale)
 }
 
 // guest is one address space with a code page and a data page.
@@ -126,6 +120,7 @@ type guest struct {
 	as    *AddressSpace
 	mm    *stubMemoryManager
 	arena []byte
+	file  *testFile // Backs arena. The code page and the data page share its region.
 	code  []byte
 	data  []byte
 	ctx   *Context
@@ -149,7 +144,7 @@ func newGuest(t testing.TB, plat *Platform, program ...uint32) *guest {
 		t.Fatalf("AllocateAnonymousArena failed: %v", err)
 	}
 	g := &guest{
-		t: t, plat: plat, as: as, mm: &stubMemoryManager{as: as}, arena: arena,
+		t: t, plat: plat, as: as, mm: &stubMemoryManager{as: as}, arena: arena, file: &testFile{mem: arena},
 		code: arena[:pageSize4K], data: arena[pageSize4K : 2*pageSize4K],
 	}
 	t.Cleanup(func() {
@@ -158,8 +153,18 @@ func newGuest(t testing.TB, plat *Platform, program ...uint32) *guest {
 			t.Errorf("UnmapView failed: %v", err)
 		}
 	})
-	mapHostBytes(t, as, guestCodeAddr, g.code, hostarch.AccessType{Read: true, Execute: true})
-	mapHostBytes(t, as, guestDataAddr, g.data, hostarch.ReadWrite)
+	for _, m := range []struct {
+		va hostarch.Addr
+		fr memmap.FileRange
+		at hostarch.AccessType
+	}{
+		{guestCodeAddr, memmap.FileRange{Start: 0, End: pageSize4K}, hostarch.AccessType{Read: true, Execute: true}},
+		{guestDataAddr, memmap.FileRange{Start: pageSize4K, End: 2 * pageSize4K}, hostarch.ReadWrite},
+	} {
+		if err := as.MapFile(m.va, g.file, m.fr, m.at, false); err != nil {
+			t.Fatalf("MapFile at %#x: %v", uint64(m.va), err)
+		}
+	}
 	g.setProgram(program...)
 	g.ctx = plat.NewContext(context.Background()).(*Context)
 	g.ac = arch.New(arch.Host)
@@ -180,6 +185,17 @@ func (g *guest) switchOnce() (*linux.SignalInfo, hostarch.AccessType, error) {
 }
 
 func (g *guest) regs() *arch.Registers { return &g.ac.StateData().Regs }
+
+// read64 runs LDR X1,[X0] then SVC #0 at the code page and returns the value
+// that the guest loaded from va. The guest program must start with those two
+// instructions. The call returns the signal that a failed load raises.
+func (g *guest) read64(va hostarch.Addr) (uint64, *linux.SignalInfo, error) {
+	g.ac.SetIP(uintptr(guestCodeAddr))
+	g.regs().Regs[0] = uint64(va)
+	g.regs().Regs[1] = 0
+	sig, _, err := g.switchOnce()
+	return g.regs().Regs[1], sig, err
+}
 
 func TestSyscallRoundTripPreservesRegisters(t *testing.T) {
 	plat := newTestPlatform(t)
@@ -247,35 +263,25 @@ func TestGuestMemoryWriteIsVisibleToHost(t *testing.T) {
 	}
 }
 
-func TestAddressSpaceCopyAndAtomics(t *testing.T) {
+// The Sentry reads and writes guest memory through the host mapping of the
+// memory, not through the address space. The guest must see each host write.
+func TestHostWriteIsVisibleToGuest(t *testing.T) {
 	plat := newTestPlatform(t)
-	g := newGuest(t, plat)
-	as := g.as
-	prev, err := as.CompareAndSwapUint32(guestDataAddr, 0, 0xCAFEBABE)
-	if err != nil || prev != 0 {
-		t.Fatalf("CompareAndSwapUint32 = (%#x, %v), want (0, nil)", prev, err)
+	if plat.SupportsAddressSpaceIO() {
+		t.Fatal("SupportsAddressSpaceIO() = true, want false: the Sentry uses the memory file mappings")
 	}
-	if got, err := as.LoadUint32(guestDataAddr); err != nil || got != 0xCAFEBABE {
-		t.Fatalf("LoadUint32 = (%#x, %v)", got, err)
-	}
-	if old, err := as.SwapUint32(guestDataAddr, 7); err != nil || old != 0xCAFEBABE {
-		t.Fatalf("SwapUint32 = (%#x, %v)", old, err)
-	}
-	// A write that crosses the page boundary into the code page must fail.
-	n, err := as.CopyOut(guestDataAddr+pageSize4K-2, []byte{1, 2, 3, 4})
-	var segv platform.SegmentationFault
-	if n != 2 || !errors.As(err, &segv) {
-		t.Fatalf("CopyOut across the end of the mapping = (%d, %v), want 2 bytes then SegmentationFault", n, err)
-	}
-	if _, err := as.CopyOut(guestCodeAddr, []byte{1}); !errors.As(err, &segv) {
-		t.Fatalf("CopyOut to a read-only page = %v, want SegmentationFault", err)
-	}
-	zeroed, err := as.ZeroOut(guestDataAddr, 8)
-	if err != nil || zeroed != 8 {
-		t.Fatalf("ZeroOut = (%d, %v)", zeroed, err)
-	}
-	if got, _ := as.LoadUint32(guestDataAddr); got != 0 {
-		t.Fatalf("LoadUint32 after ZeroOut = %#x", got)
+	g := newGuest(t, plat, insnLdrX1X0, insnSVC0)
+	for i, want := range []uint64{0x1111, 0x2222_3333, 0x4444_5555_6666} {
+		binary.LittleEndian.PutUint64(g.data[0x20:], want)
+		g.ac.SetIP(uintptr(guestCodeAddr))
+		g.regs().Regs[0] = uint64(guestDataAddr) + 0x20
+		g.regs().Regs[1] = 0
+		if sig, _, err := g.switchOnce(); sig != nil || err != nil {
+			t.Fatalf("round %d: Switch = (%v, %v)", i, sig, err)
+		}
+		if got := g.regs().Regs[1]; got != want {
+			t.Fatalf("round %d: the guest read %#x, want the host write %#x", i, got, want)
+		}
 	}
 }
 

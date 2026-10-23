@@ -23,6 +23,7 @@ import (
 	"z.gfire.dev/gvx/pkg/hostarch"
 	"z.gfire.dev/gvx/pkg/sentry/arch"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // Design notes for the vCPU state that this backend does not virtualize.
@@ -50,7 +51,7 @@ import (
 
 // syncState names the translation state a vCPU last flushed for.
 type syncState struct {
-	pt  uint64 // GuestPageTable.id; zero means unknown.
+	pt  uint64 // stage1Tables.id; zero means unknown.
 	tlb uint64
 	ic  uint64
 }
@@ -101,11 +102,11 @@ func (w *vcpuWorker) configure() error {
 		reg uint32
 		val uint64
 	}{
-		{hvSysRegMAIR, mairEL1},
-		{hvSysRegTCR, tcrEL1(ips)},
+		{hvSysRegMAIR, hvcommon.MAIRNormalWB},
+		{hvSysRegTCR, hvcommon.TCR(ips)},
 		{hvSysRegTTBR1, w.vm.kernel.ttbr1()},
-		{hvSysRegCPACR, cpacrEL1},
-		{hvSysRegCNTKCTL, cntkctlEL1},
+		{hvSysRegCPACR, hvcommon.CPACRNoTrap},
+		{hvSysRegCNTKCTL, hvcommon.CNTKCTLEL0},
 		{hvSysRegCNTVCTL, cntvCtlMasked},
 		{hvSysRegVBAR, kernelVectorVA},
 		{hvSysRegSPEL1, w.comm.va},
@@ -227,7 +228,7 @@ func (w *vcpuWorker) runSwitch(r *switchReq) (*linux.SignalInfo, hostarch.Access
 }
 
 // runLoop enters the guest until an exit needs the Sentry.
-func (w *vcpuWorker) runLoop(c *Context, pt *GuestPageTable, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (w *vcpuWorker) runLoop(c *Context, pt *stage1Tables, ac *arch.Context64) (*linux.SignalInfo, hostarch.AccessType, error) {
 	for {
 		if w.quit.Load() {
 			return nil, hostarch.NoAccess, errPlatformClosed
@@ -259,12 +260,12 @@ func (w *vcpuWorker) runLoop(c *Context, pt *GuestPageTable, ac *arch.Context64)
 }
 
 // prepareEntry readies PC, PSTATE, TTBR0 and the flush flags for one entry.
-func (w *vcpuWorker) prepareEntry(pt *GuestPageTable) error {
+func (w *vcpuWorker) prepareEntry(pt *stage1Tables) error {
 	if pt.dead.Load() {
 		return errPageTableReleased
 	}
 	if w.needsReset {
-		if err := hvSetReg(w.id, hvRegCPSR, pstateEL1h); err != nil {
+		if err := hvSetReg(w.id, hvRegCPSR, hvcommon.PstateEL1h); err != nil {
 			w.invalidateState()
 			return err
 		}
@@ -297,7 +298,7 @@ func (w *vcpuWorker) prepareEntry(pt *GuestPageTable) error {
 // beginRun announces the entry to quiesce. It reports false when the table
 // changed between prepareEntry and the announcement: the caller prepares
 // again, so the flush flags cover the newer generation.
-func (w *vcpuWorker) beginRun(pt *GuestPageTable) bool {
+func (w *vcpuWorker) beginRun(pt *stage1Tables) bool {
 	w.enterTLB.Store(w.entry.tlb)
 	w.inGuest.Store(true)
 	if pt.tlbGen.Load() != w.entry.tlb || pt.dead.Load() {
@@ -320,7 +321,7 @@ const maxUnknownExits = 4096
 
 // dispatchExit decodes one hv_vcpu_run exit. It reports done=false when the
 // loop must enter the guest again.
-func (w *vcpuWorker) dispatchExit(c *Context, pt *GuestPageTable, ac *arch.Context64) (done bool, info *linux.SignalInfo, at hostarch.AccessType, err error) {
+func (w *vcpuWorker) dispatchExit(c *Context, pt *stage1Tables, ac *arch.Context64) (done bool, info *linux.SignalInfo, at hostarch.AccessType, err error) {
 	if w.exit.reason != hvExitReasonUnknown {
 		w.unknownExits = 0
 	}
@@ -362,7 +363,7 @@ func inSpillRoutine(pc uint64) bool {
 }
 
 // onCancel resumes after a cancellation unless the Sentry needs the vCPU.
-func (w *vcpuWorker) onCancel(c *Context, pt *GuestPageTable) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
+func (w *vcpuWorker) onCancel(c *Context, pt *stage1Tables) (bool, *linux.SignalInfo, hostarch.AccessType, error) {
 	pending := c.interrupted.Load()
 	stale := pt.tlbGen.Load() != w.entry.tlb || pt.dead.Load()
 	quit := w.quit.Load()

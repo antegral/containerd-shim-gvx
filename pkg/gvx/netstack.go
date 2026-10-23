@@ -81,10 +81,11 @@ func (s *Sandbox) initNetstack() error {
 		s.netStack = st
 		s.natForwarder = fwd
 
-		if len(s.cfg.PortForwards) > 0 {
+		s.forwards = s.effectivePortForwards()
+		if len(s.forwards) > 0 {
 			pf := netbackend.NewPortForwarder()
-			rules := make([]netbackend.PortForwardRule, 0, len(s.cfg.PortForwards))
-			for _, pfSpec := range s.cfg.PortForwards {
+			rules := make([]netbackend.PortForwardRule, 0, len(s.forwards))
+			for _, pfSpec := range s.forwards {
 				hostIP := pfSpec.BindAddress
 				if hostIP == "" {
 					hostIP = "127.0.0.1"

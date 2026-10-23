@@ -335,3 +335,61 @@ func (w *windowMap) Lookup(addr uint64) (viewInfo, uint64, bool) {
 	}
 	return viewInfo{e.view.backing, e.view.off + (addr - e.addr), e.view.prot}, e.addr, true
 }
+
+// guestWindows holds the window maps of one stub, which do not overlap. A stub
+// has one window, or two when the platform also reserves the low window. The
+// host owns the range between two windows, and the memory manager never maps
+// there. The memory manager does unmap ranges that cross the gap.
+type guestWindows struct {
+	maps []*windowMap
+}
+
+func newGuestWindows(maps ...*windowMap) *guestWindows {
+	return &guestWindows{maps: slices.Clone(maps)}
+}
+
+// window returns the map whose window contains addr, or nil.
+func (g *guestWindows) window(addr uint64) *windowMap {
+	for _, w := range g.maps {
+		if addr >= w.base && addr < w.limit {
+			return w
+		}
+	}
+	return nil
+}
+
+// Map replaces [addr, addr+size) with a view of backing at off. The range must
+// lie in one window.
+func (g *guestWindows) Map(addr, size uint64, backing viewBacking, off uint64, prot viewProt) error {
+	w := g.window(addr)
+	if w == nil {
+		return fmt.Errorf("window range %#x+%#x starts outside every window", addr, size)
+	}
+	return w.Map(addr, size, backing, off, prot)
+}
+
+// Unmap turns the parts of [addr, addr+size) that lie in a window into
+// placeholders. It ignores the parts outside every window.
+func (g *guestWindows) Unmap(addr, size uint64) error {
+	end := addr + size
+	for _, w := range g.maps {
+		lo, hi := max(addr, w.base), min(end, w.limit)
+		if lo >= hi {
+			continue
+		}
+		if err := w.Unmap(lo, hi-lo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Lookup returns the view that covers addr, as windowMap.Lookup does. It
+// returns false for an address outside every window.
+func (g *guestWindows) Lookup(addr uint64) (viewInfo, uint64, bool) {
+	w := g.window(addr)
+	if w == nil {
+		return viewInfo{}, 0, false
+	}
+	return w.Lookup(addr)
+}

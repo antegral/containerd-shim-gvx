@@ -20,10 +20,12 @@ import (
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
-// The test builds the x86 kernel subtree with a fake allocator and walks it
-// from a user root, as the CPU would after CR3 loads that root.
+// The test builds the x86 kernel subtree with a fake allocator. Then it reads
+// the PML4 of a user tree, as the CPU would after CR3 loads that root, and
+// checks that the user root links the kernel entry.
 func TestX86KernelSubtreeIsSharedByEveryUserRoot(t *testing.T) {
 	a := newFakeAllocator()
 	const slots = 4
@@ -34,62 +36,59 @@ func TestX86KernelSubtreeIsSharedByEveryUserRoot(t *testing.T) {
 	kernelPages := len(a.live)
 	img := buildX86Kernel(x86KernelCodeVA)
 
-	leaf := func(root []byte, va uint64) (uint64, bool) {
-		d, ok := walk(a, root, va)
-		return d, ok && d != 0
-	}
-	check := func(name string, root []byte, va uint64, content []byte, writable, executable bool) {
+	check := func(name string, va uint64, content []byte, writable, executable bool) {
 		t.Helper()
-		d, ok := leaf(root, va)
-		if !ok {
+		_, phys, size, opts := k.pt.Lookup(hostarch.Addr(va), false)
+		if size == 0 {
 			t.Errorf("%s: %#x is not mapped", name, va)
 			return
 		}
-		if d&x86PTEUser != 0 {
-			t.Errorf("%s: descriptor %#x lets user mode in", name, d)
+		if opts.User {
+			t.Errorf("%s: the page lets user mode in", name)
 		}
-		if (d&x86PTEWritable != 0) != writable || (d&x86PTENX == 0) != executable {
-			t.Errorf("%s: descriptor %#x has W=%v X=%v, want W=%v X=%v", name, d, d&x86PTEWritable != 0, d&x86PTENX == 0, writable, executable)
+		if opts.AccessType.Write != writable || opts.AccessType.Execute != executable {
+			t.Errorf("%s: the page has W=%v X=%v, want W=%v X=%v", name, opts.AccessType.Write, opts.AccessType.Execute, writable, executable)
 		}
 		if content != nil {
-			if page := a.live[d&x86PTEAddrMask]; !bytes.Equal(page, content) {
+			if page := a.live[uint64(phys)]; !bytes.Equal(page, content) {
 				t.Errorf("%s: the page does not hold the generated image", name)
 			}
 		}
 	}
-
-	for round := range 3 {
-		pt, err := NewGuestPageTable(a, k.prefillRoot)
-		if err != nil {
-			t.Fatal(err)
+	check("GDT", x86KernelGDTVA, img.GDT, false, false)
+	check("IDT", x86KernelIDTVA, img.IDT, false, false)
+	check("code", x86KernelCodeVA, img.Code, false, true)
+	for i := range slots {
+		va := x86KernelCommBaseVA + uint64(i)*x86KernelCommStride
+		check("CommPage", va, nil, true, false)
+		check("stack", va+pageSize4K, nil, true, false)
+		if _, _, size, _ := k.pt.Lookup(hostarch.Addr(va+2*pageSize4K), false); size != 0 {
+			t.Errorf("slot %d: the guard page is mapped", i)
 		}
-		root := pt.tables.root
-		if got, want := loadPTE(root, x86KernelPML4Slot), loadPTE(k.tables.root, x86KernelPML4Slot); got != want || got == 0 {
+		if k.comm[i].va != va {
+			t.Errorf("slot %d: VA %#x, want %#x", i, k.comm[i].va, va)
+		}
+	}
+
+	kernelRoot := k.alloc.LookupPTEs(uintptr(k.pt.CR3(false, 0)))
+	for round := range 3 {
+		s := newStage1On(t, a, k.pt)
+		root := s.alloc.LookupPTEs(uintptr(s.RootIPA()))
+		if got, want := root[x86KernelPML4Slot], kernelRoot[x86KernelPML4Slot]; got != want || got == 0 {
 			t.Fatalf("round %d: PML4 entry 511 = %#x, want the shared entry %#x", round, got, want)
 		}
-		check("GDT", root, x86KernelGDTVA, img.GDT, false, false)
-		check("IDT", root, x86KernelIDTVA, img.IDT, false, false)
-		check("code", root, x86KernelCodeVA, img.Code, false, true)
-		for i := range slots {
-			va := x86KernelCommBaseVA + uint64(i)*x86KernelCommStride
-			check("CommPage", root, va, nil, true, false)
-			check("stack", root, va+pageSize4K, nil, true, false)
-			if _, ok := leaf(root, va+2*pageSize4K); ok {
-				t.Errorf("slot %d: the guard page is mapped", i)
-			}
-			if k.comm[i].va != va {
-				t.Errorf("slot %d: VA %#x, want %#x", i, k.comm[i].va, va)
-			}
-		}
 		// User addresses go through other PML4 entries and never touch the kernel.
-		if _, err := pt.MapPage(0x400000, 0x2_0000_0000, hostarch.ReadWrite); err != nil {
+		if _, err := s.mapRange(0x400000, 0x2_0000_0000, pageSize4K, hostarch.ReadWrite); err != nil {
 			t.Fatal(err)
 		}
-		if d, _ := leaf(root, 0x400000); d == 0 {
+		if got, size, _ := translate(s, 0x400000); size == 0 || got != 0x2_0000_0000 {
 			t.Error("the user mapping vanished")
 		}
-		pt.markDead()
-		pt.release()
+		if root[x86KernelPML4Slot] != kernelRoot[x86KernelPML4Slot] {
+			t.Error("a user mapping changed the shared kernel entry")
+		}
+		s.markDead()
+		s.release()
 		if got := len(a.live); got != kernelPages {
 			t.Fatalf("round %d: %d pages are live after release, want the %d kernel pages", round, got, kernelPages)
 		}
@@ -113,7 +112,7 @@ func TestX86KernelSlotsAreDistinctAndInitialized(t *testing.T) {
 		if kc.view.Stack != kc.stackTopVA() {
 			t.Errorf("slot %d: SYSCALL stack %#x, want %#x", i, kc.view.Stack, kc.stackTopVA())
 		}
-		if got := binary.LittleEndian.Uint64(kc.view.TSS[x86TSSRSP0Offset:]); got != kc.stackTopVA() {
+		if got := binary.LittleEndian.Uint64(kc.view.TSS[hvcommon.TSSRSP0Offset:]); got != kc.stackTopVA() {
 			t.Errorf("slot %d: TSS RSP0 %#x, want %#x", i, got, kc.stackTopVA())
 		}
 		if got, want := kc.frameSlotVA(), kc.va+pageSize4K+x86FrameVector; got != want {
@@ -134,9 +133,13 @@ func TestX86KernelSlotsAreDistinctAndInitialized(t *testing.T) {
 }
 
 func TestX86KernelBuildFailsCleanly(t *testing.T) {
-	a := newFakeAllocator()
-	a.failAt = 6 // Fail inside the first CommPage allocations.
-	if _, err := buildX86KernelMap(a, 4); err == nil {
-		t.Fatal("buildX86KernelMap hid the allocator failure")
+	// The build reserves its table pages first, then it allocates the images.
+	// A failure in either step must reach the caller.
+	for _, failAt := range []int{2, kernelTablePages + 1, kernelTablePages + 6} {
+		a := newFakeAllocator()
+		a.failAt = failAt
+		if _, err := buildX86KernelMap(a, 4); err == nil {
+			t.Fatalf("failAt %d: buildX86KernelMap hid the allocator failure", failAt)
+		}
 	}
 }

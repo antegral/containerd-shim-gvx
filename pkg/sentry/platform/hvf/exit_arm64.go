@@ -19,6 +19,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/abi/linux"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/sentry/platform/hvcommon"
 )
 
 // This file decodes ARM64 exception syndromes into Linux behavior. It has no
@@ -29,12 +30,12 @@ const (
 	ecUnknown      = 0x00
 	ecWFx          = 0x01
 	ecIllegalState = 0x0e
-	ecSVC64        = 0x15
+	ecSVC64        = hvcommon.ECSVC64
 	ecHVC64        = 0x16
 	ecSysReg       = 0x18
-	ecInstrAbort   = 0x20
+	ecInstrAbort   = hvcommon.ECInstrAbortLower
 	ecPCAlignment  = 0x22
-	ecDataAbort    = 0x24
+	ecDataAbort    = hvcommon.ECDataAbortLower
 	ecSPAlignment  = 0x26
 	ecBreakpoint   = 0x30
 	ecBreakpointEL = 0x31

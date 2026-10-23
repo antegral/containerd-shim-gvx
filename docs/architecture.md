@@ -16,7 +16,7 @@ This section defines the Priority-0 target matrix, execution backends, networkin
 | **Unified `systrap` Fallback (`systrap`)** | Exposes `pkg/sentry/platform/systrap` on Linux (upstream) and macOS `arm64` (`darwinsystrap`) using lazy in-place syscall patching and pre-spawned stub subprocesses. Windows (`winsystrap`) runs stub processes that a debug object controls. | Executes ELF64 binaries and JIT runtimes (V8) when hardware virtualization is disabled. The guest architecture must equal the host architecture. |
 | **Dual-Track Netstack (`pkg/netbackend`)** | Connects `pkg/tcpip` to an L4 Go `net` NAT and port forwarder (`-net=nat -p`) or an L3 `wireguard-go` tunnel (`-net=wg`). | Supports inbound/outbound port forwarding (`-p`) and `host.docker.internal`, or cryptographic L3 isolation. |
 | **Direct OCI Image Execution (`pkg/oci`)** | Streams OCI `.tar.gz`/`.tar.zst` layers in memory into cached `<sha256>.erofs` images mounted via `fsimpl/overlay`. | Runs unmodified multi-arch Docker/OCI images without extracting Linux files onto NTFS or APFS. |
-| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Modifies less than 5% of upstream gVisor and builds via `go build` on Go 1.25+. |
+| **Clean Upstream Boundary** | Isolates host logic behind `_windows.go` and `_darwin.go` files and platform interfaces. | Requires a charged upstream diff below 0.7% under Section 2.2 audit rules and Go 1.25+ builds without Bazel. |
 
 ```mermaid
 flowchart TD
@@ -105,7 +105,7 @@ gvx/ (Fork of google/gvisor@go)
  │   │   ├── wireguard_tun.go
  │   │   └── wireguard_bind.go
  │   ├── hostarch/
- │   │   └── hostarch_arm64_16k.go          # [NEW] Opt-in 16KB page size (-tags pagesize_16k) for the macOS systrap engine
+ │   │   └── hostarch_darwin_arm64_16k.go   # [NEW] Opt-in 16KB page size (-tags pagesize_16k) for the macOS systrap engine
  │   ├── sync/
  │   │   ├── futex_linux.go                 # [NEW] Linux SYS_FUTEX implementation
  │   │   ├── futex_windows.go               # [NEW] WaitOnAddress / WakeByAddressSingle bindings
@@ -146,6 +146,9 @@ gvx/ (Fork of google/gvisor@go)
  │       │   │   ├── vcpu_darwin_amd64.go
  │       │   │   ├── bluepill_arm64.go      # Go generator for the in-guest EL1 stub
  │       │   │   └── bluepill_x86.go        # Go generator for the in-guest Ring-0 stub
+ │       │   ├── hvcommon/                  # [NEW] Encoders, descriptors, and EL1 values that whpx and hvf share
+ │       │   │   ├── a64.go                 # AArch64 encoders and EL1 constants
+ │       │   │   └── x86.go                 # x86-64 selectors, GDT, TSS, IDT gate, and GS opcode emitters
  │       │   └── systrap/                   # Unified systrap backend (Linux upstream + macOS/Windows siblings)
  │       │       ├── systrap.go             # Unmodified upstream Linux systrap implementation
  │       │       ├── systrap_xplat.go       # [NEW] Shared types: ProbeInfo, ErrUnavailable
@@ -178,7 +181,7 @@ Each package owns one architectural boundary. Enforce top-down import directiona
 | `cmd/containerd-shim-gvx-v2` | Dispatches the optional shim command. | `internal/gvxshim` | `pkg/*`, `runsc/*`, `shim/*` |
 | `internal/gvxshim` | Owns bootstrap, local RPC controls, process lifetime, and safe cleanup. | None; public containerd types, ttRPC, protobuf, and host APIs are external dependencies. | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
 | `tools/shiminterop` | Exercises real ShimManager `2.1.5` against the compiled shim in an isolated module. | None | Root runtime, command, and internal packages |
-| `cmd/rungv` | Parses CLI flags (`run`, `pull`, `stub`) and starts a sandbox instance. | `pkg/gvx` | `pkg/sentry/*`, `WinHvPlatform.dll` |
+| `cmd/rungv` | Parses the Docker-style commands of [`cli.md`](cli.md) (`run`, `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, `logout`, `stub`) and starts a sandbox instance. | `pkg/gvx` | `pkg/sentry/*`, `WinHvPlatform.dll` |
 | `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, and Sentry boot. | `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip` | `cmd/*`, `internal/gvxshim` |
 | `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests and compiles `.tar` layers into `.erofs` files. | `pkg/abi/linux` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
 | `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
@@ -198,17 +201,17 @@ To prevent merge conflicts during continuous upstream pulls, `gvx` partitions al
 
 | Isolation Tier | File Paths | Upstream Conflict Rate | Maintenance Mechanism |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/fsimpl/hostfs/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
-| **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin}.go`, `pkg/memutil/*_{windows,darwin}.go`, `pkg/fd/*_{windows,darwin}.go`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
-| **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 5.0%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
+| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/platform/hvcommon/`, `pkg/sentry/fsimpl/hostfs/`, `pkg/sentry/fsimpl/ext4lite/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
+| **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
+| **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 0.7%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
 
-The audit charges a file against the 5% ceiling only when its content differs from upstream. It reports files that `gvx` adds inside upstream directories separately. It also reports build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) as a third number. A strict count that includes the fences is larger than the charged share, and the audit prints both.
+The audit charges a file against the 0.7% ceiling only when its content differs from upstream. A file that `gvx` adds inside an upstream directory is free when its name carries the token `windows`, `darwin`, or `xplat`, because the audit then counts it as a Tier 2 sibling. It reports build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) as a third number. A strict count that includes the fences is larger than the charged share, and the audit prints both.
 
 ```mermaid
 flowchart LR
     Upstream["google/gvisor (go branch)"] -->|"1. git fetch upstream go"| Merge["2. git merge --no-commit upstream/go"]
     Merge -->|"3. go run ./tools/upstream -mode=retag"| Retag["Rewrite //go:build linux || windows || darwin"]
-    Retag -->|"4. go run ./tools/upstream -mode=audit"| Audit["Assert touched upstream files < 5.0%"]
+    Retag -->|"4. go run ./tools/upstream -mode=audit"| Audit["Assert touched upstream files < 0.7%"]
     Audit -->|"5. Update UPSTREAM_COMMIT"| Verify["Build & test on Windows and macOS (amd64 & arm64)"]
 ```
 
@@ -217,11 +220,11 @@ flowchart LR
 Run this procedure to audit the current upstream diff or merge new commits from `google/gvisor`.
 
 > [!WARNING]
-> Do not hand-edit `*_linux.go` files or scatter ad-hoc changes across pure-Go Sentry files. Unrecorded edits in Tier 3 files cause merge conflicts during upstream synchronization and violate the 5% diff ceiling. Register every build-tag change in `tools/upstream/buildtag_allowlist.txt`.
+> Do not hand-edit `*_linux.go` files or scatter ad-hoc changes across pure-Go Sentry files. Unrecorded edits in Tier 3 files cause merge conflicts during upstream synchronization and violate the 0.7% diff ceiling. Register every build-tag change in `tools/upstream/buildtag_allowlist.txt`.
 
 1. Register the upstream gVisor repository as the `upstream` Git remote.
 2. Fetch the latest `go` branch from `upstream`.
-3. Inspect the modified upstream file count and verify the `< 5.0%` budget against `UPSTREAM_COMMIT`.
+3. Inspect the modified upstream file count and verify the `< 0.7%` budget against `UPSTREAM_COMMIT`.
 4. Merge `upstream/go` without committing.
 5. Run `tools/upstream` in `retag` mode to apply `//go:build linux || windows || darwin` to allowlisted files.
 6. Run `tools/upstream` in `audit` mode to assert zero unauthorized edits in `*_linux.go` files.
@@ -234,7 +237,7 @@ git fetch upstream go
 # Merge new upstream commits and re-apply build tags
 git merge --no-commit upstream/go
 go run ./tools/upstream -mode=retag
-go run ./tools/upstream -mode=audit -max-ratio=0.05   # add -offline to reuse the cached upstream archive
+go run ./tools/upstream -mode=audit -max-ratio=0.007   # add -offline to reuse the cached upstream archive
 git rev-parse upstream/go > UPSTREAM_COMMIT
 
 # Verify all four Priority-0 host targets and both Linux targets compile cleanly
@@ -262,6 +265,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | **`pkg/memutil` & `pgalloc`** | `memfd_create`, `SYS_MMAP`, `MADV_DONTNEED`, `FALLOC_FL_PUNCH_HOLE` | `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)`, `MapViewOfFile3`, and `DiscardVirtualMemory` (`MEM_RESET`). `MapViewOfFile3` is an export of `kernelbase.dll`, not `kernel32.dll`. `memutil` looks in `kernel32.dll`, so it uses the `MapViewOfFile` fallback on current hosts. | `mmap(MAP_ANON)`, `mach_vm_remap` (multi-view shared aliasing), and `madvise(MADV_FREE)`. |
 | **`pkg/sentry/time` & `hostcpu`** | `clock_gettime(CLOCK_MONOTONIC)`, `getcpu` VDSO | `QueryPerformanceCounter` / `QueryPerformanceFrequency` and `GetCurrentProcessorNumber`. | `mach_continuous_time` / `clock_gettime_nsec_np` and `pthread_cpu_number_np`. |
 | **`pkg/fd`** | Raw `int` FDs, `dup3`, `SCM_RIGHTS` | `HostHandle` wrapping `syscall.Handle` with explicit `Close()` ownership. | `HostHandle` wrapping Darwin file descriptors with `fcntl(F_DUPFD_CLOEXEC)`. |
+| **`pkg/fdnotifier`** | `epoll` in edge-triggered mode (`fdnotifier.go`, Linux only). | One table of observed descriptors in `fdnotifier_portable.go`, with no goroutine and no event. `NonBlockingPoll` reports every requested event as ready. | The same table in `fdnotifier_portable.go`. `NonBlockingPoll` calls `poll` once without blocking. |
 | **`pkg/tcpip`** | `af_packet` / `tun` host links | Pure-Go Netstack routed via `pkg/netbackend` (`-net=nat` or `-net=wg`). | Pure-Go Netstack routed via `pkg/netbackend` (`-net=nat` or `-net=wg`). |
 | **`pkg/abi/linux` & `sentry/arch`** | Pure Go (`amd64` & `arm64`) | Retain 100% unchanged; supports Linux `x86_64` and `aarch64` ABIs natively. | Retain 100% unchanged; supports Linux `aarch64` and `x86_64` ABIs natively. |
 | **`pkg/sentry/syscalls`** | `io_uring` host passthrough | Return `-ENOSYS` on `io_uring_setup` and `io_uring_enter` to select Sentry `epoll`. | Return `-ENOSYS` on `io_uring_setup` and `io_uring_enter` to select Sentry `epoll`. |
@@ -274,7 +278,7 @@ Approximately 65% of gVisor (`pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`
 | :--- | :--- | :--- |
 | **Privilege / OS Requirement** | Standard user token; `windows/arm64` verifies Windows 11 24H2 (`Build >= 26100.3915`) and `WHvCapabilityCodeFeatures.Arm64Support`. | Standard user token with ad-hoc `com.apple.security.hypervisor` signature (`codesign -s -`). |
 | **Partition Creation** | `WHvCreatePartition` + `WHvSetupPartition` | `hv_vm_create(NULL)` |
-| **4KB Page Granularity Mapping** | Allocates 64KB-aligned host arenas in `pgalloc.MemoryFile` and maps 4KB slices into hardware EPT via `WHvMapGpaRange`. | Maps 16KB host arenas into Stage-2 IPA with `HV_MEMORY_READ \| WRITE \| EXEC` via `hv_vm_map`, then enforces 4KB mappings and `R/W/X` permissions in Stage-1 (`TTBR0_EL1` with `TCR_EL1.TG0 = 0b00` 4KB granule). |
+| **4KB Page Granularity Mapping** | Registers each 64MiB arena of `pgalloc.MemoryFile` with the partition once through `WHvMapGpaRange`. `MapFile` and `Unmap` then change only the guest page tables, which hold 4KB or 2MiB entries. | Maps each 1GiB chunk of a `pgalloc.MemoryFile` into Stage-2 IPA once with `HV_MEMORY_READ \| WRITE \| EXEC` via `hv_vm_map`. `MapFile` and `Unmap` then change only Stage-1 (`TTBR0_EL1` with `TCR_EL1.TG0 = 0b00` 4KB granule), which enforces `R/W/X` at 4KB. |
 | **vCPU Execution Call** | `WHvRunVirtualProcessor(partition, vpIndex, ...)` | `hv_vcpu_run(vcpu)` on a dedicated worker thread per vCPU. The worker calls `runtime.LockOSThread()`, because a vCPU belongs to the thread that created it. |
 | **Async Signal Preemption** | `WHvCancelRunVirtualProcessor(partition, vpIndex, 0)` | `hv_vcpus_exit(&vcpu, 1)` |
 | **`amd64` Syscall Trap (`bluepill_x86.go`, `stubgen_x86.go`)** | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT`. | Ring-3 `SYSCALL` enters Ring-0 `MSR_LSTAR`, spills syscall GPRs to `CommPage`, executes `HLT` / `VMCALL`. |
@@ -305,9 +309,13 @@ sequenceDiagram
 
 #### Two-Stage 4KB Paging on Apple Silicon (`platform/hvf`) and 64KB-to-4KB Slicing on Windows (`platform/whpx`) (Descriptive Module)
 
-Linux ELF64 binaries map `.text` (`R-X`) and `.data` (`RW-`) segments at 4KB (`0x1000`) file offsets and virtual address boundaries. On Windows, `VirtualAlloc(MEM_RESERVE)` and `MapViewOfFile3` require 64KB (`0x10000`) alignment. `platform/whpx` resolves this by allocating large 64KB-aligned backing arenas in `pgalloc.MemoryFile` and invoking `WHvMapGpaRange(partition, hostVA, guestPA, 4096, flags)` to inject 4KB mappings and permissions directly into the hardware EPT/Stage-2 tables.
+Linux ELF64 binaries map `.text` (`R-X`) and `.data` (`RW-`) segments at 4KB (`0x1000`) file offsets and virtual address boundaries. On Windows, `VirtualAlloc(MEM_RESERVE)` and `MapViewOfFile3` require 64KB (`0x10000`) alignment. `platform/whpx` resolves this with 4KB entries in its own guest page tables. It registers each 64MiB arena of `pgalloc.MemoryFile` with `WHvMapGpaRange` once. Each arena has a read-only layer and a writable layer. The guest page tables give each 4KB page its permissions.
 
-On Apple Silicon macOS (`darwin/arm64`), the host XNU kernel and `hv_vm_map()` operate on 16KB (`0x4000`) pages. `platform/hvf` resolves this using the two-stage ARM64 MMU (`GVA` to Stage-1 `TTBR0_EL1` 4KB, then `IPA` to Stage-2 `hv_vm_map` 16KB, then `HPA`). Stage-2 maps 16KB host arena blocks into IPA space with permissive `HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC` rights. Inside the vCPU, the `bluepill` stub configures `TCR_EL1.TG0 = 0b00` (4KB granule) and populates 4KB Stage-1 page table entries in `TTBR0_EL1` with exact `R-X` or `RW-` (`UXN=1`) permissions. Because the ARM64 MMU enforces the intersection of Stage-1 and Stage-2 permissions, the hardware traps permission violations at exact 4KB boundaries.
+On Apple Silicon macOS (`darwin/arm64`), the host XNU kernel and `hv_vm_map()` operate on 16KB (`0x4000`) pages. `platform/hvf` resolves this using the two-stage ARM64 MMU (`GVA` to Stage-1 `TTBR0_EL1` 4KB, then `IPA` to Stage-2 `hv_vm_map` 16KB, then `HPA`). Stage-2 maps each 1GiB chunk of the memory file into IPA space once, with permissive `HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC` rights. Inside the vCPU, the `bluepill` stub configures `TCR_EL1.TG0 = 0b00` (4KB granule) and populates 4KB Stage-1 page table entries in `TTBR0_EL1` with exact `R-X` or `RW-` (`UXN=1`) permissions. Because the ARM64 MMU enforces the intersection of Stage-1 and Stage-2 permissions, the hardware traps permission violations at exact 4KB boundaries.
+
+Both hardware backends register guest memory with the hypervisor once, and never on a page fault. `MapFile` and `Unmap` change only the guest page tables. A 4 MiB fault therefore makes one call into the page-table code and no call into the hypervisor. `Platform.MapUnit` returns 2 MiB on both backends. `SupportsAddressSpaceIO` returns false, so the Sentry reads and writes guest memory through its own mapping of the memory file. A write that the Sentry makes to a page that the guest already runs as code does not flush the guest instruction cache on `arm64`. A mapping with execute permission flushes it, so the ELF loader, `mprotect`, and copy-on-write stay correct.
+
+`pkg/sentry/platform/hvcommon` holds the code that the architecture fixes and that the two backends share. This code is the AArch64 instruction encoders, the EL1 system-register values, the x86-64 selectors and descriptors, the TSS template, the IDT gate encoding, and the GS-relative opcode emitters. Each backend keeps its own `CommPage` layout and its own stub generator. Hyper-V and Hypervisor.framework exchange different state at a stop.
 
 ### 3.3 Unified User-Mode Fallback Engine: `pkg/sentry/platform/systrap` (`winsystrap` & `darwinsystrap`) (M5)
 
@@ -319,14 +327,20 @@ On Apple Silicon macOS (`darwin/arm64`), the host XNU kernel and `hv_vm_map()` o
 
 Running untrusted guest instructions inside the Sentry process without SFI masking would expose the Go runtime heap to arbitrary pointer writes. To preserve hardware MMU isolation (`CR3` on `amd64`, `TTBR0_EL1` on `arm64`) without a hypervisor, `platform/systrap` runs the guest in a stub process. The stub exists before `hostlockdown.Apply()` executes, or a process that exists then creates it.
 
-On macOS, a template stub process (`gvx-stub-darwin-arm64`) forks one stub task for each address space. The stub contains no Go runtime, zero file descriptors, and zero network sockets, and it runs inside a Seatbelt profile. Sentry and the stub share a `sysmsg` region (`mmap` + `mach_vm_remap`). When guest code reaches a patched syscall site, the stub spills the guest registers into its per-thread `Sysmsg` slot and wakes the Sentry thread with `__ulock_wake`. The Sentry replies the same way. Neither side needs a kernel socket or a pipe.
+On macOS, a template stub process (`gvx-stub-darwin-arm64`) forks one stub task for each address space. The stub contains no Go runtime, zero file descriptors, and zero network sockets, and it runs inside a Seatbelt profile. Sentry and the stub share a `sysmsg` region (`mmap` + `mach_vm_remap`). When guest code reaches a patched syscall site, the stub spills the guest registers into its per-thread `Sysmsg` slot and publishes the trap. The Sentry replies through the same word. Neither side needs a kernel socket or a pipe.
+
+Each side spins on the state word before it sleeps. The stub spins for 1024 `yield` instructions, and the Sentry spins for 512 rounds of 4 `yield` instructions. A side sets its bit in `Sysmsg.Waiter` before it calls `__ulock_wait` and reads the state again. The other side calls `__ulock_wake` only when it sees that bit. A system call that the Sentry answers inside the spin needs no kernel call. The benchmark `BenchmarkSyscallRoundTrip` measured 4.1 microseconds for a round trip before this change and 0.19 microseconds after it on an M-series Mac.
+
+`Platform.MapUnit` returns 256KiB on macOS. A page fault then maps up to 256KiB of its pma in one `MapFile` call, which uses one remap and one protection call for the whole range. A range that spans the block of a trampoline island skips that block, because the island keeps its own page.
+
+On Windows, the `whpx` backend writes the root register of the address space on the host. The register is `CR3` on `amd64` and `TTBR0_EL1` on `arm64`. The write happens before a virtual processor runs with a recorded address space that differs from the current one. The reload stub in the guest loads the same value. A kick before the run, a cancel inside the reload stub, and `AddressSpace.Release` invalidate the recorded state of the virtual processor. The first fetch of the reload stub then never walks page tables that `Release` freed.
 
 On Windows, a stub host starts before the lockdown. The host is a copy of the Sentry executable that runs only a request loop. It creates one stub process for each address space. The stub is a suspended copy of the executable, and its entry point never runs. It lives in a one-process job under a Low-integrity token and holds no handle. The Sentry attaches every stub to one debug object. A patched syscall site, a page fault, or a signal raises an exception, and the debug object delivers it to the Sentry. The Sentry reads and writes the registers of the thread, so the stub needs no handler and no shared region. A stop costs about 70 to 190 µs.
 
 | `systrap` Subsystem | Windows (`winsystrap`: `amd64` & `arm64`), implemented | macOS (`darwinsystrap`): `arm64` implemented, `amd64` dropped |
 | :--- | :--- | :--- |
 | **Page Granularity** | Reserves the guest window as one placeholder with `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` and maps memory-file pages as 4KB views with `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)`. The 64KB limit does not apply to such views. The guest sees 4KB pages. | Needs `hostarch.PageSize` equal to the 16KB host page, so it requires `-tags pagesize_16k`. A build without the tag returns `*ErrUnsupportedPageSize`. The guest sees 16KB pages, and `mach_vm_remap` maps memory-file ranges into the stub task. |
-| **Guest Address Range** | `0x100000000000` (16TB) to `0x7edfffff0000`. The Sentry reserves it before the loader runs, so the loader places stacks, heaps, and DLLs elsewhere. The engine pages occupy the top 64KB. A Linux `ET_EXEC` image at `0x400000` does not load. | The range starts above the permanent `PROT_NONE` reservations of the host, which the Sentry reads from the template task. It ends below the `sysmsg` blocks. A Linux `ET_EXEC` image at `0x400000` does not load. |
+| **Guest Address Range** | A high window from `0x100000000000` (16TB) to `0x7edfffff0000`, and a low window from `0x10000` to `0x7ffe0000`. The Sentry reserves both before the loader runs, so the loader places stacks, heaps, and DLLs elsewhere. The engine pages occupy the top 64KB of the high window. The memory manager treats the range between the windows as a hole. A Linux `ET_EXEC` image at `0x10000` or `0x400000` loads in the low window. | The range starts above the permanent `PROT_NONE` reservations of the host, which the Sentry reads from the template task. It ends below the `sysmsg` blocks. A Linux `ET_EXEC` image does not load, because every `arm64` task has a 4GB `PAGEZERO`. `rungv` names `-platform=hvf` in its error. The prototype zone mode runs such an image. See section 3.3.1. |
 | **Lazy Execute Page-Trap** | Maps original frames without execute permission. On an execute fault, the Sentry receives the exception through the debug object, patches a private copy of the page, and maps the copy as `PAGE_EXECUTE_READ`. A write to a writable and executable page maps the original frame again. The scan covers the executable sections of the backing ELF file. | Maps `PROT_EXEC` pages read-only. On an instruction abort, the Sentry patches a private copy, flushes the instruction cache with `sys_icache_invalidate`, and promotes the page to `PROT_READ \| PROT_EXEC`. It rewrites only words inside ELF executable sections, because a data word can look like an instruction. |
 | **`amd64` Syscall Patching** | Replaces each decoded `0F 05` with the same-size trap `CC 90`. The scan decodes the page in 16 linear sweeps and patches a site when more than half of the sweeps agree. The Sentry emulates `SYSCALL` at the breakpoint. The patterns A, B, and C are not implemented. | Not applicable. |
 | **`arm64` Trampoline Island & I-Cache Flush** | Replaces `svc #0`, `mrs xN, ctr_el0`, `msr tpidr_el0, xN`, and `ic ivau, xN` in place with `brk` instructions. Windows raises an illegal-instruction exception, and the Sentry emulates the instruction. The engine uses no island and no branch. | Reserves an island through `mm.MMap` within `±120 MB` of the patched page. It replaces `svc #0` with `B <island_slot>` without clobbering `X30 (LR)`. The same patcher rewrites `mrs` and `msr` of `TPIDR_EL0`, reads of `CTR_EL0`, and every instruction that names `X18`. |
@@ -375,6 +389,24 @@ sequenceDiagram
     Sentry->>Sentry: Dispatch the Linux syscall
     Sentry->>Guest: SetThreadContext and NtResumeThread
 ```
+
+#### 3.3.1 Zone Mode for Fixed-Address Executables on macOS (Descriptive Module)
+
+Every `arm64` task on macOS has a 4GB `PAGEZERO`. A Linux executable of type `ET_EXEC` links below 4GB, so it cannot map at its own addresses. The zone mode lets the macOS `systrap` engine run such an executable. It is a prototype, and the environment variable `GVX_SYSTRAP_FIXED_IMAGES=1` turns it on.
+
+The guest sees the addresses that the linker chose. The stub task holds the range from `0x10000` to 4GB, the zone, at the same address plus `2^46`. The platform reports the range between the zone and the biased zone as an address hole. The memory manager then places every other mapping above the biased zone.
+
+The patcher changes three classes of instruction in a code page. An `adr` or `adrp` with a target in the zone loads the guest address. A `br` or `blr` through a register adds the bias to a zone pointer. A load or a store through a zone pointer faults, and the Sentry replaces the instruction by a slot at the first fault. The slot tests bit 46 of the base register, adds the bias, runs the instruction, and removes the bias. Bit 46 is set in every address outside the zone.
+
+A fetch at an unbiased address continues at the biased address. A fault inside a slot reports the guest address and the guest register. An unmap of a range that spans the hole skips the hole, because the biased zone lies in it. A guest instruction that names `x18` runs in an `x18` slot. The Sentry replaces the load or store inside that slot in the same way.
+
+The Go runtime compares every return address with the code range in its module data. The zone mode therefore adds the bias to that range and to the base of the text section map. It also adds the bias to the function values in the section `.go.func`. The Sentry writes those words before the guest runs. An `adr` or `adrp` that yields a Go code address keeps the biased value. The adjustment follows the layout of Go 1.27, and other versions are untested.
+
+The prototype has limits. Return addresses stay biased, so an unwinder that compares them with a function pointer finds no match. The slot adds two branches to each access of the image. The trap slot of the engine saves `x16` and `x17` 512 bytes below the guest stack pointer. Go assembly keeps live words just below it.
+
+A `blr` slot biases a copy of the pointer in `x16`, so the pointer register keeps its guest value. A `br` slot changes the pointer register, because the slot cannot restore it after the jump. The Sentry writes a slot and then re-applies the permission of the stub mapping. It also asks the kernel to synchronize the instruction cache of the stub task. A store into a block that is both writable and executable restores the writable frame. When the store comes from the same block, the Sentry runs the store and writes both copies of the block.
+
+The scan for `adr`, `adrp`, `br`, and `blr` recognizes instructions by bit pattern. A string at the start of the read-only data can share a block with the end of the code. A word of that string can look like an `adr`. The scan therefore skips every word outside the executable sections of the image when the section headers describe the block. An image without section headers keeps the whole block in the scan.
 
 ### 3.4 Register Preservation and Two-Tier Synchronization Contract (Linux ELF & Wine / WoW64 / ARM64EC) (Descriptive Module)
 
@@ -465,9 +497,13 @@ Execute these steps in `pkg/oci` before calling `hostlockdown.Apply()`:
 6. Open read-only `os.File` handles for all cached `.erofs` layers before calling `hostlockdown.Apply()`.
 7. Mount the `.erofs` handles as ordered read-only lower layers under Sentry's `fsimpl/overlay` with `fsimpl/tmpfs` as the writable upper layer.
 
+An image reference follows the Docker grammar. `oci.ParseReference` splits it into a registry, a repository, a tag, and a digest. The credentials come from `credHelpers`, `credsStore`, or `auths` of the Docker configuration file. The layer cache doubles as the image store: one record for each image and one record for each name. `images`, `tag`, `rmi`, `inspect`, `save`, and `load` work on those records. [`cli.md`](cli.md) states the rules.
+
+The sandbox applies the image settings with Docker rules. The `Entrypoint` and `Cmd` of the image compose the command. The caller environment merges over the `Env` of the image. The `User` resolves against the guest `/etc/passwd` and `/etc/group`. The `ExposedPorts` feed `-P`. The sandbox sets the mode of the guest root to 0755, because the tmpfs upper layer has the mode 01777.
+
 ### 3.7 Secure Host File System Driver: `pkg/sentry/fsimpl/hostfs`
 
-`fsimpl/hostfs` replaces `pkg/sentry/fsimpl/gofer` (`lisafs`) to mount the host `/workspace` directory on Windows and macOS without spawning an external file-server process. It also runs on Linux, where it uses `os.Root` and `openat` in the same way.
+`fsimpl/hostfs` replaces `pkg/sentry/fsimpl/gofer` (`lisafs`) to mount the host `/workspace` directory on Windows and macOS without spawning an external file-server process. It also runs on Linux, where it uses `os.Root` and `openat` in the same way. A run can mount many host directories. The mount at `/workspace` is one of them, and the `-v` bind mounts and the named volumes are the others. Each directory has its own `os.Root` handle and its own `.gvx_meta` writer.
 
 #### Handle-Scoped Traversal and POSIX Adaptation (Descriptive Module)
 
@@ -475,7 +511,13 @@ Execute these steps in `pkg/oci` before calling `hostlockdown.Apply()`:
 
 On Windows, `hostfs` sets `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` on every open. It implements `rename(2)` on open files via `NtSetInformationFile(FileRenameInformationEx)` with `FILE_RENAME_POSIX_SEMANTICS`, and `unlink(2)` via `FileDispositionInfoEx`. NTFS refuses to rename a directory that has an open descendant, and the guest then sees `EACCES`. On macOS, `hostfs` uses native `renameat` and `unlinkat` scoped to directory file descriptors. On both platforms, an in-memory xattr table stores virtual POSIX mode bits (`0755`), `uid/gid`, and intra-workspace symlinks. It persists this table atomically to `.gvx_meta`.
 
+`hostfs` opens a child through a pinned handle of its parent directory, with `NtCreateFile` and `RootDirectory` on Windows and `openat` on Unix. A lookup of one name then makes one host call, and a path of depth `D` no longer walks from the root at each level. A `Workspace` owns the pinned handles, caps them at 256, and closes idle handles after 5 seconds. It closes the handles in a subtree before a directory rename or a directory removal. Windows refuses to rename or remove a directory with an open handle.
+
+A lookup result stays valid for 1 second without a host call. A positive result and a missing name follow that rule. A guest mutation of the entry, of a hard link to it, or of its parent drops the result at once. A change by a host process shows up after 1 second at the latest. The Windows host reports the case of a name through `finalPathLeaf`, so `hostfs` skips the second case check there.
+
 A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware backends and the macOS `systrap` engine map a guest page by host pointer, so `hostfs` keeps each chunk on the Go heap. The upstream Linux `systrap` platform runs guest code in stub processes and maps a guest page by the descriptor of a memory file. On Linux, `pkg/gvx` therefore passes the kernel memory file to `Workspace.SetChunkMemory`, and `hostfs` allocates each chunk there. `hostfs` invalidates the mappings of a truncated file before it drops its reference to a chunk.
+
+A `pread` writes back only the dirty chunks that overlap its byte range. It reads from the host file straight into the destination blocks of the caller, with one allocation for each call. A file with no guest mapping skips the write-back without a lock.
 
 ### 3.8 Host Self-Lockdown and Security Model: `pkg/hostlockdown`
 
@@ -485,7 +527,7 @@ A guest `mmap` of a workspace file reads the file in 64KiB chunks. The hardware 
 | :--- | :--- | :--- |
 | **Ring 1: Execution Boundary** | `platform/whpx`, `platform/hvf`, `platform/systrap` | Isolates guest execution inside hardware 4KB EPT/Stage-1 tables or an untrusted `systrap` stub process (`CR3`/`TTBR0_EL1`) with zero direct host syscall access. |
 | **Ring 2: Application Kernel** | `pkg/sentry/kernel`, `fsimpl/hostfs`, `pkg/netbackend` | Services ~250 Linux syscalls in memory-safe Go and scopes all `/workspace` opens to the `os.Root` handle. |
-| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. |
+| **Ring 3: Host OS Containment** | `pkg/hostlockdown` (Windows NT, macOS XNU, and Linux seccomp) | Locks down the host process before guest entry so even a hypothetical Sentry compromise cannot spawn child processes or read/write unbound host files. The host directories of the mounts are the only bound files. |
 
 ```mermaid
 stateDiagram-v2
@@ -617,10 +659,12 @@ GitHub Actions runs the verification that the local host cannot run. The workflo
 | `ci.yml` test linux | `ubuntu-24.04`, `ubuntu-24.04-arm` | `go test -race` of the owned packages. Without cgo: `pkg/hostlockdown`, `pkg/gvx`, and the whole `e2e` suite with the seccomp lockdown on. Guest runs on the upstream `systrap` platform with and without the lockdown. |
 | `ci.yml` test darwin/arm64 | `macos-15` | The owned packages through `scripts/codesign-exec.sh`, then the `systrap` engine, the SDK, and the CLI with `-tags pagesize_16k`. |
 | `ci.yml` test windows/amd64 | `windows-latest` | The owned packages, a report of the hypervisor state, and an attempt to boot a guest on `whpx`. |
-| `e2e-images.yml` | `macos-15`, `ubuntu-24.04`, `ubuntu-24.04-arm` | The registry gates on the `systrap` engine, once a week. The Linux jobs run every gate with the seccomp lockdown. |
+| `e2e-images.yml` | `macos-15`, `ubuntu-24.04`, `ubuntu-24.04-arm`, `windows-latest`, `windows-11-arm` | The registry gates on the `systrap` engine, once a week. The Linux jobs run every gate with the seccomp lockdown. The Windows jobs run every gate on the Windows engine, and skip the host lockdown tests. |
 | `diagnose.yml` | A chosen runner | A chosen test selection or script, started by hand. |
 
 A hosted runner is a virtual machine. The macOS runner cannot create a nested VM, so it skips the `hvf` tests when `GVX_ALLOW_NO_HYPERVISOR=1`. The tests that pull images skip when `GVX_E2E_OFFLINE=1`. Windows runners expose the Windows Hypervisor Platform, so CI runs the real `whpx` tests.
+
+The gate `TestE2EGateETExec` decides whether a backend runs an executable that links at a fixed address. It runs four programs: a static Go program, a static C program, `herdr api schema`, and the `herdr` server with one request. Each program must print the same output on every backend. The macOS `systrap` engine refuses these images by default, so its rows skip. The extra backend `systrap-zone` turns on the prototype zone mode and runs all four programs. The Go and `herdr` rows need `go` and a download of the `herdr` release file. The C row and the server row pull `alpine:3.20`.
 
 | Platform | Verified By |
 | :--- | :--- |
@@ -632,7 +676,7 @@ A hosted runner is a virtual machine. The macOS runner cannot create a nested VM
 
 ### 4.3 Containerd Shim Verification (Reference Module)
 
-This evidence covers only the optional control adapter. It does not change guest-runtime verification above.
+This evidence predates the upstream merge and covers only the optional control adapter. It does not verify the merged tree or change guest-runtime verification above.
 
 | Boundary | Executed result | Evidence limit |
 | :--- | :--- | :--- |

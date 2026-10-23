@@ -210,19 +210,23 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	} else {
 		cflags |= flagFullRestore
 	}
+	st := &v.st
 	gen := as.gen.Load()
-	if !v.st.valid || v.st.asID != as.id || v.st.asGen != gen {
+	reloadRoot := rootStale(st, as, gen)
+	if reloadRoot {
 		cflags |= flagReloadRoot
 	}
 	atomic.StoreUint32(&comm.Flags, cflags)
 	atomic.StoreUint32(&comm.ExitReason, uint32(ExitNone))
 
-	st := &v.st
 	full := !st.valid || !st.parked || c.parkDirty ||
 		st.fsBase != r.Fs_base || st.gsBase != r.Gs_base ||
 		st.ds != uint16(r.Ds) || st.es != uint16(r.Es) || st.fs != uint16(r.Fs) || st.gs != uint16(r.Gs)
 	b := v.regs
 	b.reset()
+	if reloadRoot {
+		b.add64(x64RegCr3, as.rootValue())
+	}
 	if full {
 		v.addParkRegs(b)
 		b.addSegment(x64RegDs, dsSeg)
@@ -245,6 +249,11 @@ func (c *Context) prepareRun(v *vcpu, as *AddressSpace, ac *arch.Context64) (run
 	}
 	st.valid = true
 	st.parked = true
+	// Committing the address space before the run is safe. The batch above
+	// wrote CR3 on the host, so the first fetch of the reload path walks the
+	// new tables. A path that leaves without a run calls st.invalidate: the
+	// kick check in Context.run and a cancel inside the reload path in
+	// onCancel. The next entry then writes CR3 again.
 	st.asID, st.asGen = as.id, gen
 	return runResult{}, false
 }
@@ -331,7 +340,9 @@ func (v *vcpu) stubRanges() (entry, exc, reload addrRange) {
 // onCancel decides what to do after a cancelled run. A processor in user
 // mode saves its registers and returns to the Sentry. A processor in the entry
 // path continues so that it completes the spill. A processor in the reload
-// path returns to the Sentry too, because the reload restarts from its start.
+// path returns to the Sentry too. The cancel can stop the reload before its
+// MOV to CR3, so the function forgets the whole processor state and the next
+// entry writes CR3 again.
 func (c *Context) onCancel(v *vcpu, ex exitInfo, ac *arch.Context64) (cancelAction, error) {
 	if ex.cpl == 3 {
 		if err := c.saveUserRegs(v, ac); err != nil {
@@ -345,7 +356,7 @@ func (c *Context) onCancel(v *vcpu, ex exitInfo, ac *arch.Context64) (cancelActi
 	case entry.contains(ex.pc) || exc.contains(ex.pc):
 		return cancelContinue, nil
 	case reload.contains(ex.pc):
-		v.st.parked = false
+		v.st.invalidate()
 		return cancelInterrupt, nil
 	}
 	return cancelInterrupt, fmt.Errorf("whpx: virtual processor %d was cancelled at unknown kernel address %#x", v.index, ex.pc)

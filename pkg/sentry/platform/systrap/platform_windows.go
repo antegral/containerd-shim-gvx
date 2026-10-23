@@ -20,8 +20,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"sync"
+
+	"golang.org/x/sys/unix"
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
@@ -39,6 +42,8 @@ type Platform struct {
 
 	host *stubHost
 	dbg  *debugger
+	// pool holds ready stubs. It is nil in a platform that did not start it.
+	pool *stubPool
 
 	sections sectionCache
 	priv     privPool
@@ -52,6 +57,20 @@ type Platform struct {
 
 	// userMin and userMax bound the guest address range.
 	userMin, userMax uint64
+
+	// lowWindow tells whether every stub also reserves the low guest window.
+	// New decides it once, because the guest range of the platform must not
+	// change while guests run.
+	lowWindow bool
+
+	// fast tells whether the platform runs system calls through the fast path.
+	// New decides it once, before the first address space.
+	fast bool
+	// spill is the spill routine of the fast path, and ntSetEvent and ntWait
+	// are the addresses of the ntdll functions that it calls.
+	spill      winSpillCode
+	ntSetEvent uint64
+	ntWait     uint64
 
 	closeOnce sync.Once
 	closeErr  error
@@ -76,19 +95,81 @@ func New() (*Platform, error) {
 		dbg.close()
 		return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the stub host did not start: %v", err)}
 	}
-	return &Platform{
+	p := &Platform{
 		host:      host,
 		dbg:       dbg,
 		breakAddr: breakAddr,
 		userMin:   winBase,
 		userMax:   internalBase,
-	}, nil
+	}
+	if fastPathRequested {
+		if err := p.prepareFast(); err != nil {
+			dbg.close()
+			_ = host.close()
+			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path is unavailable: %v", err)}
+		}
+	}
+	first := p.selectLowWindow()
+	p.startPool()
+	if first != nil {
+		select {
+		case p.pool.ready <- first:
+		default:
+			first.destroy()
+		}
+	}
+	if p.fast {
+		// GVX_SYSTRAP_FASTPATH=1 asks for the fast path, so a host that cannot
+		// run it is an error. The run proves the facts that the Windows
+		// documents do not state.
+		if err := p.selfTestFast(); err != nil {
+			_ = p.Close()
+			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path failed its self test: %v", err)}
+		}
+	}
+	return p, nil
+}
+
+// selectLowWindow decides whether the stubs of the platform reserve the low
+// guest window. It brings up one stub with both windows. If that works, the
+// platform keeps the low window, and the stub goes to the pool. If it fails,
+// the host places something in the low range. The platform then keeps only the
+// high window, and the first guest reports the cause of a failure that is not
+// about the window.
+func (p *Platform) selectLowWindow() *stubProc {
+	p.lowWindow, p.userMin = true, lowBase
+	sp, err := p.newStubProcFresh()
+	if err == nil {
+		return sp
+	}
+	if traceEvents {
+		tracef("systrap: no low guest window: %v", err)
+	}
+	p.lowWindow, p.userMin = false, winBase
+	return nil
+}
+
+// UserAddressHole implements platform.AddressHolePlatform.UserAddressHole. The
+// range between the low window and the high window belongs to the stub
+// process.
+func (p *Platform) UserAddressHole() hostarch.AddrRange {
+	if !p.lowWindow {
+		return hostarch.AddrRange{}
+	}
+	return hostarch.AddrRange{Start: hostarch.Addr(lowLimit), End: hostarch.Addr(winBase)}
 }
 
 // Close terminates every stub process and frees the Sentry-side memory. It is
 // idempotent. No AddressSpace of this Platform may be used afterwards.
 func (p *Platform) Close() error {
 	p.closeOnce.Do(func() {
+		if traceWatch {
+			fmt.Fprintf(os.Stderr, "systrap: closing, %s\n", statsLine())
+			if traceSample {
+				printSamples()
+			}
+		}
+		p.stopPool()
 		p.dbg.close()
 		p.closeErr = p.host.close()
 		p.priv.close()
@@ -117,7 +198,9 @@ func (p *Platform) MaxUserAddress() hostarch.Addr { return hostarch.Addr(p.userM
 func (p *Platform) NewAddressSpace(platform.AddressSpaceOptions) (platform.AddressSpace, error) {
 	as, err := newAddressSpace(p)
 	if err != nil {
-		return nil, err
+		// The Sentry maps an unknown error of a system call to a panic. A
+		// failed fork or exec reports ENOMEM.
+		return nil, &platform.ContextError{Err: err, Errno: unix.ENOMEM}
 	}
 	return as, nil
 }

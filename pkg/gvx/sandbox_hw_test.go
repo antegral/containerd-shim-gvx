@@ -19,6 +19,8 @@ package gvx
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -32,6 +34,7 @@ import (
 	"z.gfire.dev/gvx/internal/systraptest"
 	"z.gfire.dev/gvx/internal/testelf"
 	"z.gfire.dev/gvx/internal/testimage"
+	"z.gfire.dev/gvx/pkg/hostarch"
 )
 
 // hostTestConfig returns a Config for in-process tests. The default host
@@ -375,11 +378,13 @@ func staticBase() uint64 {
 	return systrapBase()
 }
 
-// systrapBase returns a link address that the systrap platform of the host
+// systrapBase returns a link address that every systrap engine of the host
 // allows. The macOS engine places guest addresses above the host reservations,
 // which end at 0x7000000000 on Apple silicon, so it needs an address at 16TB.
-// The Windows engine reserves the range from 16TB up, for the same reason. The
-// upstream Linux platform accepts the classic 0x400000.
+// The Windows engine holds 16TB and up in its high window, and the classic
+// addresses in its low window. The test of the low window is
+// TestSandboxStartsStaticExecutablesAtLowAddresses. The upstream Linux
+// platform accepts the classic 0x400000.
 func systrapBase() uint64 {
 	if runtime.GOOS == "linux" {
 		return 0x400000
@@ -429,5 +434,132 @@ func TestSandboxRunsStaticAndDynamicELF64UnderSystrap(t *testing.T) {
 				t.Fatalf("Run() = (%d, %v) stdout %q, want (%d, nil) %q", code, err, outBuf.String(), tc.wantCode, tc.wantOut)
 			}
 		})
+	}
+}
+
+// TestSandboxStartsStaticExecutablesAtLowAddresses starts static executables
+// that link at the addresses that real linkers use: 0x10000 for Go on arm64 and
+// 0x400000 for most others. The Windows engine holds them in its low window.
+// The macOS engine cannot hold them, because every arm64 task has a 4GB
+// PAGEZERO. It must refuse and name the cause and the engine that works.
+func TestSandboxStartsStaticExecutablesAtLowAddresses(t *testing.T) {
+	systraptest.Require(t)
+	for _, base := range []uint64{0x10000, 0x400000} {
+		t.Run("base-0x"+strconv.FormatUint(base, 16), func(t *testing.T) {
+			elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, base, 0, "low-window-ok\n")
+			if err != nil {
+				t.Fatalf("BuildGuestELF64At failed: %v", err)
+			}
+			cfg := hostTestConfig(t)
+			cfg.Platform = PlatformSystrap
+			cfg.ELFBytes = elf
+			var outBuf bytes.Buffer
+			cfg.Stdout = &outBuf
+			sb, err := New(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("New(systrap) failed: %v", err)
+			}
+			defer func() {
+				if err := sb.Close(); err != nil {
+					t.Errorf("Close() failed: %v", err)
+				}
+			}()
+			code, err := sb.Run(context.Background())
+			if runtime.GOOS == "windows" {
+				if err != nil || code != 0 || outBuf.String() != "low-window-ok\n" {
+					t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), "low-window-ok\n")
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("Run() = (%d, nil), want an error: this engine cannot hold an executable at %#x", code, base)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "position-independent") || !strings.Contains(msg, "-platform=hvf") {
+				t.Errorf("error %q does not name the cause and the engine that works", msg)
+			}
+		})
+	}
+}
+
+// TestSandboxRefusesAnExecutableThatThePageSizeCannotMap starts an executable
+// with a segment that is not congruent modulo the guest page size. The 4KB
+// build runs such a file, so the test needs a build with larger guest pages.
+// The run must fail before the guest starts, and the error must name the
+// segment.
+func TestSandboxRefusesAnExecutableThatThePageSizeCannotMap(t *testing.T) {
+	if hostarch.PageSize <= basePageSize {
+		t.Skip("the layout check runs only with guest pages above 4KB")
+	}
+	systraptest.Require(t)
+	elf, err := testelf.BuildGuestELF64At(runtime.GOARCH, systrapBase(), 0, "must-not-run\n")
+	if err != nil {
+		t.Fatalf("BuildGuestELF64At failed: %v", err)
+	}
+	// The first program header starts right behind the 64-byte ELF header.
+	const vaddrField = elfHeaderSize + 16
+	binary.LittleEndian.PutUint64(elf[vaddrField:], binary.LittleEndian.Uint64(elf[vaddrField:])+basePageSize)
+	if elfLayoutProblem(elf, hostarch.PageSize) == "" {
+		t.Fatal("the test file has no layout problem; fix the file")
+	}
+	cfg := hostTestConfig(t)
+	cfg.Platform = PlatformSystrap
+	cfg.ELFBytes = elf
+	var outBuf bytes.Buffer
+	cfg.Stdout = &outBuf
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New(systrap) failed: %v", err)
+	}
+	defer func() {
+		if err := sb.Close(); err != nil {
+			t.Errorf("Close() failed: %v", err)
+		}
+	}()
+	_, err = sb.Run(context.Background())
+	if !errors.Is(err, ErrUnsupportedELFLayout) || !strings.Contains(err.Error(), "program header 0") {
+		t.Errorf("Run() error = %v, want ErrUnsupportedELFLayout that names program header 0", err)
+	}
+	if outBuf.Len() != 0 {
+		t.Errorf("stdout = %q, want no output because the guest must not start", outBuf.String())
+	}
+}
+
+// TestSharedPageGuestELF64 runs a guest with code and data in one 16KB host
+// page. A build with 4KB guest pages maps each 4KB page with its own
+// permissions, so every engine runs the guest. A build with 16KB guest pages
+// maps the shared page writable and executable. The systrap engine then runs
+// the stores of the guest from that page through the Sentry.
+func TestSharedPageGuestELF64(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("the guest is arm64 code")
+	}
+	cfg := hostTestConfig(t)
+	var outBuf bytes.Buffer
+	cfg.Stdout = &outBuf
+	if hostarch.PageSize > basePageSize {
+		systraptest.Require(t)
+		cfg.Platform = PlatformSystrap
+	}
+	base := staticBase()
+	if hostarch.PageSize > basePageSize {
+		base = systrapBase()
+	}
+	elf, err := testelf.BuildSharedPageGuestELF64(base)
+	if err != nil {
+		t.Fatalf("BuildSharedPageGuestELF64 failed: %v", err)
+	}
+	cfg.ELFBytes = elf
+	sb, err := New(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer func() {
+		if err := sb.Close(); err != nil {
+			t.Errorf("Close() failed: %v", err)
+		}
+	}()
+	code, err := sb.Run(context.Background())
+	if err != nil || code != 0 || outBuf.String() != testelf.SharedPageOK {
+		t.Fatalf("Run() = (%d, %v) stdout %q, want (0, nil) %q", code, err, outBuf.String(), testelf.SharedPageOK)
 	}
 }

@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"testing"
+	"time"
 
 	"z.gfire.dev/gvx/pkg/hostarch"
 )
@@ -45,4 +46,62 @@ func TestFSBaseIsRepairedAfterPreemption(t *testing.T) {
 		t.Errorf("sum = %d, want %d", got, want)
 	}
 	t.Logf("the engine repaired the FS base %d times", r.as.sp.fsRepairs.Load())
+}
+
+// TestInstructionCrossesBlockBoundary runs an instruction whose first bytes
+// end one block and whose last bytes start the next block. The first block is
+// executable when the fetch of the next block faults, so pc stays in a block
+// that needs no patch. The engine must patch the block that the fault names.
+// A guest that runs a pipeline of a shell hit this fault in a call
+// instruction.
+func TestInstructionCrossesBlockBoundary(t *testing.T) {
+	r := newRig(t, newPlatform(t))
+	movabs := imm64([]byte{0x48, 0xB8}, 93) // mov rax, 93: ten bytes.
+	const inFirst = 4
+	first := make([]byte, blockSize)
+	for i := range first {
+		first[i] = 0x90 // nop
+	}
+	copy(first[blockSize-inFirst:], movabs[:inFirst])
+	second := append(append([]byte(nil), movabs[inFirst:]...), 0x0F, 0x05)
+	r.mapPage(codeVA, execAccess, first)
+	r.mapPage(codeVA+blockSize, execAccess, second)
+	r.mapPage(stackVA, hostarch.ReadWrite)
+	r.ac.SetIP(codeVA)
+	r.ac.SetStack(stackVA + blockSize - 0x100)
+
+	// A livelock of faults would block Switch for good, so a timer stops it.
+	stop := time.AfterFunc(30*time.Second, r.ctx.Interrupt)
+	defer stop.Stop()
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 93, r.ac)
+}
+
+// TestNearZeroBase checks which faults look like an access through a lost FS
+// base. A positive offset from a zero base lies below the lowest guest
+// address. A real guest address never counts, so a static executable at
+// 0x400000 can use its own TLS block when the low window exists.
+func TestNearZeroBase(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		guestMin uint64
+		addr     uint64
+		want     bool
+	}{
+		{"high window only, zero base", winBase, 0, true},
+		{"high window only, small offset", winBase, 0x28, true},
+		{"high window only, offset of a large TLS block", winBase, 0x100000, true},
+		{"high window only, a guest address", winBase, winBase, false},
+		{"low window, small offset", lowBase, 0x28, true},
+		{"low window, last address below the guest range", lowBase, lowBase - 1, true},
+		{"low window, lowest guest address", lowBase, lowBase, false},
+		{"low window, address in a static executable", lowBase, 0x400000, false},
+		{"low window, small negative offset", lowBase, ^uint64(0) - 7, true},
+		{"high window only, small negative offset", winBase, ^uint64(0) - 0xfff, true},
+		{"low window, a high guest address", lowBase, 0x7e4a080dfb28, false},
+	} {
+		if got := nearZeroBase(tc.addr, tc.guestMin); got != tc.want {
+			t.Errorf("%s: nearZeroBase(%#x, %#x) = %v, want %v", tc.name, tc.addr, tc.guestMin, got, tc.want)
+		}
+	}
 }

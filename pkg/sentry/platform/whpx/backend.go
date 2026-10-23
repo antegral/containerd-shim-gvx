@@ -49,10 +49,12 @@ type backend interface {
 	freeHost(mem []byte) error
 
 	// mapGPA maps size bytes of host memory at host into the guest physical
-	// space at gpa. A mapping over an existing mapping replaces it.
+	// space at gpa. The range must not overlap an existing mapping. No caller
+	// replaces a mapping.
 	mapGPA(host unsafe.Pointer, gpa, size uint64, flags uint32) error
 
-	// unmapGPA removes the mapping at gpa.
+	// unmapGPA removes the mapping that a call of mapGPA made at gpa. The
+	// size must equal the size of that call.
 	unmapGPA(gpa, size uint64) error
 
 	createVP(index uint32) error

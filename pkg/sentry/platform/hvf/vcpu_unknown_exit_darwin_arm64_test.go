@@ -28,7 +28,7 @@ import (
 // run of unknown exits passes the bound, and then it reports an error.
 func TestUnknownExitResumesUntilTheBound(t *testing.T) {
 	w := &vcpuWorker{exit: &hvVCPUExit{reason: hvExitReasonUnknown}}
-	c, pt, ac := &Context{}, &GuestPageTable{}, arch.New(arch.Host)
+	c, pt, ac := &Context{}, &stage1Tables{}, arch.New(arch.Host)
 
 	for i := 1; i <= maxUnknownExits; i++ {
 		done, _, _, err := w.dispatchExit(c, pt, ac)
@@ -46,7 +46,7 @@ func TestUnknownExitResumesUntilTheBound(t *testing.T) {
 // of consecutive unknown exits, so scattered ones never add up to an error.
 func TestUnknownExitCounterResetsOnOtherExits(t *testing.T) {
 	w := &vcpuWorker{exit: &hvVCPUExit{}}
-	c, pt, ac := &Context{}, &GuestPageTable{}, arch.New(arch.Host)
+	c, pt, ac := &Context{}, &stage1Tables{}, arch.New(arch.Host)
 
 	for round := 0; round < 3; round++ {
 		w.exit.reason = hvExitReasonUnknown

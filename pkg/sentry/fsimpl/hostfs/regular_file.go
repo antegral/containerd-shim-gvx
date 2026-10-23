@@ -85,6 +85,22 @@ type regularFD struct {
 	off int64
 }
 
+// openHost opens the host file of d. It passes the entry that the lookup
+// cached and the pinned handle of the directory, so it makes one host call
+// and no second lookup. When the host no longer holds that regular file, it
+// forgets the cached entry and resolves the path again, which gives the exact
+// error.
+func (d *dentry) openHost(flags int) (*os.File, error) {
+	rel := d.path()
+	f, err := d.fs.ws.openRegularWithAttr(rel, d.inode.snapshot(), flags)
+	if err == nil {
+		return f, nil
+	}
+	d.inode.invalidateMeta()
+	f, _, err = d.fs.ws.openRegular(rel, flags)
+	return f, err
+}
+
 func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *os.File) (*vfs.FileDescription, error) {
 	f := created
 	writable := vfs.MayWriteFileWithOpenFlags(opts.Flags)
@@ -97,7 +113,7 @@ func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *v
 			hostFlags = os.O_RDWR
 		}
 		var err error
-		f, _, err = d.fs.ws.openRegular(d.path(), hostFlags)
+		f, err = d.openHost(hostFlags)
 		if err != nil {
 			return nil, translateHostError(err)
 		}
@@ -195,8 +211,8 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	if err := fd.dentry.inode.data.flushRange(uint64(offset), end); err != nil {
 		return 0, translateHostError(err)
 	}
-	r := io.NewSectionReader(fd.h.f, offset, math.MaxInt64-offset)
-	read, err := dst.CopyOutFrom(ctx, safemem.FromIOReader{Reader: r})
+	r := hostFileReader{f: fd.h.f, off: offset}
+	read, err := dst.CopyOutFrom(ctx, &r)
 	switch {
 	case err == nil:
 		return read, nil
@@ -208,6 +224,48 @@ func (fd *regularFD) PRead(ctx context.Context, dst usermem.IOSequence, offset i
 	default:
 		return read, translateHostError(err)
 	}
+}
+
+// hostFileReader reads a host file at an offset straight into the blocks of a
+// destination. It replaces io.NewSectionReader and safemem.FromIOReader, which
+// together allocate two objects for each read.
+type hostFileReader struct {
+	f   *os.File
+	off int64
+}
+
+// ReadToBlocks implements safemem.Reader.ReadToBlocks. A short read returns
+// the error of ReadAt, which is io.EOF at the end of the file.
+func (r *hostFileReader) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) {
+	var done uint64
+	var scratch []byte
+	for ; !dsts.IsEmpty(); dsts = dsts.Tail() {
+		dst := dsts.Head()
+		var n int
+		var err error
+		if !dst.NeedSafecopy() {
+			n, err = r.f.ReadAt(dst.ToSlice(), r.off)
+		} else {
+			// ReadAt cannot write to memory that faults, so it reads into a
+			// scratch buffer first.
+			if len(scratch) < dst.Len() {
+				scratch = make([]byte, dst.Len())
+			}
+			var rn int
+			rn, err = r.f.ReadAt(scratch[:dst.Len()], r.off)
+			var werr error
+			n, werr = safemem.Copy(dst, safemem.BlockFromSafeSlice(scratch[:rn]))
+			if werr != nil {
+				err = werr
+			}
+		}
+		r.off += int64(n)
+		done += uint64(n)
+		if n != dst.Len() {
+			return done, err
+		}
+	}
+	return done, nil
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -235,6 +293,7 @@ type handleWriter struct {
 func (w *handleWriter) Write(p []byte) (int, error) {
 	n, err := w.fd.h.f.WriteAt(p, w.off)
 	if n > 0 {
+		w.fd.dentry.inode.invalidateMeta()
 		w.fd.dentry.inode.data.writeThrough(w.off, p[:n])
 		w.off += int64(n)
 	}
@@ -385,7 +444,7 @@ func (i *inode) truncate(d *dentry, h *hostHandle, size int64) error {
 	if h != nil {
 		f = h.f
 	} else {
-		opened, _, err := i.fs.ws.openRegular(d.path(), os.O_WRONLY)
+		opened, err := d.openHost(os.O_WRONLY)
 		if err != nil {
 			return translateHostError(err)
 		}
@@ -399,6 +458,7 @@ func (i *inode) truncate(d *dentry, h *hostHandle, size int64) error {
 	if err := f.Truncate(size); err != nil {
 		return translateHostError(err)
 	}
+	i.invalidateMeta()
 	i.data.truncated(size)
 	return nil
 }
@@ -606,6 +666,7 @@ func (c *fileData) flushLocked(start, end uint64) error {
 			errs = append(errs, err)
 			continue
 		}
+		c.ino.invalidateMeta()
 		ch.dirty = c.writableMaps > 0
 	}
 	return errors.Join(errs...)

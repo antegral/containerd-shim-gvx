@@ -344,48 +344,73 @@ func (h *hostRoot) openDirHandle(op, rel string, access uint32) (windows.Handle,
 	return handle, nil
 }
 
+// openRequest is the translation of Go open flags into NtCreateFile
+// parameters.
+type openRequest struct {
+	access      uint32
+	fileAttrs   uint32
+	disposition uint32
+	write       bool
+	truncate    bool
+}
+
+// newOpenRequest validates flags and builds the NtCreateFile parameters. The
+// name rel only labels errors.
+func newOpenRequest(rel string, flags int, perm os.FileMode) (openRequest, error) {
+	const supported = os.O_RDONLY | os.O_WRONLY | os.O_RDWR | os.O_CREATE | os.O_EXCL | os.O_TRUNC
+	if flags&^supported != 0 {
+		return openRequest{}, fmt.Errorf("hostfs: open %q: flags %#x: %w", rel, flags, fs.ErrInvalid)
+	}
+	req := openRequest{access: windows.FILE_READ_ATTRIBUTES}
+	switch flags & (os.O_WRONLY | os.O_RDWR) {
+	case os.O_RDONLY:
+		req.access |= windows.FILE_GENERIC_READ
+	case os.O_WRONLY:
+		req.access |= windows.FILE_GENERIC_WRITE
+		req.write = true
+	case os.O_RDWR:
+		req.access |= windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE
+		req.write = true
+	default:
+		return openRequest{}, fmt.Errorf("hostfs: open %q: flags %#x: %w", rel, flags, fs.ErrInvalid)
+	}
+	// FILE_OVERWRITE_IF would replace a read-only file, so O_TRUNC runs as a
+	// truncation of the open handle, as the Go standard library does.
+	req.truncate = req.write && flags&os.O_TRUNC != 0
+	req.disposition = windows.FILE_OPEN
+	switch {
+	case flags&(os.O_CREATE|os.O_EXCL) == os.O_CREATE|os.O_EXCL:
+		req.disposition = windows.FILE_CREATE
+	case flags&os.O_CREATE != 0:
+		req.disposition = windows.FILE_OPEN_IF
+	}
+	req.fileAttrs = windows.FILE_ATTRIBUTE_NORMAL
+	if perm&0o200 == 0 {
+		req.fileAttrs = windows.FILE_ATTRIBUTE_READONLY
+	}
+	return req, nil
+}
+
 func (h *hostRoot) open(rel string, flags int, perm os.FileMode) (*os.File, error) {
 	if rel == "." {
 		return nil, &ntError{op: "open", path: rel, status: windows.STATUS_FILE_IS_A_DIRECTORY}
 	}
-	const supported = os.O_RDONLY | os.O_WRONLY | os.O_RDWR | os.O_CREATE | os.O_EXCL | os.O_TRUNC
-	if flags&^supported != 0 {
-		return nil, fmt.Errorf("hostfs: open %q: flags %#x: %w", rel, flags, fs.ErrInvalid)
+	req, err := newOpenRequest(rel, flags, perm)
+	if err != nil {
+		return nil, err
 	}
-	access := uint32(windows.FILE_READ_ATTRIBUTES)
-	write := false
-	switch flags & (os.O_WRONLY | os.O_RDWR) {
-	case os.O_RDONLY:
-		access |= windows.FILE_GENERIC_READ
-	case os.O_WRONLY:
-		access |= windows.FILE_GENERIC_WRITE
-		write = true
-	case os.O_RDWR:
-		access |= windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE
-		write = true
-	default:
-		return nil, fmt.Errorf("hostfs: open %q: flags %#x: %w", rel, flags, fs.ErrInvalid)
-	}
-	// FILE_OVERWRITE_IF would replace a read-only file, so O_TRUNC runs as a
-	// truncation of the open handle below, as the Go standard library does.
-	disposition := uint32(windows.FILE_OPEN)
-	switch {
-	case flags&(os.O_CREATE|os.O_EXCL) == os.O_CREATE|os.O_EXCL:
-		disposition = windows.FILE_CREATE
-	case flags&os.O_CREATE != 0:
-		disposition = windows.FILE_OPEN_IF
-	}
-	fileAttrs := uint32(windows.FILE_ATTRIBUTE_NORMAL)
-	if perm&0o200 == 0 {
-		fileAttrs = windows.FILE_ATTRIBUTE_READONLY
-	}
-
 	parent, err := h.walkParent("open", rel)
 	if err != nil {
 		return nil, err
 	}
 	defer parent.release()
-	handle, err := openAt(parent.handle, parent.name, access, fileAttrs, disposition, windows.FILE_NON_DIRECTORY_FILE)
+	return openIn(parent.handle, parent.name, rel, req)
+}
+
+// openIn opens the file name inside the directory handle dir and refuses a
+// reparse point. The path rel only labels errors.
+func openIn(dir windows.Handle, name, rel string, req openRequest) (*os.File, error) {
+	handle, err := openAt(dir, name, req.access, req.fileAttrs, req.disposition, windows.FILE_NON_DIRECTORY_FILE)
 	if err != nil {
 		return nil, hostError("open", rel, err)
 	}
@@ -393,7 +418,7 @@ func (h *hostRoot) open(rel string, flags int, perm os.FileMode) (*os.File, erro
 		closeHandle(handle)
 		return nil, hostError("open", rel, err)
 	}
-	if write && flags&os.O_TRUNC != 0 {
+	if req.truncate {
 		if err := syscall.Ftruncate(syscall.Handle(handle), 0); err != nil {
 			closeHandle(handle)
 			return nil, hostError("truncate", rel, err)
@@ -402,6 +427,74 @@ func (h *hostRoot) open(rel string, flags int, perm os.FileMode) (*os.File, erro
 	// The relative name cannot reopen the file by path: it resolves against
 	// the process directory, not the workspace.
 	return os.NewFile(uintptr(handle), rel), nil
+}
+
+// hostDirHandle is an open directory handle. openDirAt returns one, and its
+// caller closes it with closeDir.
+type hostDirHandle windows.Handle
+
+// caseVerified returns true because lstatAt and openDirAt compare the stored
+// name of the entry with the requested name through finalPathLeaf.
+func (h *hostRoot) caseVerified() bool {
+	return true
+}
+
+func (h *hostRoot) rootDir() hostDirHandle {
+	return hostDirHandle(h.handle)
+}
+
+// openDirAt opens the directory name inside dir with FILE_OPEN_REPARSE_POINT,
+// rejects a reparse point, and verifies the stored case of the name.
+func (h *hostRoot) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hostInfo, error) {
+	handle, err := descend(windows.Handle(dir), name)
+	if err != nil {
+		return 0, hostInfo{}, hostError("open directory", name, err)
+	}
+	stored, err := finalPathLeaf(handle)
+	if err != nil {
+		closeHandle(handle)
+		return 0, hostInfo{}, hostError("open directory", name, err)
+	}
+	if stored != name {
+		closeHandle(handle)
+		return 0, hostInfo{}, fmt.Errorf("hostfs: open directory %q: %w: %w", name, errNameMismatch, windows.ERROR_FILE_NOT_FOUND)
+	}
+	info, err := statHandle(handle)
+	if err != nil {
+		closeHandle(handle)
+		return 0, hostInfo{}, hostError("open directory", name, err)
+	}
+	return hostDirHandle(handle), info, nil
+}
+
+func (h *hostRoot) closeDir(dir hostDirHandle) error {
+	return windows.CloseHandle(windows.Handle(dir))
+}
+
+func (h *hostRoot) fstatDir(dir hostDirHandle) (hostInfo, error) {
+	info, err := statHandle(windows.Handle(dir))
+	if err != nil {
+		return hostInfo{}, hostError("fstat", "directory", err)
+	}
+	return info, nil
+}
+
+func (h *hostRoot) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
+	if err := validateWindowsName(name); err != nil {
+		return hostInfo{}, hostError("lstat", name, err)
+	}
+	return lstatIn(windows.Handle(dir), name, name)
+}
+
+func (h *hostRoot) openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error) {
+	req, err := newOpenRequest(name, flags, perm)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateWindowsName(name); err != nil {
+		return nil, hostError("open", name, err)
+	}
+	return openIn(windows.Handle(dir), name, name, req)
 }
 
 func (h *hostRoot) openDir(rel string) (*os.File, error) {
@@ -547,7 +640,15 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 		return hostInfo{}, err
 	}
 	defer parent.release()
-	handle, err := openAt(parent.handle, parent.name, windows.FILE_READ_ATTRIBUTES, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
+	return lstatIn(parent.handle, parent.name, rel)
+}
+
+// lstatIn reads the metadata of the entry name inside the directory handle
+// dir without following a reparse point. It fails with errNameMismatch when
+// the stored name differs from name in case or through a short alias. The
+// path rel only labels errors.
+func lstatIn(dir windows.Handle, name, rel string) (hostInfo, error) {
+	handle, err := openAt(dir, name, windows.FILE_READ_ATTRIBUTES, windows.FILE_ATTRIBUTE_NORMAL, windows.FILE_OPEN, 0)
 	if err != nil {
 		return hostInfo{}, hostError("lstat", rel, err)
 	}
@@ -556,7 +657,7 @@ func (h *hostRoot) lstat(rel string) (hostInfo, error) {
 	if err != nil {
 		return hostInfo{}, hostError("lstat", rel, err)
 	}
-	if stored != parent.name {
+	if stored != name {
 		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w: %w", rel, errNameMismatch, windows.ERROR_FILE_NOT_FOUND)
 	}
 	info, err := statHandle(handle)

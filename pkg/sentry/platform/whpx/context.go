@@ -66,6 +66,13 @@ const (
 	cancelInterrupt
 )
 
+// rootStale reports whether the processor may hold a translation root other
+// than the current one of as. prepareRun writes the root register of the
+// processor on the host when it returns true.
+func rootStale(st *vpState, as *AddressSpace, gen uint64) bool {
+	return !st.valid || st.asID != as.id || st.asGen != gen
+}
+
 // Context implements platform.Context for one application thread.
 type Context struct {
 	platform.NoCPUNumbers
@@ -197,6 +204,10 @@ func (c *Context) run(v *vcpu, as *AddressSpace, ac *arch.Context64) runResult {
 		return r
 	}
 	if c.kicked.Swap(false) {
+		// The run did not happen, so the processor never executed the
+		// reload path that prepareRun set up. Forget the state, so that the
+		// next entry writes the root register again.
+		v.st.invalidate()
 		return runResult{err: platform.ErrContextInterrupt}
 	}
 	for {

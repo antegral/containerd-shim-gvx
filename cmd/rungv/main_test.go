@@ -49,8 +49,8 @@ func TestParseRunArgsDefaults(t *testing.T) {
 	if cfg.NetworkMode != gvx.NetModeNAT {
 		t.Errorf("NetworkMode = %q, want nat", cfg.NetworkMode)
 	}
-	if cfg.OCIImage != "alpine:3.20" || strings.Join(cfg.Argv, " ") != "echo hi" {
-		t.Errorf("image/argv = %q %q", cfg.OCIImage, cfg.Argv)
+	if cfg.OCIImage != "alpine:3.20" || strings.Join(cfg.Cmd, " ") != "echo hi" || len(cfg.Argv) != 0 {
+		t.Errorf("image/cmd/argv = %q %q %q, want the arguments of an image as Cmd and no Argv", cfg.OCIImage, cfg.Cmd, cfg.Argv)
 	}
 }
 
@@ -69,6 +69,26 @@ func TestParseRunArgsLockdownOptOut(t *testing.T) {
 		}
 		if rc.cfg.DisableHostLockdown != tc.wantDisable {
 			t.Errorf("%s: DisableHostLockdown = %v, want %v", tc.flag, rc.cfg.DisableHostLockdown, tc.wantDisable)
+		}
+	}
+}
+
+func TestParseRunArgsELFCheckOptOut(t *testing.T) {
+	for _, tc := range []struct {
+		flags       []string
+		wantDisable bool
+	}{
+		{nil, false},
+		{[]string{"-elf-check=false"}, true},
+		{[]string{"-elf-check=true"}, false},
+		{[]string{"-elf-check"}, false},
+	} {
+		rc, _, done, stderr := parse(t, append(tc.flags, "-image=x")...)
+		if done {
+			t.Fatalf("%v ended the command: %s", tc.flags, stderr)
+		}
+		if rc.cfg.DisableELFLayoutCheck != tc.wantDisable {
+			t.Errorf("%v: DisableELFLayoutCheck = %v, want %v", tc.flags, rc.cfg.DisableELFLayoutCheck, tc.wantDisable)
 		}
 	}
 }
@@ -114,9 +134,9 @@ func TestParseRunArgsUsageErrors(t *testing.T) {
 		wantStderr string
 	}{
 		{"no target", nil, 2, "specify"},
-		{"bad port", []string{"-p", "nope", "-image=x"}, 2, "port forward"},
+		{"bad port", []string{"-p", "nope", "-image=x"}, 2, "nope"},
 		{"unknown flag", []string{"-bogus"}, 2, "bogus"},
-		{"help", []string{"-h"}, 0, "Usage"},
+		{"help", []string{"--help"}, 0, "Usage"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, code, done, stderr := parse(t, tc.args...)

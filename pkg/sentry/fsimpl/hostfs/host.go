@@ -16,35 +16,66 @@ package hostfs
 
 import (
 	"errors"
+	"os"
 	"time"
 )
 
 // This file defines the contract between the platform-neutral hostfs code and
 // the per-platform host access layer. Each platform file set defines a
-// hostRoot type with the methods below:
+// hostRoot type with the methods of hostBackend, and these package functions:
 //
 //	func newHostRoot(root *os.Root) (*hostRoot, error)
-//	func (h *hostRoot) close() error
-//	func (h *hostRoot) open(rel string, flags int, perm os.FileMode) (*os.File, error)
-//	func (h *hostRoot) openDir(rel string) (*os.File, error)
-//	func (h *hostRoot) lstat(rel string) (hostInfo, error)
-//	func (h *hostRoot) fstat(f *os.File) (hostInfo, error)
-//	func (h *hostRoot) mkdir(rel string) error
-//	func (h *hostRoot) unlink(rel string) error
-//	func (h *hostRoot) rmdir(rel string) error
-//	func (h *hostRoot) rename(oldRel, newRel string) error
-//	func (h *hostRoot) link(oldRel, newRel string) error
-//	func (h *hostRoot) readlink(rel string) (string, error)
-//	func (h *hostRoot) readDir(rel string) ([]hostDirEntry, error)
-//	func (h *hostRoot) syncDir(rel string) error
-//	func (h *hostRoot) chtimes(rel string, atime, mtime *time.Time) error
-//	func (h *hostRoot) caseInsensitive() bool
 //	func hostErrno(err error) (error, bool)
 //
-// Every method takes a cleaned, slash-separated, workspace-relative path with
-// no "." or ".." components ("." names the workspace root itself). No method
-// may reach a file by absolute path or follow a symbolic link, junction, or
-// mount point at any component.
+// Every path method takes a cleaned, slash-separated, workspace-relative path
+// with no "." or ".." components ("." names the workspace root itself). No
+// method may reach a file by absolute path or follow a symbolic link,
+// junction, or mount point at any component.
+//
+// The pinned-directory methods take an open directory handle (hostDirHandle,
+// declared by each platform file set) and one name without a separator. They
+// resolve the name inside that directory only, so a lookup costs one host call
+// at any depth. The caller of openDirAt owns the handle that it returns and
+// releases it with closeDir. The handle of rootDir belongs to the backend.
+
+// hostBackend is the host access layer that Workspace uses. hostRoot
+// implements it. Tests wrap it to count host calls.
+type hostBackend interface {
+	close() error
+	open(rel string, flags int, perm os.FileMode) (*os.File, error)
+	openDir(rel string) (*os.File, error)
+	lstat(rel string) (hostInfo, error)
+	fstat(f *os.File) (hostInfo, error)
+	mkdir(rel string) error
+	unlink(rel string) error
+	rmdir(rel string) error
+	rename(oldRel, newRel string) error
+	link(oldRel, newRel string) error
+	readlink(rel string) (string, error)
+	readDir(rel string) ([]hostDirEntry, error)
+	syncDir(rel string) error
+	chtimes(rel string, atime, mtime *time.Time) error
+
+	// caseInsensitive reports whether the volume folds name case.
+	caseInsensitive() bool
+	// caseVerified reports that lstat and openDirAt already compare the
+	// stored name with the requested name, so callers need no second check.
+	caseVerified() bool
+
+	// rootDir returns the pinned workspace directory.
+	rootDir() hostDirHandle
+	// openDirAt opens the directory name inside dir. It returns
+	// ErrPathTraversal when name is a link and never follows it.
+	openDirAt(dir hostDirHandle, name string) (hostDirHandle, hostInfo, error)
+	// closeDir releases a handle that openDirAt returned.
+	closeDir(dir hostDirHandle) error
+	// fstatDir reads the metadata of the directory that dir names.
+	fstatDir(dir hostDirHandle) (hostInfo, error)
+	// lstatAt is lstat for name inside dir.
+	lstatAt(dir hostDirHandle, name string) (hostInfo, error)
+	// openChildAt is open for name inside dir.
+	openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error)
+}
 
 // hostKind is the file type of a host directory entry.
 type hostKind uint8

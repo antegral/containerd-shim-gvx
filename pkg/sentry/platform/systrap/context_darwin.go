@@ -215,8 +215,23 @@ func (th *thread) waitTerminated() {
 }
 
 // waitTrapped blocks until the stub thread hands the thread to the Sentry.
+//
+// A guest system call often returns to the stub within a few microseconds, so
+// the Sentry spins on the state word before it sleeps. A sleeping Sentry sets
+// waiterSentry first and reads the state again. The stub calls ulock_wake only
+// when it sees that bit, so a system call that the Sentry answers inside the
+// spin needs no kernel call on this side.
 func (th *thread) waitTrapped(limit time.Duration) error {
-	deadline := time.Now().Add(limit)
+	for i := 0; i < sentrySpinRounds; i++ {
+		if th.sm.loadState() == stateTrapped {
+			return nil
+		}
+		procyield(sentrySpinYields)
+	}
+	var deadline time.Time
+	if limit > 0 {
+		deadline = time.Now().Add(limit)
+	}
 	for {
 		st := th.sm.loadState()
 		if st == stateTrapped {
@@ -228,14 +243,22 @@ func (th *thread) waitTrapped(limit time.Duration) error {
 		if limit > 0 && time.Now().After(deadline) {
 			return fmt.Errorf("the stub thread did not park within %v (state %d)", limit, st)
 		}
-		ulockWait(&th.sm.State, st, waitSliceMicros)
+		atomic.OrUint32(&th.sm.Waiter, waiterSentry)
+		if st = th.sm.loadState(); st != stateTrapped {
+			ulockWait(&th.sm.State, st, waitSliceMicros)
+		}
+		atomic.AndUint32(&th.sm.Waiter, ^uint32(waiterSentry))
 	}
 }
 
-// resume hands the thread back to the stub.
+// resume hands the thread back to the stub. The stub sets waiterStub before it
+// sleeps and reads the state again, so the Sentry calls ulock_wake only when
+// it sees that bit.
 func (th *thread) resume(state uint32) {
 	th.sm.storeState(state)
-	ulockWakeAll(&th.sm.State)
+	if atomic.LoadUint32(&th.sm.Waiter)&waiterStub != 0 {
+		ulockWakeAll(&th.sm.State)
+	}
 }
 
 // forceStop makes a running thread trap, at the next instruction boundary of
@@ -575,6 +598,11 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 		}
 	}
 	sm.MC = sm.FMC
+	if as.p.zone {
+		if act, done := c.zoneBodyFault(ctx, mm, as, sm.Sig, sm.MC.ES.ESR>>26, sm.MC.ES.FAR, sm.MC.SS.PC); done {
+			return act
+		}
+	}
 	if act, done := c.recoverX18Slot(as, sm); done {
 		return act
 	}
@@ -600,6 +628,12 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 		}
 	}
 
+	if as.p.zone {
+		if act, done := c.zoneFault(ctx, mm, as, th, ac, sig, ec, esr, far, pc); done {
+			return act
+		}
+	}
+
 	switch sig {
 	case darwinSIGSEGV, darwinSIGBUS:
 		switch ec {
@@ -616,16 +650,8 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 			}
 		case ecDataAbort:
 			if esr&esrWnR != 0 {
-				base := blockRound(far)
-				if ok, err := as.restoreData(base); err != nil {
-					return contextErr(err, unix.ENOMEM)
-				} else if ok {
-					return signalAction{resume: true}
-				}
-				// A writable data state means that another thread restored the
-				// block after this thread faulted, so the write retries.
-				if st, at, ok := as.blockStateOf(base); ok && st == blockData && at.Write {
-					return signalAction{resume: true}
+				if act, done := c.storeToExecBlock(as, sm, pc, far); done {
+					return act
 				}
 			}
 		}
@@ -736,7 +762,7 @@ func (c *Context) reportFault(th *thread, ac *arch.Context64, sig uint64, ec uin
 	}
 	linuxSig, linuxCode := faultSignal(sig, esr)
 	si := &linux.SignalInfo{Signo: int32(linuxSig), Code: linuxCode}
-	si.SetAddr(far)
+	si.SetAddr(c.p.guestAddr(far))
 	return signalAction{si: si, at: at, err: platform.ErrContextSignal}
 }
 
