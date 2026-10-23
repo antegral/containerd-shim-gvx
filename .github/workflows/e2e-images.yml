@@ -46,8 +46,11 @@ jobs:
         run: |
           go test -count=1 -timeout 80m -tags pagesize_16k \
             -exec "$PWD/scripts/codesign-exec.sh" \
-            -run 'TestE2ESystrap|TestE2EDockerRun|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
+            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
             ./e2e
+          go test -count=1 -timeout 30m -tags pagesize_16k \
+            -exec "$PWD/scripts/codesign-exec.sh" \
+            -run 'TestE2EDockerRun.*/systrap' ./e2e
 
   linux-systrap:
     name: gates on linux/${{ matrix.arch }}
@@ -95,5 +98,6 @@ jobs:
         shell: bash
         run: |
           go test -count=1 -timeout 80m -skip 'HostLockdown' \
-            -run 'TestE2ESystrap|TestE2EDockerRun|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
+            -run 'TestE2ESystrap|TestE2EGateM3(Alpine|NginxPortForward|PythonAlpine|NodeAlpine)/systrap|TestE2EGateM4(PosixTortureBusybox|GitWorkloads|NodeModulesTorture)/systrap|TestE2EStdioReopenThroughDeviceNames/systrap' \
             ./e2e
+          go test -count=1 -timeout 30m -skip 'HostLockdown' -run 'TestE2EDockerRun.*/systrap' ./e2e
