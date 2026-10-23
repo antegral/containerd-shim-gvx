@@ -355,6 +355,9 @@ The tests are `engine_windows_test.go`, `engine_windows_amd64_test.go`, `lockdow
 | `39855645886` | `amd64` | The same loop on an EPYC 9V74 runner with the page-crossing fix: 12 of 12 runs pass. Seventeen runs on two other models (EPYC 7763 and 9V45) also pass. |
 | `39898594534`, `39898597202` | `amd64`, `arm64` | The low window: 60 suspended processes on each runner. The range was free, one placeholder covered it, the loader stayed out of it, and 64KB views mapped in it. |
 | `39899579241` | `arm64` | The `arm64` build of herdr links at `0x400000`. Before the low window it failed with `out of memory`. |
+| `39903063365`, `39903065819` | `amd64`, `arm64` | The low window end to end. Executables at `0x10000` and `0x400000` run. The `amd64` build of herdr (static-PIE) and the `arm64` build (`ET_EXEC` at `0x400000`) print their version and their API schema. |
+| `39903271799` | both | The registry gates fail in both Node gates. The kernel did not forward the address hole, and the address hints of V8 placed memory in it. |
+| `39904398745`, `39905154834` | both, all platforms | The registry gates pass with the low window and the kernel forwarder. |
 
 The scan of section 3.7 ran on a development host. Its output is in [`windows-systrap-probes/x86scan/RESULTS.txt`](windows-systrap-probes/x86scan/RESULTS.txt).
 
