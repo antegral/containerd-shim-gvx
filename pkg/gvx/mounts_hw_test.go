@@ -145,6 +145,44 @@ func TestSandboxMountsInGuest(t *testing.T) {
 	}
 }
 
+// TestSandboxProcMountInfoWithHostMount runs a guest that reads
+// /proc/self/mountinfo while a host directory is mounted. Package managers
+// and container tools read this file, and a failure there ends the sandbox.
+func TestSandboxProcMountInfoWithHostMount(t *testing.T) {
+	if !hvtest.Available() {
+		systraptest.Require(t)
+	}
+	catELF, err := testelf.BuildGuestCatELF64(runtime.GOARCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layer, err := testimage.Tar(testimage.File{Name: "bin/cat", Data: catELF, Mode: 0o755})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := hostTestConfig(t)
+	cfg.OCILayerTars = [][]byte{layer}
+	cfg.Mounts = []Mount{{Kind: MountBind, HostPath: t.TempDir(), GuestPath: "/mnt/a"}}
+	cfg.Argv = []string{"/bin/cat", "/proc/self/mountinfo"}
+	code, stdout, stderr := runConfig(t, cfg)
+	if code != 0 {
+		t.Fatalf("guest exit code = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	var found bool
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 4 && fields[4] == "/mnt/a" {
+			found = true
+			if fields[3] != "/" || !slices.Contains(fields, "hostfs") {
+				t.Errorf("mountinfo line for /mnt/a = %q, want the root \"/\" of a hostfs mount", line)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("mountinfo has no line for /mnt/a:\n%s", stdout)
+	}
+}
+
 // TestSandboxGuestWritesFollowMountAccess runs a guest that creates one file.
 // The exit code and the host directories show which mounts accept writes.
 func TestSandboxGuestWritesFollowMountAccess(t *testing.T) {
