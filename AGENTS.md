@@ -35,9 +35,13 @@ Execute these numbered steps at the start of every task before editing repositor
 
 | Isolation Tier | Packages and Files | Architectural Rule |
 | :--- | :--- | :--- |
-| **Tier 1: Additive Packages** | `cmd/rungv`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/fsimpl/hostfs`, `e2e`, `tools/upstream`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
+| **Tier 1: Additive Packages** | `cmd/rungv`, `cmd/containerd-shim-gvx-v2`, `internal/gvxshim`, `pkg/gvx`, `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/platform/whpx`, `pkg/sentry/platform/hvf`, `pkg/sentry/fsimpl/hostfs`, `e2e`, `tools/upstream`, `tools/shiminterop`, `docs/` | Owned exclusively by `gvx`; never present in `upstream/go` (`0.0%` merge conflict rate). |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin}.go`, `pkg/memutil/*_{windows,darwin}.go`, `pkg/fd/*_{windows,darwin}.go`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | Place alongside unmodified `*_linux.go` files so `git merge upstream/go` never conflicts. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files in `pkg/sentry/kernel`, `pkg/sentry/arch`, `pkg/ring0`, `pkg/sentry/vfs`, `pkg/sentry/fsimpl/{erofs,tmpfs,overlay}`, `pkg/tcpip` | Register every build-tag change (`linux \|\| windows \|\| darwin`) in `tools/upstream/buildtag_allowlist.txt`; keep modified upstream files below `5.0%`. |
+
+The optional shim adapter owns the G3 control boundary beside M2. It must not import `pkg/gvx`, Sentry, `pkg/hostlockdown`, or the upstream runsc shim.
+The standalone SDK never imports the adapter. A live control daemon does not represent a created sandbox or running workload.
+The isolated `tools/shiminterop` module tests real SDK `2.1.5` without importing the root module. Its compatible telemetry dependencies do not replace root dependencies.
 
 ---
 
@@ -117,6 +121,9 @@ rg -n "\x{2014}| \x{2013} |\x{2192}" README.md AGENTS.md docs/ 2>/dev/null
 ### 5.1 Continuous Integration (Descriptive Module)
 
 The workflow `.github/workflows/ci.yml` builds and vets all six targets, audits the upstream diff, and tests `linux/amd64`, `linux/arm64`, `darwin/arm64`, `windows/amd64`, and `windows/arm64`. A hosted macOS runner and the hosted `windows-11-arm` runner are virtual machines without a hypervisor, so they run the `systrap` suites. The workflow `.github/workflows/e2e-images.yml` pulls real images once a week. The workflow `.github/workflows/diagnose.yml` runs a chosen test selection on a chosen runner by hand. On Linux, run `scripts/seccomp-audit.sh` when a change adds a host call, because a call outside the seccomp allowlist kills the process.
+
+Native shim tests reexecute production `Main` without `GVX_SHIM_BINARY`. The existing Windows/arm64 job runs the shim package explicitly.
+Explicit interoperability tests use `GVX_SHIM_BINARY`; the private external-daemon test also requires `GVX_CONTAINERD_BINARY`. The [README procedure](README.md#23-containerd-control-shim-procedural-module) separates those smoke tests from guest workloads.
 
 Keep CI usage low. Do not add jobs that repeat work, and do not run registry tests on every push. Use these environment variables in CI only:
 

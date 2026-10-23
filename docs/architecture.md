@@ -69,6 +69,7 @@ gvx/ (Fork of google/gvisor@go)
  ├── third_party/
  │   └── x_sys/                             # [NEW] golang.org/x/sys with Darwin and Windows additions (go.mod replace)
  ├── tools/
+ │   ├── shiminterop/                       # [NEW] Isolated SDK smoke tests
  │   └── upstream/                          # [NEW] Upstream sync, diff audit, import boundaries, and build-tag rewriter
  │       ├── main.go
  │       ├── patches.go
@@ -78,9 +79,11 @@ gvx/ (Fork of google/gvisor@go)
  │       ├── sync.go
  │       └── diff_audit.go
  ├── cmd/
+ │   ├── containerd-shim-gvx-v2/             # [NEW] Optional containerd control command
+ │   │   └── main.go
  │   └── rungv/                             # [NEW] Standalone CLI runner (run, pull, stub)
  │       └── main.go
- ├── internal/                              # [NEW] Test fixtures: testelf, testimage, systraptest, lockdownprobe
+ ├── internal/                              # [NEW] gvxshim control adapter and test fixtures
  ├── pkg/
  │   ├── gvx/                               # [NEW] Embeddable Go library API for host tools
  │   │   ├── sandbox.go
@@ -172,8 +175,11 @@ Each package owns one architectural boundary. Enforce top-down import directiona
 
 | Package | Single Responsibility | Allowed Internal Imports | Forbidden Imports |
 | :--- | :--- | :--- | :--- |
+| `cmd/containerd-shim-gvx-v2` | Dispatches the optional shim command. | `internal/gvxshim` | `pkg/*`, `runsc/*`, `shim/*` |
+| `internal/gvxshim` | Owns bootstrap, local RPC controls, process lifetime, and safe cleanup. | None; public containerd types, ttRPC, protobuf, and host APIs are external dependencies. | `pkg/*`, `runsc/*`, `shim/*`, `cmd/*` |
+| `tools/shiminterop` | Exercises real ShimManager `2.1.5` against the compiled shim in an isolated module. | None | Root runtime, command, and internal packages |
 | `cmd/rungv` | Parses CLI flags (`run`, `pull`, `stub`) and starts a sandbox instance. | `pkg/gvx` | `pkg/sentry/*`, `WinHvPlatform.dll` |
-| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, and Sentry boot. | `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip` | `cmd/*` |
+| `pkg/gvx` | Coordinates `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, and Sentry boot. | `pkg/oci`, `pkg/netbackend`, `pkg/hostlockdown`, `pkg/sentry/*`, `pkg/fd`, `pkg/tcpip` | `cmd/*`, `internal/gvxshim` |
 | `pkg/oci` | Resolves `amd64`/`arm64` OCI manifests and compiles `.tar` layers into `.erofs` files. | `pkg/abi/linux` | `pkg/sentry/kernel`, `pkg/hostlockdown` |
 | `pkg/netbackend` | Bridges `pkg/tcpip` to L4 Go `net` forwarders (`nat`) or L3 `wireguard-go` (`wg`). | `pkg/tcpip` | `pkg/sentry/kernel`, `WinHvPlatform.dll` |
 | `pkg/hostlockdown` | Locks down the host process via Windows Tokens/JobObjects or macOS Seatbelt. | `golang.org/x/sys/windows`, `golang.org/x/sys/unix` | `pkg/sentry/*`, `pkg/tcpip` |
@@ -192,7 +198,7 @@ To prevent merge conflicts during continuous upstream pulls, `gvx` partitions al
 
 | Isolation Tier | File Paths | Upstream Conflict Rate | Maintenance Mechanism |
 | :--- | :--- | ---: | :--- |
-| **Tier 1: Additive Directories** | `cmd/rungv/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/fsimpl/hostfs/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
+| **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/fsimpl/hostfs/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin}.go`, `pkg/memutil/*_{windows,darwin}.go`, `pkg/fd/*_{windows,darwin}.go`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
 | **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 5.0%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
 
@@ -537,6 +543,45 @@ Seccomp cannot read a socket address. The filter cannot pin the WireGuard peer p
 
 The upstream `systrap` platform hangs while it starts in a cgo build. `New` returns `ErrPlatformUnavailable` there, and race builds use cgo. Build with `CGO_ENABLED=0`. A missing rule kills the process. Run `scripts/seccomp-audit.sh` to list the calls that the allowlist lacks. It builds with the tag `gvx_seccomp_log`, which logs those calls and allows them.
 
+### 3.9 Optional Containerd Control Adapter (Descriptive Module)
+
+The command `containerd-shim-gvx-v2` implements runtime identity `io.containerd.gvx.v2`. Its `internal/gvxshim` adapter adds the G3 control boundary beside M2, without changing the M1 through M5 runtime.
+The daemon never calls `gvx.New`, starts a guest, or applies guest lockdown. The standalone SDK does not depend on it.
+
+The launcher validates identity, serializes startup, starts a detached child, and probes the real Task endpoint. It emits JSON bootstrap version `3` only after readiness and keeps successful stderr empty.
+The child remains provisional until an authorized external control RPC attaches. Private readiness probes do not attach it.
+The default five-second timeout bounds startup, provisional handoff, shutdown drain, and executable cleanup. Attached serving has no lifetime timeout.
+
+| RPC | Result | State effect |
+| :--- | :--- | :--- |
+| Task v3 `Connect` | Actual shim PID, task PID `0`, version `gvx-control-v1` | Attaches an external caller |
+| Task v3 `Shutdown` | Empty success after registering the response obligation | Requests daemon shutdown |
+| Sandbox `CreateSandbox` | Wire `Unimplemented` after namespace and ID validation | Attaches but creates no sandbox |
+| Sandbox `ShutdownSandbox` | Empty success after registering the response obligation | Requests daemon shutdown |
+| Other Task or Sandbox methods | Wire `Unimplemented` | No workload state |
+
+Supported methods require matching namespace metadata and instance ID. The adapter registers no Task v2 service.
+Executable `delete` emits the upstream Task v2 `DeleteResponse` encoding independently of the Task v3 RPC version. Nonempty runtime options and arbitrary socket overrides remain unsupported.
+
+Identity combines the effective owner, normalized local containerd address, namespace, ID, and canonical bundle. A fixed-order JSON array and full SHA-256 digest derive endpoint names.
+Linux and Darwin use `/tmp/gvx-shim-<euid>/<digest>/task` and `stop`, private directories, private sockets, and kernel peer credentials.
+Windows uses local `\\.\pipe\gvx-shim-<digest>-task` and `-stop` pipes. Protected DACLs grant the current user and LocalSystem access; the transport rejects remote clients.
+These controls do not isolate hostile callers that share the owner's credentials.
+
+The bundle's `.gvx-shim` directory contains generation state, diagnostics, a command lock, and a lifetime lease. Each command pins directory identities and rejects unsafe links or replacement entries.
+Delete captures one generation before waiting for the command lock. Its independent stop channel remains usable when the Task pathname disappears.
+Delete waits for release of the same lease before removing admitted transient entries. It never signals a PID from metadata.
+Delete preserves containerd-owned files, the bundle, and stable lock files. Containerd removes its own bundle after executable cleanup.
+Conflicting resources or unresponsive serving loops cause an error and preserve evidence.
+
+Shutdown closes listeners before draining accepted connections. The response barrier counts complete empty-success frames accepted by the underlying transport.
+The drain deadline bounds blocked writes and closes retained connections directly. Transport acceptance does not prove that the peer consumed a response.
+
+The root module retains containerd SDK `2.1.5`, API `1.10.0`, and ttRPC `1.2.7`. Bootstrap version `3` selects Task v3; the runtime-name suffix remains `v2`.
+The isolated `tools/shiminterop` module compiles real SDK lifecycle code with compatible telemetry dependencies. Root telemetry dependencies remain unchanged.
+The installed containerd `2.2.4` smoke verifies native creation rejection and cleanup only. It does not demonstrate a successfully created sandbox.
+Containerd `2.3` binary bootstrap, CRI, guest workloads, and successful native sandbox creation remain outside this adapter.
+
 ---
 
 ## 4. Milestone Roadmap and Verification Criteria
@@ -584,3 +629,19 @@ A hosted runner is a virtual machine. The macOS runner cannot create a nested VM
 | `windows/amd64` and `windows/arm64` | CI builds both. CI runs `windows/amd64` tests, and `whpx` runs only where the runner has the Windows Hypervisor Platform. `windows/arm64` is compile-checked only. |
 | `darwin/amd64` | Compile-checked only. |
 | `linux/amd64` and `linux/arm64` | CI builds, vets, and tests both. |
+
+### 4.3 Containerd Shim Verification (Reference Module)
+
+This evidence covers only the optional control adapter. It does not change guest-runtime verification above.
+
+| Boundary | Executed result | Evidence limit |
+| :--- | :--- | :--- |
+| Linux command | JSON v3/ttRPC bootstrap, empty successful stderr, independent and repeated delete, owned state and socket cleanup | No guest workload |
+| Real SDK `2.1.5` | ShimManager shutdown and disconnect smoke passed; kernel peer PID matched Connect; task PID remained zero | Library lifecycle, not an external daemon |
+| External containerd `2.2.4` | Native creation returned the intended unsupported error; child, endpoints, lease, and bundle cleanup passed | No successful native sandbox |
+| Six production targets | Linux, Darwin, and Windows built on `amd64` and `arm64` | Cross-compilation does not prove native behavior |
+| Test binaries | Darwin `arm64` and Windows `amd64` cross-compiled | No native execution on those hosts |
+
+Native Darwin and Windows execution remains unverified. Cross-compilation does not verify peer authorization, named-pipe access, detachment, or cleanup on those hosts.
+The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-module) reproduces the SDK and external-daemon boundaries without registry or rootfs dependencies.
+
