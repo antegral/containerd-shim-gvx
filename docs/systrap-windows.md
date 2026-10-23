@@ -215,7 +215,7 @@ The guest window of a stub is `[0x100000000000, 0x7edfffff0000)`. It starts at 1
 
 `windowMap` turns each `MapFile`, `Unmap`, and protection request into the five operations that Windows allows on placeholders. It keeps one extent for each placeholder or view. A mapping of any size becomes one view. A partial change unmaps the whole view and maps the surviving parts again. A randomized test checks the map against a reference model with a fake host that enforces the Windows rules. The code runs on macOS too, so the logic has a fast test on the development host.
 
-The low window is `[0x10000, 0x7ffe0000)`. It holds a non-PIE `ET_EXEC` image at the address that it links to. Go links an `arm64` program at `0x10000`, and most other linkers use `0x400000`. `0x10000` is the lowest user address of Windows, and `0x7ffe0000` is the page of `KUSER_SHARED_DATA`. The range between the two windows belongs to the stub. The platform reports it through `platform.AddressHolePlatform`, and the memory manager never maps there.
+The low window is `[0x10000, 0x7ffe0000)`. It holds a non-PIE `ET_EXEC` image at the address that it links to. Go links an `arm64` program at `0x10000`, and most other linkers use `0x400000`. `0x10000` is the lowest user address of Windows, and `0x7ffe0000` is the page of `KUSER_SHARED_DATA`. The range between the two windows belongs to the stub. The platform reports it through `platform.AddressHolePlatform`, the kernel forwards it, and the memory manager never maps there.
 
 `windowMap` stays the same. `guestWindows` routes each call to the window that owns the address. An unmap that crosses the hole clears both windows.
 
