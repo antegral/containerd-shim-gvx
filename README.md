@@ -47,6 +47,7 @@ Use these steps to compile `rungv` and run an unmodified OCI image on Windows or
 3. Pass `-net=wg` with a WireGuard configuration file when strict L3 host LAN isolation is required.
 4. Select the guest architecture with `-arch`. The hardware backends accept only the host architecture.
 5. Run `rungv stub` to probe the `systrap` engine. The command exits with status 1 and prints the typed error when the engine is unavailable.
+6. Use the Docker flags `-e`, `-u`, `-v`, `-m`, `--cpus`, `-P`, `--read-only`, and `--tmpfs`, and the image commands `pull`, `images`, `inspect`, `tag`, `rmi`, `save`, `load`, `login`, and `logout`. The reference [`docs/cli.md`](docs/cli.md) lists every flag and every difference from Docker.
 
 ```bash
 # Build on macOS (Apple Silicon arm64 or Intel amd64) and apply free ad-hoc hypervisor signature
@@ -188,6 +189,7 @@ Read the architecture plan and agent operating manual before modifying any packa
 | Document | Audience | Scope Description |
 | :--- | :--- | :--- |
 | [`docs/architecture.md`](docs/architecture.md) | Engineers & AI Agents | Subsystem design, Windows/macOS `amd64`/`arm64` specs, upstream sync pipeline, and M1-M5 milestones. |
+| [`docs/cli.md`](docs/cli.md) | Users & Engineers | Every `rungv` command, every flag of `rungv run`, the run rules, and the differences from Docker. |
 | [`AGENTS.md`](AGENTS.md) | AI Coding Agents & Reviewers | Mandatory startup protocol, ASD-STE100 rules, package import boundaries, and verification gates. |
 
 ---
