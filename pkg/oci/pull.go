@@ -24,6 +24,8 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -86,6 +88,40 @@ type RuntimeConfig struct {
 	Env        []string `json:"Env"`
 	WorkingDir string   `json:"WorkingDir"`
 	User       string   `json:"User"`
+	// ExposedPorts holds the keys of the image ExposedPorts map, such as
+	// "80/tcp". ExposedPortList parses them.
+	ExposedPorts map[string]struct{} `json:"ExposedPorts,omitempty"`
+}
+
+// ExposedPort is one port that an image declares with EXPOSE.
+type ExposedPort struct {
+	Port     uint16
+	Protocol string // "tcp" or "udp"
+}
+
+// ExposedPortList returns the ports that the image declares, ordered by port
+// number and then by protocol. A key without a protocol means tcp. The call
+// skips a key that is not a port number from 1 to 65535 with tcp or udp.
+func (c RuntimeConfig) ExposedPortList() []ExposedPort {
+	var ports []ExposedPort
+	for key := range c.ExposedPorts {
+		num, proto, _ := strings.Cut(key, "/")
+		if proto == "" {
+			proto = "tcp"
+		}
+		n, err := strconv.ParseUint(num, 10, 16)
+		if err != nil || n == 0 || (proto != "tcp" && proto != "udp") {
+			continue
+		}
+		ports = append(ports, ExposedPort{Port: uint16(n), Protocol: proto})
+	}
+	sort.Slice(ports, func(i, j int) bool {
+		if ports[i].Port != ports[j].Port {
+			return ports[i].Port < ports[j].Port
+		}
+		return ports[i].Protocol < ports[j].Protocol
+	})
+	return ports
 }
 
 type imageConfigFile struct {
