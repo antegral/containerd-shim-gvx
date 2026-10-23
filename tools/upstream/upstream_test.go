@@ -133,7 +133,7 @@ func TestRepositoryMaskKeepsUpstreamTreesIncluded(t *testing.T) {
 			t.Errorf("Decide(%q) = %v, want MaskInclude", rel, got)
 		}
 	}
-	for _, rel := range []string{"pkg/gvx/sandbox.go", "pkg/sentry/platform/platforms/platforms_darwin.go", "internal/testelf/elf.go", "cmd/containerd-shim-gvx-v2/main.go", "internal/gvxshim/lifecycle.go", "tools/shiminterop/shim_manager_linux_test.go", "tools/shiminterop/go.mod"} {
+	for _, rel := range []string{"pkg/gvx/sandbox.go", "pkg/sentry/platform/platforms/platforms_darwin.go", "pkg/sentry/fsimpl/ext4lite/ext4lite.go", "pkg/sentry/platform/hvcommon/arm64.go", "internal/testelf/elf.go", "cmd/containerd-shim-gvx-v2/main.go", "internal/gvxshim/lifecycle.go", "tools/shiminterop/shim_manager_linux_test.go", "tools/shiminterop/go.mod"} {
 		if got := mask.Decide(rel); got != MaskProtect {
 			t.Errorf("Decide(%q) = %v, want MaskProtect", rel, got)
 		}
