@@ -136,11 +136,8 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		layerFiles = append(layerFiles, img.LayerFiles...)
 		img.LayerFiles = nil
 		layerPaths = append(layerPaths, img.LayerPaths...)
-		if len(s.cfg.Argv) == 0 {
-			s.cfg.Argv = img.Config.CommandVector(nil)
-		}
-		if len(s.cfg.Envv) == 0 && len(img.Config.Env) > 0 {
-			s.cfg.Envv = append([]string(nil), img.Config.Env...)
+		if err := s.applyImageDefaults(img.Config); err != nil {
+			return err
 		}
 	}
 
@@ -177,6 +174,13 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 		}
 	}
 
+	if len(s.cfg.Argv) == 0 && (len(s.cfg.Cmd) > 0 || s.cfg.EntrypointSet) {
+		// A layer tar has no image config: the caller names the whole command.
+		if err := s.applyImageDefaults(oci.RuntimeConfig{}); err != nil {
+			return err
+		}
+	}
+
 	if len(layerFiles) != len(layerPaths) {
 		return fmt.Errorf("gvx: %d opened EROFS layers but %d layer paths", len(layerFiles), len(layerPaths))
 	}
@@ -190,6 +194,27 @@ func (s *Sandbox) initOCILayers(ctx context.Context) (err error) {
 			return err
 		}
 	}
+	return nil
+}
+
+// applyImageDefaults fills the command and the environment of the guest from
+// the config of its image. The command follows Docker rules, and the caller
+// environment replaces the image values key by key.
+func (s *Sandbox) applyImageDefaults(img oci.RuntimeConfig) error {
+	argv, err := composeCommand(img, commandSource{
+		Argv:          s.cfg.Argv,
+		Entrypoint:    s.cfg.Entrypoint,
+		EntrypointSet: s.cfg.EntrypointSet,
+		Cmd:           s.cfg.Cmd,
+	})
+	if err != nil {
+		return err
+	}
+	env, err := mergeEnv(img.Env, s.cfg.Envv)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	s.cfg.Argv, s.cfg.Envv = argv, env
 	return nil
 }
 

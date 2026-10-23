@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -141,6 +142,17 @@ func ParsePortForward(spec string) (PortForward, error) {
 	}, nil
 }
 
+// Resources limits what the guest may use. A zero field means no limit.
+type Resources struct {
+	// MemoryBytes is the largest memory use of the guest. A value above zero
+	// must be at least MinMemoryLimit. The sandbox kills a guest that passes it.
+	MemoryBytes int64
+
+	// CPUMillis is the CPU quota in thousandths of a CPU. The guest sees that
+	// many CPUs rounded up. Windows also caps the CPU time of the host process.
+	CPUMillis int64
+}
+
 // ErrInvalidConfig marks a Config that New rejects before it opens any host
 // handle. Callers separate usage errors from runtime failures with errors.Is.
 var ErrInvalidConfig = errors.New("gvx: invalid configuration")
@@ -202,8 +214,39 @@ type Config struct {
 	// Argv is the command vector passed to the guest process.
 	Argv []string
 
-	// Envv is the environment variable list ("KEY=VALUE") passed to the guest.
+	// Entrypoint replaces the image Entrypoint when EntrypointSet is true. An
+	// empty Entrypoint with EntrypointSet clears the image Entrypoint. Docker
+	// rules apply: Argv, when it is not empty, wins over Entrypoint and Cmd.
+	Entrypoint    []string
+	EntrypointSet bool
+
+	// Cmd replaces the image Cmd. The guest runs the Entrypoint followed by Cmd.
+	// An override of the Entrypoint drops the image Cmd.
+	Cmd []string
+
+	// Envv is the environment variable list ("KEY=VALUE") that the sandbox
+	// merges over the image Env. A key in Envv replaces the same key of the image.
 	Envv []string
+
+	// User is a Docker user specification: "name", "uid", "user:group", or
+	// "uid:gid". The sandbox resolves names in the /etc/passwd and /etc/group
+	// of the guest. The empty string means the image User, and then root.
+	User string
+
+	// Hostname is the hostname of the guest. The default is "gvx".
+	Hostname string
+
+	// Name is an optional container name that follows the Docker rule
+	// [a-zA-Z0-9][a-zA-Z0-9_.-]+. The sandbox uses it as the container ID of the
+	// kernel. A run has no other state, so the name has no further effect.
+	Name string
+
+	// Resources limits the memory and the CPU of the guest.
+	Resources Resources
+
+	// PublishAll publishes every port that the image declares with EXPOSE to a
+	// free port of 127.0.0.1. It needs the nat network mode and an image.
+	PublishAll bool
 
 	// WorkDir is the initial guest working directory (defaults to "/workspace"
 	// when WorkspacePath is set, or "/").
@@ -234,6 +277,15 @@ type Config struct {
 	// work must set this field.
 	DisableHostLockdown bool
 }
+
+// defaultHostname is the guest hostname when Config.Hostname is empty.
+const defaultHostname = "gvx"
+
+var (
+	containerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+	// hostnamePattern accepts what Linux sethostname takes: at most 64 bytes.
+	hostnamePattern = regexp.MustCompile(`^[a-zA-Z0-9.-]{1,64}$`)
+)
 
 // normalize applies defaults and rejects contradictory settings before New
 // opens any host handle. Every rejection wraps ErrInvalidConfig.
@@ -275,6 +327,28 @@ func (c *Config) normalize() error {
 	}
 	if c.NetworkMode == NetModeWireGuard && c.WireGuardConfig == nil && c.WireGuardConfigPath == "" {
 		return fmt.Errorf("%w: network mode %q needs WireGuardConfig or WireGuardConfigPath", ErrInvalidConfig, NetModeWireGuard)
+	}
+
+	if _, _, _, err := splitUserSpec(c.User); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+	if c.Name != "" && !containerNamePattern.MatchString(c.Name) {
+		return fmt.Errorf("%w: invalid container name %q (want [a-zA-Z0-9][a-zA-Z0-9_.-]+)", ErrInvalidConfig, c.Name)
+	}
+	if c.Hostname == "" {
+		c.Hostname = defaultHostname
+	}
+	if !hostnamePattern.MatchString(c.Hostname) {
+		return fmt.Errorf("%w: invalid hostname %q (want 1 to 64 characters from a-z, A-Z, 0-9, dot, and hyphen)", ErrInvalidConfig, c.Hostname)
+	}
+	if m := c.Resources.MemoryBytes; m < 0 || (m > 0 && m < MinMemoryLimit) {
+		return fmt.Errorf("%w: memory limit %d bytes is invalid: use 0 or at least %d", ErrInvalidConfig, m, MinMemoryLimit)
+	}
+	if q := c.Resources.CPUMillis; q < 0 || q > int64(runtime.NumCPU())*1000 {
+		return fmt.Errorf("%w: CPU quota %d is invalid: use 0 to %d thousandths of a CPU", ErrInvalidConfig, q, runtime.NumCPU()*1000)
+	}
+	if c.PublishAll && c.NetworkMode != NetModeNAT {
+		return fmt.Errorf("%w: publishing the exposed ports needs network mode %q, got %q", ErrInvalidConfig, NetModeNAT, c.NetworkMode)
 	}
 
 	if c.Stdout == nil {

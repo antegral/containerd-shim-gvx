@@ -132,6 +132,16 @@ func parseGroup(data []byte) []groupEntry {
 	return out
 }
 
+// splitUserSpec splits "user:group" and rejects an empty part or a third part.
+// An empty specification is valid and means the default user.
+func splitUserSpec(spec string) (user, group string, hasGroup bool, err error) {
+	user, group, hasGroup = strings.Cut(spec, ":")
+	if spec != "" && (user == "" || (hasGroup && group == "") || strings.Contains(group, ":")) {
+		return "", "", false, fmt.Errorf("invalid user specification %q: want user, user:group, uid, or uid:gid", spec)
+	}
+	return user, group, hasGroup, nil
+}
+
 // resolveExecUser resolves a Docker user specification against the passwd and
 // group files of the guest. The specification is "", "user", "uid", "user:group",
 // or any mix of names and numbers.
@@ -141,9 +151,9 @@ func parseGroup(data []byte) []groupEntry {
 // Docker does. A specification without a group adds the supplementary groups
 // that list the user as a member. A specification with a group adds none.
 func resolveExecUser(spec string, passwd, group []byte) (execUser, error) {
-	userPart, groupPart, hasGroup := strings.Cut(spec, ":")
-	if spec != "" && (userPart == "" || (hasGroup && groupPart == "") || strings.Contains(groupPart, ":")) {
-		return execUser{}, fmt.Errorf("invalid user specification %q: want user, user:group, uid, or uid:gid", spec)
+	userPart, groupPart, hasGroup, err := splitUserSpec(spec)
+	if err != nil {
+		return execUser{}, err
 	}
 	pw := parsePasswd(passwd)
 	gr := parseGroup(group)

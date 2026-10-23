@@ -114,3 +114,25 @@ func TestFinalizeEnvAddsOnlyMissingKeys(t *testing.T) {
 		t.Errorf("finalizeEnv without a terminal = %q, want %q (no TERM)", got, want)
 	}
 }
+
+func TestApplyImageDefaultsComposesCommandAndMergesEnvironment(t *testing.T) {
+	s := &Sandbox{cfg: Config{Cmd: []string{"status"}, Envv: []string{"LANG=en", "X=1"}}}
+	img := oci.RuntimeConfig{Entrypoint: []string{"git"}, Cmd: []string{"--help"}, Env: []string{"PATH=/bin", "LANG=C"}}
+	if err := s.applyImageDefaults(img); err != nil {
+		t.Fatalf("applyImageDefaults: %v", err)
+	}
+	if want := []string{"git", "status"}; !reflect.DeepEqual(s.cfg.Argv, want) {
+		t.Errorf("Argv = %q, want %q", s.cfg.Argv, want)
+	}
+	if want := []string{"PATH=/bin", "LANG=en", "X=1"}; !reflect.DeepEqual(s.cfg.Envv, want) {
+		t.Errorf("Envv = %q, want %q", s.cfg.Envv, want)
+	}
+}
+
+func TestApplyImageDefaultsRejectsABadEnvironmentEntry(t *testing.T) {
+	s := &Sandbox{cfg: Config{Envv: []string{"NOEQUALS"}}}
+	err := s.applyImageDefaults(oci.RuntimeConfig{Cmd: []string{"/bin/sh"}})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("applyImageDefaults = %v, want an ErrInvalidConfig error", err)
+	}
+}
