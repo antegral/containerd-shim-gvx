@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 
@@ -69,6 +70,8 @@ func TestX86EncodersDecodeAsIntended(t *testing.T) {
 		{"jmp gs", enc(func(a *x86Asm) { a.jmpGS(winTEBScratchB) }), "jmp qword ptr gs:[0x20]"},
 		{"mov r15, rax", enc(func(a *x86Asm) { a.movRegReg(x86R15, x86RAX) }), "mov r15, rax"},
 		{"mov rax, r15", enc(func(a *x86Asm) { a.movRegReg(x86RAX, x86R15) }), "mov rax, r15"},
+		{"xsave64", enc(func(a *x86Asm) { a.xsave64(x86R15, winOffXsave) }), "xsave64 ptr [r15+0x100]"},
+		{"xrstor64", enc(func(a *x86Asm) { a.xrstor64(x86R15, winOffXsave) }), "xrstor64 ptr [r15+0x100]"},
 	} {
 		inst, err := x86asm.Decode(c.code, 64)
 		if err != nil {
@@ -161,6 +164,7 @@ func newSpillRig(t *testing.T, reloc []byte) *spillRig {
 	copy(m.r[:], r.guest[:])
 	m.rflags = rigFlags
 	m.gsBase = rigTEB
+	copy(m.vec[:], vectorImage(rigVectorSeed))
 	m.put64(rigTEB+winTEBSysmsg, rigSysm)
 	m.put64(rigSysm+winOffGuestEvent, rigGuestEv)
 	m.put64(rigSysm+winOffHostEvent, rigHostEv)
@@ -192,6 +196,12 @@ func newSpillRig(t *testing.T, reloc []byte) *spillRig {
 		// The callee may change every volatile register.
 		for _, n := range []int{x86RAX, x86RCX, x86RDX, x86R8, x86R9, x86R10, x86R11} {
 			m.r[n] = 0xDEAD_0000 + uint64(n)
+		}
+		// The callee may change the volatile vector registers.
+		for _, rg := range volatileVector {
+			for i := rg[0]; i < rg[1]; i++ {
+				m.vec[i] = 0xEE
+			}
 		}
 		if r.onCallee != nil {
 			r.onCallee(m, target)
@@ -624,5 +634,139 @@ func TestPatchJmpEncodesRelativeJump(t *testing.T) {
 	}
 	if err := patchJmp(page, 0x40, siteVA, siteVA+2*winIslandReach32); err == nil {
 		t.Error("patchJmp wrote a jump that cannot reach the slot")
+	}
+}
+
+// rigVectorSeed seeds the vector registers that the guest holds at the trap.
+const rigVectorSeed = 1
+
+// volatileVector lists the parts of the XSAVE image that a call into ntdll can
+// clobber: XMM0 to XMM5 and the upper halves of YMM0 to YMM5.
+var volatileVector = [][2]int{{160, 160 + 6*16}, {576, 576 + 6*16}}
+
+// vectorImage returns an XSAVE image that a pattern of seed fills. XSTATE_BV
+// marks every component as live.
+func vectorImage(seed byte) []byte {
+	img := make([]byte, winXsaveSize)
+	for i := range img {
+		img[i] = seed + byte(i*7)
+	}
+	binary.LittleEndian.PutUint64(img[xsaveHeaderOffset:], winXsaveMask)
+	clear(img[xsaveHeaderOffset+8 : xsaveHeaderOffset+64])
+	return img
+}
+
+// sameVector compares the parts of two XSAVE images that the routine saves.
+func sameVector(a, b []byte) bool {
+	for _, rg := range x86VectorRanges() {
+		if !bytes.Equal(a[rg[0]:rg[1]], b[rg[0]:rg[1]]) {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *spillRig) sysmsgVector() []byte {
+	img := make([]byte, winXsaveSize)
+	for i := range img {
+		img[i] = r.m.mem[rigSysm+winOffXsave+uint64(i)]
+	}
+	return img
+}
+
+func (r *spillRig) putSysmsgVector(img []byte) {
+	for i, b := range img {
+		r.m.mem[rigSysm+winOffXsave+uint64(i)] = b
+	}
+}
+
+func TestSpillSavesVectorStateBeforeItsFirstCall(t *testing.T) {
+	r := newSpillRig(t, rigNop3)
+	guest := vectorImage(rigVectorSeed)
+	r.m.put32(rigSysm+winOffSentryWaiter, 1)
+	r.onCallee = func(m *x86Machine, target uint64) {
+		if target != rigSetEv {
+			return
+		}
+		if sameVector(m.vec[:], guest) {
+			t.Error("the call left the volatile vector registers alone, so this test proves nothing")
+		}
+		if !sameVector(r.sysmsgVector(), guest) {
+			t.Error("NtSetEvent ran before the routine saved the vector state")
+		}
+	}
+	r.m.onYield = func(m *x86Machine) {
+		if !sameVector(r.sysmsgVector(), guest) {
+			t.Error("the saved vector state differs from the guest registers while the stub polls")
+		}
+		r.setState(winStateRunHot)
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.callLog) != 1 || r.callLog[0] != "set" {
+		t.Fatalf("calls = %v, want one NtSetEvent", r.callLog)
+	}
+	r.checkHotExit(t, r.guest, rigFlags)
+	if !sameVector(r.m.vec[:], guest) {
+		t.Error("the guest vector registers changed across the call")
+	}
+}
+
+func TestSpillKeepsVectorStateAcrossBothOfItsCalls(t *testing.T) {
+	r := newSpillRig(t, rigNop3)
+	guest := vectorImage(rigVectorSeed)
+	r.m.put32(rigSysm+winOffSentryWaiter, 1)
+	r.onCallee = func(m *x86Machine, target uint64) {
+		if target == rigWaitFn {
+			r.setState(winStateRunHot)
+		}
+	}
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.callLog) != 2 {
+		t.Fatalf("calls = %v, want NtSetEvent and NtWaitForSingleObject", r.callLog)
+	}
+	if !sameVector(r.m.vec[:], guest) {
+		t.Error("the guest vector registers changed across the two calls")
+	}
+}
+
+func TestSpillLoadsTheVectorStateThatTheSentryWrote(t *testing.T) {
+	for name, resume := range map[string]uint32{"hot": winStateRunHot, "cold": winStateRunCold} {
+		t.Run(name, func(t *testing.T) {
+			r := newSpillRig(t, rigNop3)
+			sentry := vectorImage(rigVectorSeed + 8)
+			r.onCallee = func(m *x86Machine, target uint64) {
+				if target != rigWaitFn {
+					return
+				}
+				if !sameVector(r.sysmsgVector(), vectorImage(rigVectorSeed)) {
+					t.Error("the saved vector state changed before the Sentry wrote its own")
+				}
+				r.putSysmsgVector(sentry)
+				r.setState(resume)
+			}
+			if err := r.m.run(100000); err != nil {
+				t.Fatal(err)
+			}
+			if !sameVector(r.m.vec[:], sentry) {
+				t.Error("the resume did not load the vector state that the Sentry wrote")
+			}
+		})
+	}
+}
+
+func TestSpillDoesNotWriteTheVectorImageOutsideItsComponents(t *testing.T) {
+	r := newSpillRig(t, rigNop3)
+	const gap = 900 // between the AVX component and the opmask component
+	r.m.mem[rigSysm+winOffXsave+gap] = 0x5A
+	r.m.onYield = func(m *x86Machine) { r.setState(winStateRunHot) }
+	if err := r.m.run(100000); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.m.mem[rigSysm+winOffXsave+gap]; got != 0x5A {
+		t.Errorf("the routine wrote %#x into a byte that no saved component owns", got)
 	}
 }

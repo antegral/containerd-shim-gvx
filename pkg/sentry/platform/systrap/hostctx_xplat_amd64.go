@@ -75,6 +75,26 @@ const (
 	eflagsTrap = 1 << 8
 )
 
+// xstateComponent describes one extended component: its XSAVE feature ID, its
+// offset in the Linux XSAVE image (the standard, non-compacted layout of the
+// Intel SDM), and its size.
+type xstateComponent struct {
+	id     uint32
+	offset int
+	size   int
+}
+
+var xstateComponents = []xstateComponent{
+	{2, 576, 256},   // AVX: YMM_Hi128
+	{5, 1088, 64},   // AVX-512: opmask registers
+	{6, 1152, 512},  // AVX-512: ZMM_Hi256
+	{7, 1664, 1024}, // AVX-512: Hi16_ZMM
+}
+
+// xsaveHeaderOffset is the offset of the XSAVE header. The first word of the
+// header is XSTATE_BV, which names the components that hold live state.
+const xsaveHeaderOffset = 512
+
 // ptr returns the address to pass to GetThreadContext and SetThreadContext.
 func (c *hostContext) ptr() uintptr { return uintptr(unsafe.Pointer(&c.buf[0])) }
 

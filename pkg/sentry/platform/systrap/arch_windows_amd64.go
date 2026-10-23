@@ -439,31 +439,19 @@ func archPC(ac *arch.Context64) uint64 { return ac.StateData().Regs.Rip }
 // archAttachFast names the winSysmsg to the spill routine through the TEB.
 func (th *thread) archAttachFast(slot *fastSlot) error { return th.writeTEBSysmsg(slot.va) }
 
-// archFastSetFP writes the vector state of ac into a thread that waits in the
-// spill routine. The Windows x64 kernel keeps the vector registers across the
-// calls of the routine, so the live context holds the state. The call suspends
-// the thread for the time of the write. Callers hold mu.
-func (th *thread) archFastSetFP(_ *fastThread, ac *arch.Context64) error {
-	if err := ntSuspendThread(th.h); err != nil {
-		return th.ctxErr("NtSuspendThread", err)
-	}
-	defer func() { _ = ntResumeThread(th.h) }()
-	th.ctx.loadFrom(ac, true)
-	th.ctx.setFlags(th.ctx.fpFlags())
-	return th.setContext()
+// archFastSetFP writes the vector state of ac into the sysmsg of a thread that
+// waits in the spill routine. The routine loads the image with XRSTOR on the
+// next resume, because the calls of the routine clobber the live registers.
+// Callers hold mu.
+func (th *thread) archFastSetFP(f *fastThread, ac *arch.Context64) error {
+	f.slot.sm.loadVector(ac, xstateMask())
+	return nil
 }
 
-// archFastGetFP reads the vector state of a thread that waits in the spill
-// routine into ac. Callers hold mu.
-func (th *thread) archFastGetFP(_ *fastThread, ac *arch.Context64) error {
-	if err := ntSuspendThread(th.h); err != nil {
-		return th.ctxErr("NtSuspendThread", err)
-	}
-	defer func() { _ = ntResumeThread(th.h) }()
-	if err := th.getContext(th.ctx.fpFlags()); err != nil {
-		return err
-	}
-	th.ctx.storeFP(ac)
+// archFastGetFP reads the vector state that the spill routine saved in the
+// sysmsg of a thread that waits in it into ac. Callers hold mu.
+func (th *thread) archFastGetFP(f *fastThread, ac *arch.Context64) error {
+	f.slot.sm.storeVector(ac)
 	return nil
 }
 

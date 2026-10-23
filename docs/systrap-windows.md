@@ -330,7 +330,11 @@ These stops keep the debug path: every fault, every execute fault that patches a
 
 `Interrupt` does not step a thread that runs the spill routine, a slot, or an ntdll stub that the routine calls, because the trap publishes its own stop. The call tries again until the thread leaves that code or publishes the trap. A thread that steps into the first instruction of a slot goes back to the patched instruction, because the slot has not run.
 
-On `arm64`, the spill routine saves V0 to V31, FPSR, and FPCR in the `winSysmsg` before it makes any call, and loads them on every resume. The Sentry reads and writes the vector state of a trapped thread in that block. A first CI run on `windows-11-arm` showed that the calls of the routine lose the volatile vector registers, so the live thread context did not hold the guest state: `PullFullState` read zero, and a value from the Sentry reached the guest as zero. The ABI lets a call clobber V0 to V7 and V16 to V31, and the guest expects a system call to keep them. On `amd64`, the routine touches no vector register. `PullFullState` and `FullStateChanged` suspend the thread for the time of one context call. This relies on the Windows x64 kernel keeping the vector registers across the calls of the routine. Nobody has measured it.
+The spill routine saves the vector state of the guest in the `winSysmsg` before it makes any call, and loads it on every resume. The Sentry reads and writes the vector state of a trapped thread in that block. The live thread context does not hold the guest state, because the calls of the routine clobber the volatile vector registers. The first CI runs failed `TestFastPathVectorStateFollowsTheSentry` on `windows-11-arm` and on `windows-latest`: `PullFullState` read zero, and a value from the Sentry reached the guest as zero.
+
+On `arm64`, the block holds V0 to V31, FPSR, and FPCR. The ABI lets a call clobber V0 to V7 and V16 to V31, and the guest expects a system call to keep them.
+
+On `amd64`, the block is an XSAVE image at offset `0x100` of the `winSysmsg`. The routine writes it with `XSAVE64` and loads it with `XRSTOR64`. The feature mask is `0xE7`: x87, SSE, AVX, and the three AVX-512 components. The processor ignores the mask bits that XCR0 does not enable. The Sentry copies the image to and from the Linux XSAVE image of the guest. It sets only the XSTATE_BV bits of components that the operating system enabled, because `XRSTOR64` faults on any other bit.
 
 When the variable is set, `New` runs a guest with six system calls in a new stub. All six must take the fast path. A failed run, or a run that exceeds 30 seconds, makes `New` return `ErrUnavailable`. A host that fails this test therefore reports the failure and does not fall back without notice.
 
@@ -339,7 +343,7 @@ The design rests on facts that no Windows document states:
 - No code of the stub uses the three `NT_TIB` words.
 - `ntdll` loads at the same address in the Sentry and in the stub.
 - `TPIDR_EL0` keeps the value that the engine writes, across waits and stops, on `arm64`. Section 3.4 measured this for waits and stops, but not for the spill routine itself.
-- On `amd64`, the ntdll stubs and the kernel keep the vector registers across `NtSetEvent` and `NtWaitForSingleObject`. A first CI run showed that this does not hold on `arm64`, which section 6.8 describes. The `amd64` claim has no measurement of its own beyond the passing engine tests.
+- On `amd64`, the stub process runs `XSAVE64` and `XRSTOR64`. Only a Windows run proves that the host accepts them. The macOS tests run the routine in an emulator.
 
 | Piece | Verified by |
 | :--- | :--- |

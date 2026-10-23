@@ -17,6 +17,8 @@
 package systrap
 
 import (
+	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -94,5 +96,118 @@ func TestWinTrapResumesHotOnlyAtTheReturnAddress(t *testing.T) {
 func TestWinSiteReturnIsBehindTheSyscall(t *testing.T) {
 	if got := winSiteReturn(0x1000); got != 0x1002 {
 		t.Fatalf("the return address of a site at 0x1000 is %#x, want 0x1002", got)
+	}
+}
+
+// extraTail is the number of bytes behind the saved components in the Linux
+// XSAVE image of the tests. A real image carries more components than the
+// routine saves, such as the protection key register.
+const extraTail = 64
+
+func xsaveBV(img []byte) uint64 { return binary.LittleEndian.Uint64(img[xsaveHeaderOffset:]) }
+
+func TestWinSysmsgXsaveRoundTripsEveryComponent(t *testing.T) {
+	src := vectorImage(5)
+	src = append(src, bytes.Repeat([]byte{0x77}, extraTail)...)
+	var m winSysmsg
+	m.loadXsave(src, winXsaveMask)
+	if !sameVector(m.Xsave[:], src) {
+		t.Fatal("loadXsave changed a component on the way into the sysmsg")
+	}
+
+	dst := bytes.Repeat([]byte{0xAB}, len(src))
+	binary.LittleEndian.PutUint64(dst[xsaveHeaderOffset:], 0)
+	m.storeXsave(dst)
+	if !bytes.Equal(dst[:xsaveHeaderOffset], src[:xsaveHeaderOffset]) {
+		t.Error("storeXsave changed the legacy region on the way out of the sysmsg")
+	}
+	for _, comp := range xstateComponents {
+		if !bytes.Equal(dst[comp.offset:comp.offset+comp.size], src[comp.offset:comp.offset+comp.size]) {
+			t.Errorf("storeXsave changed component %d on the way out of the sysmsg", comp.id)
+		}
+	}
+	// storeXsave sets the bits of the extended components and leaves the x87
+	// and SSE bits to the Sentry, as the Windows context path does.
+	if got, want := xsaveBV(dst), uint64(winXsaveMask&^winXsaveLegacy); got != want {
+		t.Errorf("XSTATE_BV = %#x after storeXsave, want %#x", got, want)
+	}
+	for i := winXsaveSize; i < len(dst); i++ {
+		if dst[i] != 0xAB {
+			t.Fatalf("storeXsave wrote byte %d behind the saved components", i)
+		}
+	}
+}
+
+func TestWinSysmsgXsaveLoadsOnlyTheEnabledComponents(t *testing.T) {
+	src := vectorImage(5)
+	const avxOnly = 1 << 2
+	var m winSysmsg
+	m.loadXsave(src, avxOnly)
+	if got, want := xsaveBV(m.Xsave[:]), uint64(winXsaveLegacy|avxOnly); got != want {
+		t.Fatalf("XSTATE_BV = %#x, want %#x: XRSTOR faults on a bit that XCR0 does not enable", got, want)
+	}
+	for _, comp := range xstateComponents {
+		loaded := !bytes.Equal(m.Xsave[comp.offset:comp.offset+comp.size], make([]byte, comp.size))
+		if want := comp.id == 2; loaded != want {
+			t.Errorf("component %d loaded = %v, want %v", comp.id, loaded, want)
+		}
+	}
+}
+
+func TestWinSysmsgXsaveHeaderIsInTheStandardFormat(t *testing.T) {
+	src := vectorImage(5)
+	// A guest can write any bytes into the header of its signal frame.
+	for i := xsaveHeaderOffset + 8; i < xsaveHeaderOffset+64; i++ {
+		src[i] = 0xFF
+	}
+	var m winSysmsg
+	m.loadXsave(src, winXsaveMask)
+	for i := xsaveHeaderOffset + 8; i < xsaveHeaderOffset+64; i++ {
+		if m.Xsave[i] != 0 {
+			t.Fatalf("header byte %d = %#x, want zero: XCOMP_BV and the reserved bytes select the standard format", i, m.Xsave[i])
+		}
+	}
+}
+
+func TestWinSysmsgXsaveAlwaysLoadsX87AndSSE(t *testing.T) {
+	src := vectorImage(5)
+	binary.LittleEndian.PutUint64(src[xsaveHeaderOffset:], 0)
+	var m winSysmsg
+	m.loadXsave(src, winXsaveMask)
+	if got := xsaveBV(m.Xsave[:]); got != winXsaveLegacy {
+		t.Fatalf("XSTATE_BV = %#x, want %#x: the legacy region always carries the registers", got, uint64(winXsaveLegacy))
+	}
+	if !bytes.Equal(m.Xsave[:xsaveHeaderOffset], src[:xsaveHeaderOffset]) {
+		t.Error("the legacy region differs from the Sentry image")
+	}
+}
+
+func TestWinSysmsgXsaveSurvivesAShortImage(t *testing.T) {
+	for _, size := range []int{0, 100, xsaveHeaderOffset, xsaveHeaderOffset + 8, 1000} {
+		src := vectorImage(5)[:size]
+		var m winSysmsg
+		m.loadXsave(src, winXsaveMask)
+		if size >= xsaveHeaderOffset+8 && xsaveBV(m.Xsave[:])&^uint64(winXsaveLegacy|1<<2) != 0 {
+			t.Errorf("size %d: XSTATE_BV %#x names a component that the image cannot hold", size, xsaveBV(m.Xsave[:]))
+		}
+		dst := make([]byte, size)
+		m.storeXsave(dst)
+	}
+}
+
+func TestWinSysmsgXsaveStoreClearsInitialComponents(t *testing.T) {
+	var m winSysmsg
+	m.loadXsave(vectorImage(5), winXsaveMask)
+	// The processor reports an initial component by a clear XSTATE_BV bit.
+	const opmask = 1 << 5
+	binary.LittleEndian.PutUint64(m.Xsave[xsaveHeaderOffset:], winXsaveMask&^opmask)
+
+	dst := vectorImage(9)
+	m.storeXsave(dst)
+	if got := xsaveBV(dst); got != winXsaveMask&^opmask {
+		t.Errorf("XSTATE_BV = %#x, want %#x", got, uint64(winXsaveMask&^opmask))
+	}
+	if !bytes.Equal(dst[1088:1088+64], make([]byte, 64)) {
+		t.Error("an initial component kept the old register contents in the Sentry image")
 	}
 }

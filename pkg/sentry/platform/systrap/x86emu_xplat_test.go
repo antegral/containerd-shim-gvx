@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 
@@ -37,6 +38,8 @@ type x86Machine struct {
 	mem    map[uint64]byte
 	gsBase uint64
 	fsBase uint64
+	// vec holds the vector registers as an XSAVE image.
+	vec [winXsaveSize]byte
 
 	onYield func(m *x86Machine)
 	onFence func(m *x86Machine)
@@ -419,9 +422,69 @@ func (m *x86Machine) step(inst x86asm.Inst) (done bool, err error) {
 		v, err := m.value(args[0], 8, next)
 		m.fsBase = v
 		return false, err
+	case "XSAVE64", "XRSTOR64":
+		return false, m.xstate(inst, next)
 	case "INT", "INT3":
 		m.exit.trap = 3
 		return true, nil
 	}
 	return false, fmt.Errorf("instruction %v is not in the emulated set", inst)
+}
+
+// x86VectorRanges returns the byte ranges of an XSAVE image that the spill
+// routine saves: the legacy region, the header, and the extended components.
+func x86VectorRanges() [][2]int {
+	ranges := [][2]int{{0, xsaveHeaderOffset}, {xsaveHeaderOffset, xsaveHeaderOffset + 64}}
+	for _, comp := range xstateComponents {
+		ranges = append(ranges, [2]int{comp.offset, comp.offset + comp.size})
+	}
+	return ranges
+}
+
+// xstate runs XSAVE64 and XRSTOR64 on the vector registers of the machine. It
+// stops the run where the processor raises a fault: an address that is not
+// 64-byte aligned, a feature mask other than the one that the routine owns,
+// and a header that is not valid for the standard format.
+func (m *x86Machine) xstate(inst x86asm.Inst, next uint64) error {
+	mem, ok := inst.Args[0].(x86asm.Mem)
+	if !ok {
+		return fmt.Errorf("%v operand %v", inst.Op, inst.Args[0])
+	}
+	addr, err := m.operandAddr(mem, next)
+	if err != nil {
+		return err
+	}
+	if addr%64 != 0 {
+		return fmt.Errorf("%v at %#x is not 64-byte aligned", inst.Op, addr)
+	}
+	if m.r[x86RAX]&0xFFFF_FFFF != winXsaveMask || m.r[x86RDX]&0xFFFF_FFFF != 0 {
+		return fmt.Errorf("%v with the feature mask %#x:%#x, want %#x", inst.Op, m.r[x86RDX]&0xFFFF_FFFF, m.r[x86RAX]&0xFFFF_FFFF, uint64(winXsaveMask))
+	}
+	ranges := x86VectorRanges()
+	if inst.Op.String() == "XSAVE64" {
+		for _, rg := range ranges {
+			for i := rg[0]; i < rg[1]; i++ {
+				m.mem[addr+uint64(i)] = m.vec[i]
+			}
+		}
+		return nil
+	}
+	var header [64]byte
+	for i := range header {
+		header[i] = m.mem[addr+xsaveHeaderOffset+uint64(i)]
+	}
+	if bv := binary.LittleEndian.Uint64(header[:]); bv&^winXsaveMask != 0 {
+		return fmt.Errorf("XRSTOR64 with XSTATE_BV %#x, XCR0 enables %#x", bv, uint64(winXsaveMask))
+	}
+	for _, b := range header[8:] {
+		if b != 0 {
+			return fmt.Errorf("XRSTOR64 with a header that is not in the standard format: % x", header[8:])
+		}
+	}
+	for _, rg := range ranges {
+		for i := rg[0]; i < rg[1]; i++ {
+			m.vec[i] = m.mem[addr+uint64(i)]
+		}
+	}
+	return nil
 }

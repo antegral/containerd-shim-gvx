@@ -45,9 +45,10 @@ import (
 //	  jmp  site+2+len(relocated)
 //
 // The spill routine finds the sysmsg of the thread in the TEB, saves every
-// register, switches to the stub stack, runs the handoff, loads the registers
-// again, and jumps to the tail with a JMP through the TEB. A guest can never
-// write the GS base, so GS names the TEB of the thread.
+// register and the vector state, switches to the stub stack, runs the handoff,
+// loads the vector state and the registers again, and jumps to the tail with a
+// JMP through the TEB. A guest can never write the GS base, so GS names the TEB
+// of the thread.
 
 const (
 	// winSlotLiteralOffset is the offset of the 8-byte literal that holds the
@@ -180,6 +181,20 @@ func (a *x86Asm) callMem(base int, disp int32) { a.memOp(false, []byte{0xFF}, 2,
 // leaBase is `lea r64, [base+disp32]`.
 func (a *x86Asm) leaBase(reg, base int, disp int32) { a.memOp(true, []byte{0x8D}, reg, base, disp) }
 
+// loadXsaveMask is `mov eax, winXsaveMask; xor edx, edx`. XSAVE and XRSTOR take
+// the requested-feature bitmap in EDX:EAX.
+func (a *x86Asm) loadXsaveMask() {
+	a.emit(0xB8)
+	a.imm32(winXsaveMask)
+	a.emit(0x31, 0xD2)
+}
+
+// xsave64 is `xsave64 [base+disp32]`.
+func (a *x86Asm) xsave64(base int, disp int32) { a.memOp(true, []byte{0x0F, 0xAE}, 4, base, disp) }
+
+// xrstor64 is `xrstor64 [base+disp32]`.
+func (a *x86Asm) xrstor64(base int, disp int32) { a.memOp(true, []byte{0x0F, 0xAE}, 5, base, disp) }
+
 // movLoadGS is `mov r64, gs:[abs32]`, and movStoreGS is `mov gs:[abs32], r64`.
 func (a *x86Asm) movLoadGS(reg int, abs uint32) {
 	a.emit(0x65, x86Rex(true, reg, 0), 0x8B, byte(reg&7)<<3|4, 0x25)
@@ -283,6 +298,12 @@ func buildSpill() (winSpillCode, error) {
 	a.emit(0x9C) // pushfq
 	a.popMem(base, winOffRflags)
 
+	// Save the vector state before the first call. A call into ntdll can
+	// clobber the volatile vector registers, and the Sentry reads the saved
+	// image while the thread waits.
+	a.loadXsaveMask()
+	a.xsave64(base, winOffXsave)
+
 	// Publish Trapped. An x86 store has release semantics. The fence orders the
 	// store before the load of the Sentry flag.
 	a.movStoreImm32(base, winOffState, uint32(winStateTrapped))
@@ -323,8 +344,10 @@ func buildSpill() (winSpillCode, error) {
 	a.emit(0x83, 0xF8, byte(winStateRunCold)) // cmp eax, RunCold
 	a.jcc32(x86CCE, "cold")
 
-	// Hot resume: load the FS base, the flags, the return address, and every
-	// register, then jump to the tail.
+	// Hot resume: load the vector state, the FS base, the flags, the return
+	// address, and every register, then jump to the tail.
+	a.loadXsaveMask()
+	a.xrstor64(base, winOffXsave)
 	a.movLoad(x86RAX, base, winOffFsBase)
 	a.emit(0xF3, 0x48, 0x0F, 0xAE, 0xD0) // wrfsbase rax
 	a.pushMem(base, winOffRflags)
@@ -337,6 +360,8 @@ func buildSpill() (winSpillCode, error) {
 	// Cold resume: load the flags and every register, then trap. The Sentry
 	// continues the thread at Target and loads the FS base itself.
 	a.label("cold")
+	a.loadXsaveMask()
+	a.xrstor64(base, winOffXsave)
 	a.pushMem(base, winOffRflags)
 	a.emit(0x9D)
 	loadAll(&a, base)

@@ -17,6 +17,7 @@
 package systrap
 
 import (
+	"encoding/binary"
 	"unsafe"
 
 	"z.gfire.dev/gvx/pkg/sentry/arch"
@@ -36,6 +37,12 @@ type winRegs struct {
 type winSysmsg struct {
 	winSysmsgHeader
 	Regs winRegs
+	_    [winOffXsave - winOffFsBase - 8]byte
+	// Xsave holds the vector state of the trapped guest in the standard XSAVE
+	// format. A call into ntdll can clobber the volatile vector registers on
+	// Windows, so the spill routine saves them before its first call and loads
+	// them again on every resume.
+	Xsave [winXsaveSize]byte
 }
 
 // Offsets of the registers in the winSysmsg. A register number is the number
@@ -45,6 +52,19 @@ const (
 	winOffRegBase = winOffRegs
 	winOffRflags  = winOffRegs + 16*8
 	winOffFsBase  = winOffRflags + 8
+
+	// winOffXsave is the offset of the XSAVE area of the guest vector state.
+	// XSAVE and XRSTOR fault on an address that is not 64-byte aligned, and
+	// the shared page is page aligned.
+	winOffXsave = 0x100
+	// winXsaveMask names the components that the spill routine saves: x87,
+	// SSE, AVX, and the three AVX-512 components. The processor ignores the
+	// bits that XCR0 does not enable.
+	winXsaveMask = winXsaveLegacy | 1<<2 | 1<<5 | 1<<6 | 1<<7
+	// winXsaveLegacy names the x87 and SSE components, which every image holds.
+	winXsaveLegacy = 0x3
+	// winXsaveSize is the size of the standard XSAVE image of those components.
+	winXsaveSize = 1664 + 1024
 )
 
 // winRegOffset returns the offset of general-purpose register n.
@@ -56,6 +76,9 @@ var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.Rsp)-4*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.R15)-15*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.Rflags)-16*8]
 var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Regs.FsBase)-17*8]
+var _ = [1]struct{}{}[unsafe.Offsetof(winSysmsg{}.Xsave)-winOffXsave]
+var _ = [1]struct{}{}[unsafe.Sizeof(winSysmsg{})-(winOffXsave+winXsaveSize)]
+var _ = [1]struct{}{}[winOffXsave%64]
 
 const (
 	// winSiteLen is the length of the SYSCALL instruction. Its return address
@@ -108,3 +131,69 @@ func (t winTrap) resumeState(ac *arch.Context64) uint32 {
 
 // winSiteReturn returns the address where the guest continues after the site.
 func winSiteReturn(site uint64) uint64 { return site + winSiteLen }
+
+// loadVector builds the XSAVE image of the vector state of ac in the sysmsg.
+// The spill routine loads the image with XRSTOR on the next resume.
+func (m *winSysmsg) loadVector(ac *arch.Context64, enabled uint64) {
+	m.loadXsave(*ac.FloatingPointData(), enabled)
+}
+
+// loadXsave builds the XSAVE image of the Linux XSAVE image fp in the sysmsg.
+// Only the components in enabled can be live, because XRSTOR faults on an
+// XSTATE_BV bit that XCR0 does not enable. x87 and SSE are always part of the
+// image.
+func (m *winSysmsg) loadXsave(fp []byte, enabled uint64) {
+	clear(m.Xsave[:])
+	copy(m.Xsave[:xsaveHeaderOffset], fp)
+	var bv uint64
+	if len(fp) >= xsaveHeaderOffset+8 {
+		bv = binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
+	}
+	bv &= winXsaveLegacy | enabled
+	bv |= winXsaveLegacy
+	for _, comp := range xstateComponents {
+		bit := uint64(1) << comp.id
+		if bv&bit == 0 {
+			continue
+		}
+		if len(fp) < comp.offset+comp.size {
+			bv &^= bit
+			continue
+		}
+		copy(m.Xsave[comp.offset:comp.offset+comp.size], fp[comp.offset:comp.offset+comp.size])
+	}
+	// XCOMP_BV and the reserved bytes of the header stay zero, which selects
+	// the standard format.
+	binary.LittleEndian.PutUint64(m.Xsave[xsaveHeaderOffset:], bv)
+}
+
+// storeVector copies the XSAVE image that the spill routine saved into the
+// vector state of ac.
+func (m *winSysmsg) storeVector(ac *arch.Context64) { m.storeXsave(*ac.FloatingPointData()) }
+
+// storeXsave copies the saved XSAVE image into the Linux XSAVE image fp. A
+// component that the saved image marks as initial becomes zeros, and its
+// XSTATE_BV bit becomes clear.
+func (m *winSysmsg) storeXsave(fp []byte) {
+	copy(fp[:min(len(fp), xsaveHeaderOffset)], m.Xsave[:xsaveHeaderOffset])
+	if len(fp) < xsaveHeaderOffset+8 {
+		return
+	}
+	have := binary.LittleEndian.Uint64(m.Xsave[xsaveHeaderOffset:])
+	bv := binary.LittleEndian.Uint64(fp[xsaveHeaderOffset:])
+	for _, comp := range xstateComponents {
+		bit := uint64(1) << comp.id
+		if len(fp) < comp.offset+comp.size {
+			continue
+		}
+		dst := fp[comp.offset : comp.offset+comp.size]
+		if have&bit == 0 {
+			clear(dst)
+			bv &^= bit
+			continue
+		}
+		copy(dst, m.Xsave[comp.offset:comp.offset+comp.size])
+		bv |= bit
+	}
+	binary.LittleEndian.PutUint64(fp[xsaveHeaderOffset:], bv)
+}
