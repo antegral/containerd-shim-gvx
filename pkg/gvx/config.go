@@ -166,6 +166,17 @@ type Config struct {
 	// WorkspaceReadOnly mounts /workspace in read-only mode.
 	WorkspaceReadOnly bool
 
+	// Mounts lists extra guest mounts: bind mounts of host directories, named
+	// volumes, and tmpfs mounts. WorkspacePath and WorkspaceReadOnly stay the
+	// shorthand for the bind mount at /workspace, so no entry of Mounts may use
+	// /workspace when WorkspacePath is set.
+	Mounts []Mount
+
+	// ReadOnlyRoot mounts the root file system of the guest in read-only mode
+	// after the guest setup. /proc, /sys, /dev, /dev/shm, /dev/pts, and every
+	// mount of WorkspacePath and Mounts keep their own access flags.
+	ReadOnlyRoot bool
+
 	// Argv is the command vector passed to the guest process.
 	Argv []string
 
@@ -242,6 +253,10 @@ func (c *Config) normalize() error {
 	}
 	if c.NetworkMode == NetModeWireGuard && c.WireGuardConfig == nil && c.WireGuardConfigPath == "" {
 		return fmt.Errorf("%w: network mode %q needs WireGuardConfig or WireGuardConfigPath", ErrInvalidConfig, NetModeWireGuard)
+	}
+
+	if err := c.validateMounts(); err != nil {
+		return err
 	}
 
 	if c.Stdout == nil {

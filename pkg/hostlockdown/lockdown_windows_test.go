@@ -312,7 +312,7 @@ func runLockedChild(mode string) error {
 		return err
 	}
 
-	st, err := Apply(Options{WorkspacePath: ws})
+	st, err := Apply(Options{Mounts: []HostMount{{Path: ws}}})
 	if err != nil {
 		return fmt.Errorf("Apply: %w", err)
 	}

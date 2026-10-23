@@ -35,7 +35,7 @@ import (
 )
 
 // Sandbox coordinates the execution backend (whpx or hvf), OCI EROFS
-// overlay layers, /workspace hostfs mount, Dual-Track Netstack, and host
+// overlay layers, hostfs, volume and tmpfs mounts, Dual-Track Netstack, and host
 // process self-lockdown.
 type Sandbox struct {
 	mu            sync.Mutex
@@ -46,6 +46,8 @@ type Sandbox struct {
 	resolvedImg   *oci.ResolvedImage
 	layerHandles  []*fd.HostHandle
 	workspace     *hostfs.Workspace
+	workspaces    []*hostfs.Workspace
+	mounts        []sandboxMount
 	netStack      *stack.Stack
 	natForwarder  *netbackend.NATForwarder
 	portForwarder *netbackend.PortForwarder
@@ -56,7 +58,7 @@ type Sandbox struct {
 }
 
 // New initializes a Sandbox. It opens the execution platform, the EROFS layer
-// handles, the /workspace os.Root, the network sockets, and the kernel
+// handles, the os.Root of every bind and volume mount, the network sockets, and the kernel
 // MemoryFile, then locks down the host process unless
 // Config.DisableHostLockdown is set. Every host handle exists before the
 // lockdown call because the lockdown denies new host file opens.
@@ -82,12 +84,8 @@ func New(ctx context.Context, cfg Config) (*Sandbox, error) {
 		return cleanup(err)
 	}
 
-	if cfg.WorkspacePath != "" {
-		ws, err := hostfs.OpenWorkspace(cfg.WorkspacePath, cfg.WorkspaceReadOnly)
-		if err != nil {
-			return cleanup(fmt.Errorf("gvx: open workspace %q: %w", cfg.WorkspacePath, err))
-		}
-		sb.workspace = ws
+	if err := sb.openMounts(); err != nil {
+		return cleanup(err)
 	}
 
 	if err := sb.initNetstack(); err != nil {
@@ -190,8 +188,7 @@ func openHVF() (platform.Platform, string, error) {
 // socket to reach the peer port. The none mode gets no outbound access.
 func (s *Sandbox) lockdownOptions() hostlockdown.Options {
 	opts := hostlockdown.Options{
-		WorkspacePath:        s.cfg.WorkspacePath,
-		WorkspaceReadOnly:    s.cfg.WorkspaceReadOnly,
+		Mounts:               s.hostMounts(),
 		AllowOutboundNet:     s.cfg.NetworkMode == NetModeNAT,
 		InstallSyscallFilter: s.syscallFilter(),
 	}
@@ -217,7 +214,8 @@ func (s *Sandbox) Stack() *stack.Stack {
 	return s.netStack
 }
 
-// Workspace returns the Sandbox's /workspace hostfs.Workspace handle.
+// Workspace returns the hostfs.Workspace handle of the mount at /workspace. It
+// returns nil when no bind or volume mount uses /workspace.
 func (s *Sandbox) Workspace() *hostfs.Workspace {
 	return s.workspace
 }
@@ -254,7 +252,7 @@ func (s *Sandbox) Run(ctx context.Context) (int, error) {
 }
 
 // Close releases all host handles owned by the Sandbox: port forwarders,
-// WireGuard endpoint, Netstack, /workspace os.Root, EROFS layer handles, and
+// WireGuard endpoint, Netstack, the os.Root of every mount, EROFS layer handles, and
 // the hypervisor platform.
 func (s *Sandbox) Close() error {
 	s.mu.Lock()
@@ -292,11 +290,8 @@ func (s *Sandbox) Close() error {
 		s.netStack = nil
 	}
 
-	if s.workspace != nil {
-		if err := s.workspace.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		s.workspace = nil
+	if err := s.closeMounts(); err != nil {
+		errs = append(errs, err)
 	}
 
 	for _, hh := range s.layerHandles {

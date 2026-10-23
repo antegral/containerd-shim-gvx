@@ -28,6 +28,7 @@ import (
 
 	gvcontext "z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/errors/linuxerr"
+	"z.gfire.dev/gvx/pkg/hostlockdown"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 	"z.gfire.dev/gvx/pkg/sentry/vfs"
 	"z.gfire.dev/gvx/pkg/usermem"
@@ -205,12 +206,18 @@ func TestLockdownOptionsByNetworkMode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sb := &Sandbox{
-				cfg:        Config{NetworkMode: tc.mode, WorkspacePath: "/ws", WorkspaceReadOnly: true},
+				cfg: Config{NetworkMode: tc.mode},
+				mounts: []sandboxMount{
+					{Mount: Mount{Kind: MountBind, GuestPath: "/workspace", ReadOnly: true}, hostPath: "/ws"},
+					{Mount: Mount{Kind: MountTmpfs, GuestPath: "/scratch"}},
+					{Mount: Mount{Kind: MountVolume, GuestPath: "/vol"}, hostPath: "/vols/data"},
+				},
 				wgPeerPort: tc.peerPort,
 			}
 			opts := sb.lockdownOptions()
-			if opts.AllowOutboundNet != tc.wantOutbound || opts.WorkspacePath != "/ws" || !opts.WorkspaceReadOnly || !slices.Equal(opts.OutboundUDPPorts, tc.wantUDPPorts) {
-				t.Fatalf("lockdownOptions() = %+v, want AllowOutboundNet=%v WorkspacePath=/ws WorkspaceReadOnly OutboundUDPPorts=%v", opts, tc.wantOutbound, tc.wantUDPPorts)
+			wantMounts := []hostlockdown.HostMount{{Path: "/ws", ReadOnly: true}, {Path: "/vols/data"}}
+			if opts.AllowOutboundNet != tc.wantOutbound || !slices.Equal(opts.Mounts, wantMounts) || !slices.Equal(opts.OutboundUDPPorts, tc.wantUDPPorts) {
+				t.Fatalf("lockdownOptions() = %+v, want AllowOutboundNet=%v Mounts=%v OutboundUDPPorts=%v", opts, tc.wantOutbound, wantMounts, tc.wantUDPPorts)
 			}
 		})
 	}
