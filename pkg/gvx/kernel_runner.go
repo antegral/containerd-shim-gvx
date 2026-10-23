@@ -487,6 +487,12 @@ func (s *Sandbox) runWithKernel(ctx context.Context, argv []string) (int, error)
 
 	tg, _, err := k.CreateProcess(procArgs)
 	if err != nil {
+		read := func(path string, maxBytes int) ([]byte, error) {
+			return readGuestFile(sctxWithRoot, vfsObj, creds, root, path, maxBytes)
+		}
+		if hint := s.nonPIEHintForGuestFile(read, execPath); hint != "" {
+			err = fmt.Errorf("%w; %s", err, hint)
+		}
 		return 1, fmt.Errorf("gvx: create guest process %q: %w", execPath, err)
 	}
 

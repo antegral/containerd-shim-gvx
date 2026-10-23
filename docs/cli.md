@@ -160,6 +160,7 @@ The layer cache is the image store. It holds the compiled EROFS layers, one reco
 | `docker save` of any image | The command needs the registry that the image came from. |
 | Cgroup limits | `--memory` is a guard with a delay. `--cpus` caps the CPU time on Windows only. |
 | Guest architecture | Must equal the host architecture, except with `-platform=systrap`. |
+| Executables that link at a fixed address (non-PIE) | The macOS `systrap` engine refuses them, and the error names `-platform=hvf`. `hvf`, `whpx`, and the Windows `systrap` engine run them. |
 | Writes to the root file system | Lost at exit. Use a mount for data that must stay. |
 
 ## 8. Examples
