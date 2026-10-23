@@ -58,11 +58,12 @@ type PlatformSpec struct {
 
 // Descriptor describes a content-addressable blob in an OCI Image Index or Manifest.
 type Descriptor struct {
-	MediaType string        `json:"mediaType"`
-	Digest    string        `json:"digest"`
-	Size      int64         `json:"size"`
-	URLs      []string      `json:"urls,omitempty"`
-	Platform  *PlatformSpec `json:"platform,omitempty"`
+	MediaType   string            `json:"mediaType"`
+	Digest      string            `json:"digest"`
+	Size        int64             `json:"size"`
+	URLs        []string          `json:"urls,omitempty"`
+	Platform    *PlatformSpec     `json:"platform,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // ImageIndex represents an OCI Image Index or Docker Manifest List.
@@ -127,8 +128,10 @@ func (c RuntimeConfig) ExposedPortList() []ExposedPort {
 type imageConfigFile struct {
 	Architecture string        `json:"architecture"`
 	OS           string        `json:"os"`
+	Created      string        `json:"created"`
 	Config       RuntimeConfig `json:"config"`
 	RootFS       struct {
+		Type    string   `json:"type"`
 		DiffIDs []string `json:"diff_ids"`
 	} `json:"rootfs"`
 }
@@ -395,9 +398,15 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 
 	// A digest names immutable content, so a cached image needs no network.
 	if isDigestRef(reference) {
-		if img, err := cache.loadImageByDigest(baseURL, repository, reference, targetArch); err == nil {
+		img, err := cache.loadImageByDigest(baseURL, repository, reference, targetArch)
+		switch {
+		case err == nil:
+			if err := cache.storeTag(baseURL, repository, reference, targetArch, reference); err != nil {
+				_ = img.Close()
+				return nil, err
+			}
 			return img, nil
-		} else if !errors.Is(err, ErrNotCached) {
+		case !errors.Is(err, ErrNotCached):
 			return nil, err
 		}
 	}
@@ -487,10 +496,8 @@ func PullRegistryImage(ctx context.Context, client *http.Client, baseURL, reposi
 	}); err != nil {
 		return nil, err
 	}
-	if !isDigestRef(reference) {
-		if err := cache.storeTag(baseURL, repository, reference, targetArch, digest); err != nil {
-			return nil, err
-		}
+	if err := cache.storeTag(baseURL, repository, reference, targetArch, digest); err != nil {
+		return nil, err
 	}
 	return cache.finishImage(targetArch, cfg, digest, digests)
 }
