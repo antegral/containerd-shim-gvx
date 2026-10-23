@@ -56,7 +56,13 @@ type testMM struct {
 	as platform.AddressSpace
 }
 
-func (*testMM) MMap(context.Context, memmap.MMapOpts) (hostarch.Addr, error) {
+// MMap accepts a mapping at a fixed address, which the trampoline islands of
+// the fast path need. The tests map their own pages at fixed addresses, and the
+// island allocator keeps 2MB away from the code that it serves.
+func (*testMM) MMap(_ context.Context, opts memmap.MMapOpts) (hostarch.Addr, error) {
+	if opts.Fixed {
+		return opts.Addr, nil
+	}
 	return 0, unix.ENOSYS
 }
 

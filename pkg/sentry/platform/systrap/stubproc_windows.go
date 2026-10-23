@@ -36,8 +36,9 @@ const (
 	winLimit = uint64(0x7EE000000000)
 
 	// internalSize is the part of the window that the engine keeps for itself,
-	// at the top. The guest never sees it, because MaxUserAddress lies below it.
-	internalSize = uint64(0x10000)
+	// at the top: the engine pages, then one area for each fast thread. The
+	// guest never sees it, because MaxUserAddress lies below it.
+	internalSize = uint64(winArenaSize)
 	internalBase = winLimit - internalSize
 
 	// lowBase and lowLimit bound the low guest window. A non-PIE executable
@@ -52,7 +53,7 @@ const (
 
 	// codeSize is the size of the executable part of the engine pages. The
 	// data pages follow it.
-	codeSize = 0x4000
+	codeSize = winCodeSize
 
 	// startTimeout bounds the wait for a new stub process or thread to reach its
 	// first stop.
@@ -90,6 +91,13 @@ type stubProc struct {
 	// internal is the section behind the engine pages of the window.
 	internal *anonSection
 
+	// owner is the address space of the stub. The thread code reads the
+	// trampoline islands through it.
+	owner atomic.Pointer[addressSpace]
+
+	// fast holds the fast slots of the stub. Callers hold mu.
+	fast fastSlots
+
 	archProc
 }
 
@@ -100,13 +108,15 @@ func (sp *stubProc) thread(tid uint32) *thread {
 	return sp.threads[tid]
 }
 
-// markDead records the death of the stub and wakes every waiter.
+// markDead records the death of the stub and wakes every waiter, including a
+// Sentry thread that sleeps on the event of a fast thread.
 func (sp *stubProc) markDead(err error) {
 	if sp.dead.Swap(true) {
 		return
 	}
 	sp.deadErr.Store(&err)
 	close(sp.deadCh)
+	sp.wakeFastThreads()
 }
 
 func (sp *stubProc) deathError() error {

@@ -88,6 +88,11 @@ type addressSpace struct {
 	// until the address space is released.
 	copies []*anonSection
 
+	// islands holds the pages of trampoline slots, by base address. reserved
+	// holds the island addresses that a pending mm.MMap call creates.
+	islands  map[uint64]*island
+	reserved map[uint64]struct{}
+
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
 }
@@ -182,11 +187,14 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 		wins = append(wins, newWindowMap(stubView{sp.proc}, lowBase, lowLimit))
 	}
 	as := &addressSpace{
-		p:      p,
-		sp:     sp,
-		win:    newGuestWindows(wins...),
-		blocks: make(map[uint64]*execBlock),
+		p:        p,
+		sp:       sp,
+		win:      newGuestWindows(wins...),
+		blocks:   make(map[uint64]*execBlock),
+		islands:  make(map[uint64]*island),
+		reserved: make(map[uint64]struct{}),
 	}
+	sp.owner.Store(as)
 	pagesStart := time.Now()
 	defer func() { bringUpStats.pagesNs.Add(uint64(time.Since(pagesStart))) }()
 	if err := as.setupInternal(); err != nil {
@@ -199,17 +207,20 @@ func newAddressSpace(p *Platform) (*addressSpace, error) {
 // setupInternal maps the engine pages: one page of code and the pages of the
 // per-thread data slots. The arch file writes the code.
 func (as *addressSpace) setupInternal() error {
-	sec, err := newAnonSection(internalSize)
+	sec, err := newAnonSection(winEnginePagesSize)
 	if err != nil {
 		return err
 	}
 	as.internal = sec
 	as.sp.internal = sec
 	writeInternalCode(sec.local[:codeSize])
+	if as.p.fast {
+		copy(sec.local[winSpillOffset:], as.p.spill.code)
+	}
 	if err := as.win.Map(internalBase, codeSize, &sec.ref, 0, viewReadExec); err != nil {
 		return err
 	}
-	if err := as.win.Map(internalBase+codeSize, internalSize-codeSize, &sec.ref, codeSize, viewReadWrite); err != nil {
+	if err := as.win.Map(internalBase+codeSize, winEnginePagesSize-codeSize, &sec.ref, codeSize, viewReadWrite); err != nil {
 		return err
 	}
 	return flushInstructionCache(as.sp.proc, uintptr(internalBase), codeSize)
@@ -248,6 +259,11 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	}
 	if as.sp.dead.Load() {
 		return as.sp.deathError()
+	}
+	if skip, err := as.islandRange(guest, fr.Length()); skip || err != nil {
+		// The memory manager populates the sealed mapping of a trampoline
+		// island like any other mapping. The island keeps its own private page.
+		return err
 	}
 	// A file with a host handle maps through a section of that file. Any other
 	// file, such as a workspace file of hostfs, maps through a copy of its
@@ -366,6 +382,7 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 			as.dropBlockLocked(base)
 		}
 	}
+	as.dropIslandsLocked(start, end)
 }
 
 // Release implements platform.AddressSpace.Release.
@@ -381,6 +398,7 @@ func (as *addressSpace) Release() {
 	// Terminating the process stops every thread, so no stub thread touches
 	// the pages that go back to the pool below.
 	as.sp.destroy()
+	as.sp.closeFast()
 	as.mu.Lock()
 	defer as.mu.Unlock()
 	for base := range as.blocks {
@@ -394,6 +412,7 @@ func (as *addressSpace) Release() {
 		c.close()
 	}
 	as.copies = nil
+	as.releaseIslandsLocked()
 }
 
 // PreFork implements platform.AddressSpace.PreFork.

@@ -18,6 +18,7 @@ package systrap
 
 import (
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -65,6 +66,14 @@ func (c *Context) threadIn(as *addressSpace) (*thread, error) {
 	th, err := as.sp.newGuestThread()
 	if err != nil {
 		return nil, err
+	}
+	if as.p.fast {
+		// Every thread of a stub that runs patched code needs its slot, because
+		// the spill routine finds the winSysmsg of the thread through the TEB.
+		if err := as.attachFast(th); err != nil {
+			th.destroy()
+			return nil, err
+		}
 	}
 	c.th.Store(th)
 	c.needRestoreFP = true
@@ -127,21 +136,26 @@ func (c *Context) Switch(ctx context.Context, mm platform.MemoryManager, ac *arc
 		// Switch tests the flag after it starts the thread, and a kick tests the
 		// state of the thread after it sets the flag, so one of the two sees the other.
 		if c.kicked.Load() {
-			th.forceStop()
+			c.stopThread(th)
 		}
 		for {
 			var waited time.Time
 			if traceEvents {
 				waited = time.Now()
 			}
-			ev, err := th.waitEvent(0)
+			ev, trapped, err := th.waitNext()
 			if err != nil {
 				return nil, hostarch.NoAccess, errDeadContext
 			}
-			if traceEvents {
-				stopStats.waitNs[kindOf(ev)].Add(uint64(time.Since(waited)))
+			var out outcome
+			if trapped {
+				out = c.fastTrap(as, th, ac)
+			} else {
+				if traceEvents {
+					stopStats.waitNs[kindOf(ev)].Add(uint64(time.Since(waited)))
+				}
+				out = c.handleEvent(ctx, mm, as, th, ac, ev)
 			}
-			out := c.handleEvent(ctx, mm, as, th, ac, ev)
 			if out.done {
 				if traceAll && !traceMuted.Load() {
 					tracef("pid %d thread %d: switch returns, signal %v, error %v", th.sp.pid, th.tid, out.si != nil, out.err)
@@ -240,10 +254,10 @@ func (th *thread) stopAndPull(ac *arch.Context64, ev debugEvent) error {
 // stepStop serves a single-step stop. The stop belongs to a forced stop of the
 // thread, so the Sentry reports an interrupt.
 func (c *Context) stepStop(th *thread, ac *arch.Context64, ev debugEvent) outcome {
-	if th.stepping && th.inEngineCode(th.ctx.pc()) {
+	if th.stepping && !th.rewindToSite() && th.inEngineCode(th.ctx.pc()) {
 		// The thread runs engine code that the Sentry planted. Step on until
 		// it reaches guest code, where its registers are the guest registers.
-		if err := th.continueEvent(ev); err != nil {
+		if err := th.continueUnchanged(ev); err != nil {
 			return fatal(err, unix.EFAULT)
 		}
 		return running
@@ -339,7 +353,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 			// A fault that repeats means that the fetch reaches a block that
 			// the guest did not map for execution.
 			if patched || th.execRepeats <= execRetryLimit {
-				if err := th.continueEvent(ev); err != nil {
+				if err := th.continueUnchanged(ev); err != nil {
 					return fatal(err, unix.EFAULT)
 				}
 				return running
@@ -361,7 +375,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		if ok, err := as.restoreData(base); err != nil {
 			return fatal(err, unix.ENOMEM)
 		} else if ok {
-			if err := th.continueEvent(ev); err != nil {
+			if err := th.continueUnchanged(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running
@@ -369,7 +383,7 @@ func (c *Context) faultStop(ctx context.Context, mm platform.MemoryManager, as *
 		// A writable data state means that another thread restored the block
 		// after this thread faulted, so the write retries.
 		if st, at, ok := as.blockStateOf(base); ok && st == blockData && at.Write {
-			if err := th.continueEvent(ev); err != nil {
+			if err := th.continueUnchanged(ev); err != nil {
 				return fatal(err, unix.EFAULT)
 			}
 			return running
@@ -428,7 +442,26 @@ func (c *Context) Interrupt() {
 func (c *Context) NotifyInterrupt() {
 	c.kicked.Store(true)
 	if th := c.th.Load(); th != nil {
-		th.forceStop()
+		c.stopThread(th)
+	}
+}
+
+// stopThread forces a stop of a running thread. A thread can run the code of a
+// trap, which publishes its own stop. The call tries again until the thread
+// leaves that code or publishes the trap, which Switch serves.
+func (c *Context) stopThread(th *thread) {
+	for i := 0; !th.forceStop(); i++ {
+		if f := th.fast.Load(); f != nil && f.slot.sm.loadState() == winStateTrapped {
+			return
+		}
+		if !c.kicked.Load() {
+			return
+		}
+		if i < 64 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(10 * time.Microsecond)
+		}
 	}
 }
 
@@ -445,7 +478,12 @@ func (c *Context) PullFullState(_ platform.AddressSpace, ac *arch.Context64) err
 	}
 	th.mu.Lock()
 	defer th.mu.Unlock()
-	if err := th.getContext(th.ctx.fpFlags()); err != nil {
+	if f := th.fast.Load(); f != nil && f.inSpill {
+		// The thread runs in the spill routine, so its registers are live.
+		if err := th.getLiveFP(); err != nil {
+			return err
+		}
+	} else if err := th.getContext(th.ctx.fpFlags()); err != nil {
 		return err
 	}
 	th.ctx.storeFP(ac)

@@ -49,6 +49,9 @@ const (
 	brkICIVAU  = 0x5c2
 	brkSetTLS  = 0x5c3
 	brkMSRTLS  = 0x5c4
+	// brkMRSTLS replaces `mrs xN, tpidr_el0` when the fast path has no slot for
+	// it. 0x5c5 belongs to the cold resume of the fast path.
+	brkMRSTLS = 0x5c6
 
 	arm64ICIVAU = 0xd50b7520 // ic ivau, xN with N in bits 4:0.
 
@@ -117,9 +120,15 @@ func (th *thread) setTLS(value uint64) error {
 	return nil
 }
 
-// archStart makes TPIDR_EL0 of the thread equal to the TLS value of ac.
+// archStart makes TPIDR_EL0 of the thread equal to the TLS value of ac. A fast
+// thread keeps the address of its sysmsg there, and the guest value goes to the
+// TLS word of the sysmsg.
 func (th *thread) archStart(ac *arch.Context64) error {
 	want := ac.StateData().Regs.TPIDR_EL0
+	if f := th.fast.Load(); f != nil {
+		f.slot.sm.TLS = want
+		want = f.slot.va
+	}
 	if th.tlsKnown && th.tls == want {
 		return nil
 	}
@@ -128,13 +137,18 @@ func (th *thread) archStart(ac *arch.Context64) error {
 
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(ac *arch.Context64) {
+	if f := th.fast.Load(); f != nil {
+		ac.StateData().Regs.TPIDR_EL0 = f.slot.sm.TLS
+		return
+	}
 	if th.tlsKnown {
 		ac.StateData().Regs.TPIDR_EL0 = th.tls
 	}
 }
 
-// inEngineCode reports whether pc lies in the engine pages.
-func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) }
+// inEngineCode reports whether pc lies in the engine pages or in a trampoline
+// island.
+func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) || th.inIslandPC(pc) }
 
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS. arm64 has no
 // GS register.
@@ -144,6 +158,9 @@ func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) err
 func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent) (outcome, bool) {
 	if ev.Code != statusIllegalInsn && ev.Code != statusBreakpoint {
 		return outcome{}, false
+	}
+	if th.isFastExit(ev) {
+		return th.fastExit(ac, ev), true
 	}
 	site, ok := as.siteAt(ev.Addr)
 	if !ok {
@@ -175,6 +192,15 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 			v = th.ctx.reg(int(site.reg))
 		}
 		th.ctx.setPC(pc + 4)
+		if f := th.fast.Load(); f != nil {
+			// The register of the thread keeps the address of the sysmsg. The
+			// guest thread pointer lives in the sysmsg.
+			f.slot.sm.TLS = v
+			if err := th.continueEvent(ev); err != nil {
+				return fatal(err, unix.EFAULT), true
+			}
+			return running, true
+		}
 		if err := th.park(ev); err != nil {
 			return fatal(err, unix.EFAULT), true
 		}
@@ -185,6 +211,11 @@ func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent)
 			return fatal(err, unix.EFAULT), true
 		}
 		return running, true
+	case siteMRS:
+		// A read of the guest thread pointer that no slot serves.
+		if f := th.fast.Load(); f != nil && site.reg != 31 {
+			th.ctx.setReg(int(site.reg), f.slot.sm.TLS)
+		}
 	default:
 		return outcome{}, false
 	}
@@ -215,18 +246,37 @@ type siteInfo struct {
 }
 
 // patchPage replaces the instructions that Windows cannot run with BRK or
-// NOP. page is a copy of the original frame.
-func (as *addressSpace) patchPage(_ context.Context, _ platform.MemoryManager, _ uint64, page []byte) (map[uint16]siteInfo, error) {
+// NOP. page is a copy of the original frame. With the fast path, each `svc #0`
+// becomes a branch to a trampoline slot, and a site without a slot keeps the
+// BRK.
+func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, error) {
 	sites := make(map[uint16]siteInfo)
 	for _, s := range scanARM64(page) {
 		var imm uint32
 		switch s.Kind {
 		case siteSVC:
+			if as.p.fast {
+				if word, ok := as.fastBranch(ctx, mm, base+uint64(s.Offset)); ok {
+					binary.LittleEndian.PutUint32(page[s.Offset:], word)
+					continue
+				}
+			}
 			imm = brkSyscall
 		case siteCTR:
 			imm = brkCTR
 		case siteMSR:
 			imm = brkMSRTLS
+		case siteMRS:
+			// With the fast path, TPIDR_EL0 holds the address of the sysmsg, so
+			// the guest reads its thread pointer through a slot or a trap.
+			if !as.p.fast || s.Reg == 31 {
+				continue
+			}
+			if word, ok := as.fastTLSBranch(ctx, mm, base+uint64(s.Offset), s.Reg); ok {
+				binary.LittleEndian.PutUint32(page[s.Offset:], word)
+				continue
+			}
+			imm = brkMRSTLS
 		default:
 			// Reads of TPIDR_EL0 run natively.
 			continue
@@ -247,6 +297,64 @@ func (as *addressSpace) patchPage(_ context.Context, _ platform.MemoryManager, _
 	}
 	return sites, nil
 }
+
+// fastTLSBranch allocates a slot for the `mrs xN, tpidr_el0` at site and
+// returns the branch that replaces the instruction.
+func (as *addressSpace) fastTLSBranch(ctx context.Context, mm platform.MemoryManager, site uint64, reg uint8) (uint32, bool) {
+	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
+		return encodeWinTLSSlot(buf, slotVA, site, reg)
+	})
+	var word uint32
+	if err == nil {
+		word, err = encodeBranch(site, slotVA)
+	}
+	if err != nil {
+		if traceEvents {
+			tracef("no trampoline slot for the mrs at %#x: %v", site, err)
+		}
+		return 0, false
+	}
+	return word, true
+}
+
+// fastBranch allocates a trampoline slot for the `svc #0` at site and returns
+// the branch that replaces the instruction.
+func (as *addressSpace) fastBranch(ctx context.Context, mm platform.MemoryManager, site uint64) (uint32, bool) {
+	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
+		return encodeWinSlot(buf, slotVA, site, as.p.spillVA())
+	})
+	var word uint32
+	if err == nil {
+		word, err = encodeBranch(site, slotVA)
+	}
+	if err != nil {
+		if traceEvents {
+			tracef("no trampoline slot for the svc at %#x: %v", site, err)
+		}
+		return 0, false
+	}
+	return word, true
+}
+
+// newWinTrap describes the trap of the `svc #0` at site.
+func newWinTrap(site uint64, regs *winRegs) winTrap {
+	return winTrap{site: site, ret: winSiteReturn(site), sp: regs.SP}
+}
+
+// archFastTrap adds the arm64 state to the registers of a fast trap.
+func (th *thread) archFastTrap(ac *arch.Context64) { th.pullArch(ac) }
+
+// archFastHot reports whether the thread can resume without a debug stop. The
+// Sentry writes the TLS word of the sysmsg at each start, so the TLS value never
+// forces a cold resume.
+func (th *thread) archFastHot(*arch.Context64) bool { return true }
+
+// archPC returns the program counter of ac.
+func archPC(ac *arch.Context64) uint64 { return ac.StateData().Regs.Pc }
+
+// archAttachFast has nothing to write. The first start sets TPIDR_EL0 to the
+// address of the sysmsg, which names the page to the spill routine.
+func (th *thread) archAttachFast(*fastSlot) error { return nil }
 
 func movzImm(rd, imm uint32) uint32 { return 0xd2800000 | imm<<5 | rd }
 func subsImm1(rd uint32) uint32     { return 0xf1000400 | rd<<5 | rd }

@@ -57,10 +57,17 @@ const (
 	fsRepairLimit = 8
 
 	// slotBase is the offset of the data slots, and slotStride is the size of
-	// one slot: the guest rax, then the guest rip. The code pages hold
-	// maxSlots*trampStride bytes, so the data starts right behind them.
+	// one slot: the guest rax, then the guest rip. The data pages follow the
+	// code pages.
 	slotBase   = codeSize
 	slotStride = 16
+)
+
+// The trampolines end where the spill routine starts, and the data slots fit in
+// the data pages of the engine.
+var (
+	_ = [winSpillOffset - maxSlots*trampStride]struct{}{}
+	_ = [winEnginePagesSize - slotBase - maxSlots*slotStride]struct{}{}
 )
 
 // fetchWindow is the longest instruction in bytes. A fetch of one instruction
@@ -171,8 +178,9 @@ func (th *thread) archStart(ac *arch.Context64) error {
 // pullArch completes the copy of the registers into ac.
 func (th *thread) pullArch(*arch.Context64) {}
 
-// inEngineCode reports whether pc lies in the engine pages.
-func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) }
+// inEngineCode reports whether pc lies in the engine pages or in a trampoline
+// island.
+func (th *thread) inEngineCode(pc uint64) bool { return inInternal(pc) || th.inIslandPC(pc) }
 
 // UserModifiedGS implements platform.AddressSpace.UserModifiedGS. Windows uses
 // the GS base for the TEB, so a guest cannot set it.
@@ -184,6 +192,9 @@ func (*addressSpace) UserModifiedGS(context.Context, platform.MemoryManager) err
 func (th *thread) archEvent(as *addressSpace, ac *arch.Context64, ev debugEvent) (outcome, bool) {
 	if ev.Code != statusBreakpoint || ev.State == dbgStateSingleStep {
 		return outcome{}, false
+	}
+	if th.isFastExit(ev) {
+		return th.fastExit(ac, ev), true
 	}
 	site, ok := as.siteAt(ev.Addr)
 	if !ok {
@@ -314,19 +325,39 @@ type siteInfo struct {
 }
 
 // patchPage replaces the SYSCALL and RDFSBASE instructions of one page with
-// traps. page is a copy of the original frame.
+// traps. page is a copy of the original frame. With the fast path, a SYSCALL
+// whose following instructions can move becomes a JMP to a trampoline slot,
+// and every other SYSCALL keeps the trap.
 func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager, base uint64, page []byte) (map[uint16]siteInfo, error) {
 	before := as.neighborBytes(base, true, amd64MaxInsnLen)
 	after := as.neighborBytes(base, false, amd64MaxInsnLen)
 	found := scanAMD64(before, page, after)
 	scope := as.p.scopeOf(ctx, mm, base)
+	var plan *jmpPlanner
+	if as.p.fast {
+		// The plan reads the original bytes, because an earlier patch changes
+		// the page.
+		plan = newJmpPlanner(before, append([]byte(nil), page...), after)
+	}
 	var keep []amd64Site
 	sites := make(map[uint16]siteInfo, len(found))
+	// jumpEnd is the end of the bytes that the last JMP patch owns.
+	jumpEnd := 0
 	for _, s := range found {
 		// A file image proves which bytes are code. Anonymous memory and files
 		// without section headers give no proof, and the decoder alone decides.
 		if scope.proven() && !scope.containsRange(base+uint64(max(s.Offset, 0)), uint64(s.Len)) {
 			continue
+		}
+		if jumpEnd > 0 && s.Offset < jumpEnd {
+			// The bytes of this site belong to the previous slot.
+			continue
+		}
+		if as.p.fast && s.Kind == amd64SiteSyscall && s.Offset >= 0 {
+			if end, ok := as.patchJump(ctx, mm, base, plan, page, s.Offset); ok {
+				jumpEnd = end
+				continue
+			}
 		}
 		keep = append(keep, s)
 		if s.Offset >= 0 {
@@ -338,6 +369,75 @@ func (as *addressSpace) patchPage(ctx context.Context, mm platform.MemoryManager
 	}
 	return sites, nil
 }
+
+// patchJump replaces the SYSCALL at offset off of page with a JMP to a new
+// slot. It returns the end of the bytes that the patch owns, or false when the
+// site keeps its trap.
+func (as *addressSpace) patchJump(ctx context.Context, mm platform.MemoryManager, base uint64, plan *jmpPlanner, page []byte, off int) (int, bool) {
+	if hasPrefixBefore(plan.before, plan.page, off) {
+		// A prefix would apply to the JMP.
+		return 0, false
+	}
+	reloc, ok := plan.plan(off)
+	if !ok {
+		return 0, false
+	}
+	site := base + uint64(off)
+	slotVA, err := as.installSlot(ctx, mm, site, func(buf []byte, slotVA uint64) error {
+		return encodeWinSlot(buf, slotVA, site, as.p.spillVA(), reloc)
+	})
+	if err == nil {
+		err = patchJmp(page, off, site, slotVA)
+	}
+	if err != nil {
+		if traceEvents {
+			tracef("no trampoline slot for the SYSCALL at %#x: %v", site, err)
+		}
+		return 0, false
+	}
+	return off + winSiteLen + len(reloc), true
+}
+
+// hasPrefixBefore reports whether the byte in front of page[off] is an
+// instruction prefix, a legacy prefix or REX.
+func hasPrefixBefore(before, page []byte, off int) bool {
+	var b byte
+	switch {
+	case off > 0:
+		b = page[off-1]
+	case len(before) > 0:
+		b = before[len(before)-1]
+	default:
+		return false
+	}
+	switch {
+	case b >= 0x40 && b <= 0x4F:
+		return true
+	}
+	switch b {
+	case 0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65:
+		return true
+	}
+	return false
+}
+
+// newWinTrap describes the trap of the SYSCALL at site.
+func newWinTrap(site uint64, _ *winRegs) winTrap {
+	return winTrap{site: site, ret: winSiteReturn(site)}
+}
+
+// archFastTrap adds the amd64 state to the registers of a fast trap.
+func (th *thread) archFastTrap(*arch.Context64) { th.fsFix.n = 0 }
+
+// archFastHot reports whether the thread can resume without a debug stop. The
+// stub loads the FS base on every return.
+func (th *thread) archFastHot(*arch.Context64) bool { return true }
+
+// archPC returns the program counter of ac.
+func archPC(ac *arch.Context64) uint64 { return ac.StateData().Regs.Rip }
+
+// archAttachFast names the winSysmsg to the spill routine through the TEB.
+func (th *thread) archAttachFast(slot *fastSlot) error { return th.writeTEBSysmsg(slot.va) }
 
 // probeProgram returns the guest code of Probe: calls system calls with
 // number 5, then one with number 6.

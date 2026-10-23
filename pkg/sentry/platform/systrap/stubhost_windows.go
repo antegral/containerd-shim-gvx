@@ -49,6 +49,7 @@ const (
 	opNewStub   = 1
 	opSetDebug  = 2
 	opRelease   = 3
+	opNewEvents = 4
 	hostReqSize = 16
 	// hostProtocolVersion is the version of the pipe protocol.
 	hostProtocolVersion = 1
@@ -94,6 +95,8 @@ type stubHostLoop struct {
 	level  confinement
 	exe    string
 	jobs   map[uint32]windows.Handle
+	// procs holds a handle to each live stub, to duplicate event handles into it.
+	procs map[uint32]windows.Handle
 	// debug is the debug object of the Sentry, in the handle table of the host.
 	debug windows.Handle
 }
@@ -101,7 +104,7 @@ type stubHostLoop struct {
 // runStubHost serves requests until the Sentry closes the pipe. It returns the
 // process exit code.
 func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
-	h := &stubHostLoop{jobs: make(map[uint32]windows.Handle)}
+	h := &stubHostLoop{jobs: make(map[uint32]windows.Handle), procs: make(map[uint32]windows.Handle)}
 	sentry, err := windows.OpenProcess(windows.PROCESS_DUP_HANDLE, false, sentryPID)
 	if err != nil {
 		return 3
@@ -126,6 +129,9 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 			for pid := range h.jobs {
 				h.release(pid)
 			}
+			for pid := range h.procs {
+				h.release(pid)
+			}
 			return 0
 		}
 		if binary.LittleEndian.Uint32(req[0:]) != hostMagic {
@@ -141,6 +147,20 @@ func runStubHost(sentryPID uint32, in io.Reader, out io.Writer) int {
 		case opRelease:
 			h.release(uint32(binary.LittleEndian.Uint64(req[8:])))
 			if err := writeHostReply(out, 0, nil, h.level); err != nil {
+				return 6
+			}
+			continue
+		case opNewEvents:
+			ev, err := h.newEvents(uint32(binary.LittleEndian.Uint64(req[8:])))
+			var errno uint32
+			if err != nil {
+				errno = uint32(windows.ERROR_GEN_FAILURE)
+				var e windows.Errno
+				if errors.As(err, &e) {
+					errno = uint32(e)
+				}
+			}
+			if err := writeEventsReply(out, errno, ev); err != nil {
 				return 6
 			}
 			continue
@@ -233,12 +253,59 @@ func buildStubToken() (windows.Token, confinement, error) {
 	return restricted, confineToken, nil
 }
 
-// release closes the job of a stub that the Sentry destroyed.
+// release closes the job and the process handle of a stub that the Sentry
+// destroyed.
 func (h *stubHostLoop) release(pid uint32) {
 	if job, ok := h.jobs[pid]; ok {
 		_ = windows.CloseHandle(job)
 		delete(h.jobs, pid)
 	}
+	if proc, ok := h.procs[pid]; ok {
+		_ = windows.CloseHandle(proc)
+		delete(h.procs, pid)
+	}
+}
+
+// eventStubAccess is the right of a stub on an event: it sets and waits.
+const eventStubAccess = 0x100002 // EVENT_MODIFY_STATE | SYNCHRONIZE
+
+// newEvents creates one auto-reset event pair and duplicates it into the stub
+// with the given process ID and into the Sentry.
+func (h *stubHostLoop) newEvents(pid uint32) (out eventHandles, err error) {
+	proc, ok := h.procs[pid]
+	if !ok {
+		return eventHandles{}, windows.ERROR_NOT_FOUND
+	}
+	var inSentry []windows.Handle
+	defer func() {
+		if err != nil {
+			// Close the events that already reached the Sentry. The stub copies
+			// die with the stub.
+			for _, ev := range inSentry {
+				_ = windows.DuplicateHandle(h.sentry, ev, 0, nil, 0, false, windows.DUPLICATE_CLOSE_SOURCE)
+			}
+			out = eventHandles{}
+		}
+	}()
+	self := windows.CurrentProcess()
+	for _, d := range []struct{ stub, sentry *windows.Handle }{
+		{&out.stubGuest, &out.guest},
+		{&out.stubHost, &out.host},
+	} {
+		ev, err := ntCreateAutoResetEvent()
+		if err != nil {
+			return out, err
+		}
+		defer windows.CloseHandle(ev)
+		if err := windows.DuplicateHandle(self, ev, proc, d.stub, eventStubAccess, false, 0); err != nil {
+			return out, fmt.Errorf("DuplicateHandle(event to the stub): %w", err)
+		}
+		if err := windows.DuplicateHandle(self, ev, h.sentry, d.sentry, 0, false, windows.DUPLICATE_SAME_ACCESS); err != nil {
+			return out, fmt.Errorf("DuplicateHandle(event to the Sentry): %w", err)
+		}
+		inSentry = append(inSentry, *d.sentry)
+	}
+	return out, nil
 }
 
 // newStub creates one confined, suspended stub process and returns handles in
@@ -252,7 +319,12 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer windows.CloseHandle(pi.Process)
+	keepProc := false
+	defer func() {
+		if !keepProc {
+			_ = windows.CloseHandle(pi.Process)
+		}
+	}()
 	defer windows.CloseHandle(pi.Thread)
 
 	job, err := createStubJob()
@@ -288,6 +360,8 @@ func (h *stubHostLoop) newStub() (*stubHandles, error) {
 		_ = windows.TerminateProcess(pi.Process, 1)
 		return nil, fmt.Errorf("DuplicateHandle(thread): %w", err)
 	}
+	h.procs[pi.ProcessId] = pi.Process
+	keepProc = true
 	return &stubHandles{pid: pi.ProcessId, tid: pi.ThreadId, proc: proc, thread: thread, level: level}, nil
 }
 
@@ -473,6 +547,46 @@ func (h *stubHost) newStub() (*stubHandles, error) {
 	}
 	h.level = sh.level
 	return sh, nil
+}
+
+// eventHandles holds one auto-reset event pair in the Sentry and in a stub.
+type eventHandles struct {
+	// stubGuest and stubHost are handle values in the stub process. The stub
+	// sets the guest event to wake the Sentry and waits on the host event.
+	stubGuest, stubHost windows.Handle
+	// guest and host are the same two events in the Sentry process.
+	guest, host windows.Handle
+}
+
+// newEvents asks the host for one event pair that the stub with the given
+// process ID can use. The host creates the events and duplicates them into the
+// stub and into the Sentry, so the Sentry needs no right to a stub handle table.
+func (h *stubHost) newEvents(pid uint32) (eventHandles, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var req [hostReqSize]byte
+	binary.LittleEndian.PutUint32(req[0:], hostMagic)
+	binary.LittleEndian.PutUint32(req[4:], opNewEvents)
+	binary.LittleEndian.PutUint64(req[8:], uint64(pid))
+	if _, err := h.in.Write(req[:]); err != nil {
+		return eventHandles{}, fmt.Errorf("send to the stub host: %w", err)
+	}
+	var rsp [hostRspSize]byte
+	if _, err := io.ReadFull(h.out, rsp[:]); err != nil {
+		return eventHandles{}, fmt.Errorf("read from the stub host: %w", err)
+	}
+	if binary.LittleEndian.Uint32(rsp[0:]) != hostMagic {
+		return eventHandles{}, errors.New("the stub host sent a malformed reply")
+	}
+	if errno := binary.LittleEndian.Uint32(rsp[4:]); errno != 0 {
+		return eventHandles{}, fmt.Errorf("the stub host could not create events: %w", windows.Errno(errno))
+	}
+	return eventHandles{
+		stubGuest: windows.Handle(binary.LittleEndian.Uint64(rsp[8:])),
+		stubHost:  windows.Handle(binary.LittleEndian.Uint64(rsp[16:])),
+		guest:     windows.Handle(binary.LittleEndian.Uint64(rsp[24:])),
+		host:      windows.Handle(binary.LittleEndian.Uint64(rsp[32:])),
+	}, nil
 }
 
 // release tells the host that the stub with the given process ID is gone.

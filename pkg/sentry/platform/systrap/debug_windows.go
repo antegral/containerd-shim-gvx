@@ -144,7 +144,7 @@ func statsLine() string {
 	for k := stopKind(0); k < stopKinds; k++ {
 		fmt.Fprintf(&b, " %s %d %d %d,", stopKindNames[k], stopStats.count[k].Load(), stopStats.handleNs[k].Load()/1e6, stopStats.waitNs[k].Load()/1e6)
 	}
-	return strings.TrimSuffix(b.String(), ",") + "; " + bringUpLine()
+	return strings.TrimSuffix(b.String(), ",") + fmt.Sprintf("; fast traps %d", fastTraps.Load()) + "; " + bringUpLine()
 }
 
 func tracef(format string, args ...any) {
@@ -328,6 +328,11 @@ func (d *debugger) dispatch(ev debugEvent) {
 		}
 		select {
 		case th.events <- ev:
+			// The count rises before the wake, so a Sentry thread that sets its
+			// waiter flag and then reads the count sees the event, or the pump
+			// sees the flag.
+			th.evQueued.Add(1)
+			th.wakeFast()
 		default:
 			// The thread has an outstanding event already. Continue the new one,
 			// because a reply to the old one is still pending.

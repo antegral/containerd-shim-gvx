@@ -63,6 +63,15 @@ type Platform struct {
 	// change while guests run.
 	lowWindow bool
 
+	// fast tells whether the platform runs system calls through the fast path.
+	// New decides it once, before the first address space.
+	fast bool
+	// spill is the spill routine of the fast path, and ntSetEvent and ntWait
+	// are the addresses of the ntdll functions that it calls.
+	spill      winSpillCode
+	ntSetEvent uint64
+	ntWait     uint64
+
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -93,6 +102,13 @@ func New() (*Platform, error) {
 		userMin:   winBase,
 		userMax:   internalBase,
 	}
+	if fastPathRequested {
+		if err := p.prepareFast(); err != nil {
+			dbg.close()
+			_ = host.close()
+			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path is unavailable: %v", err)}
+		}
+	}
 	first := p.selectLowWindow()
 	p.startPool()
 	if first != nil {
@@ -100,6 +116,15 @@ func New() (*Platform, error) {
 		case p.pool.ready <- first:
 		default:
 			first.destroy()
+		}
+	}
+	if p.fast {
+		// GVX_SYSTRAP_FASTPATH=1 asks for the fast path, so a host that cannot
+		// run it is an error. The run proves the facts that the Windows
+		// documents do not state.
+		if err := p.selfTestFast(); err != nil {
+			_ = p.Close()
+			return nil, &ErrUnavailable{Host: "windows/" + runtime.GOARCH, Reason: fmt.Sprintf("the fast path failed its self test: %v", err)}
 		}
 	}
 	return p, nil
