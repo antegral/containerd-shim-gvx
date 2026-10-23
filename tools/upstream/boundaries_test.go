@@ -150,18 +150,35 @@ func TestBoundaryIgnoresUpstreamFilesNoWindowsOrMacTargetBuilds(t *testing.T) {
 	m := modulePrefix
 	// systrap upstream code imports the kernel on Linux; the fence keeps it out of Windows and macOS builds.
 	linuxOnly := "//go:build linux\n\n" + importLines(m+"pkg/sentry/kernel")
-	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go", linuxOnly); len(vs) != 0 {
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/subprocess_amd64.go", linuxOnly); len(vs) != 0 {
 		t.Errorf("linux-only upstream file flagged: %v", vs)
 	}
-	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/usertrap_linux.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 0 {
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/subprocess_linux.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 0 {
 		t.Errorf("_linux upstream file flagged: %v", vs)
 	}
-	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/usertrap.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 1 {
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/subprocess.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 1 {
 		t.Errorf("unconstrained upstream file: %d violations, want 1", len(vs))
 	}
 	// The exemption never covers files that gvx wrote.
 	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/x_xplat.go", linuxOnly); len(vs) != 1 {
 		t.Errorf("tier 2 file with a forbidden import: %d violations, want 1", len(vs))
+	}
+}
+
+func TestBoundaryUsertrapMayImportTheKernelButNotAHardwareBackend(t *testing.T) {
+	t.Parallel()
+
+	m := modulePrefix
+	// usertrap is upstream code that reads guest memory through kernel.Task.
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 0 {
+		t.Errorf("usertrap importing the kernel flagged: %v", vs)
+	}
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/usertrap/usertrap_amd64.go", importLines(m+"pkg/sentry/platform/whpx", m+"pkg/sentry/platform/hvf")); len(vs) != 2 {
+		t.Errorf("usertrap importing a hardware backend: %d violations, want 2", len(vs))
+	}
+	// The rest of systrap keeps the kernel ban.
+	if vs := boundaryCheck(t, "pkg/sentry/platform/systrap/context_queue.go", importLines(m+"pkg/sentry/kernel")); len(vs) != 1 {
+		t.Errorf("systrap importing the kernel: %d violations, want 1", len(vs))
 	}
 }
 

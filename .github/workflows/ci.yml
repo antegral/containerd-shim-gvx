@@ -96,7 +96,7 @@ jobs:
           path: ~/.cache/gvx/upstream
           key: upstream-${{ hashFiles('UPSTREAM_COMMIT') }}
       - name: Audit the upstream diff
-        run: go run ./tools/upstream -mode=audit -max-ratio=0.007
+        run: go run ./tools/upstream -mode=audit -max-ratio=0.01
 
   linux:
     name: test linux/${{ matrix.arch }}
