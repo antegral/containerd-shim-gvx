@@ -20,6 +20,8 @@ package hostlockdown
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 )
@@ -31,15 +33,24 @@ var ErrUnsupported = errors.New("hostlockdown: unsupported host OS")
 // ErrNotLockedDown reports that BindThread ran before a successful Apply.
 var ErrNotLockedDown = errors.New("hostlockdown: Apply has not succeeded")
 
+// HostMount names one host directory that the locked process may open files
+// below.
+type HostMount struct {
+	// Path is the host directory. It must exist when Apply runs. The root of a
+	// file system, such as "/" or "C:\", is refused.
+	Path string
+
+	// ReadOnly limits the locked process to read access below Path.
+	ReadOnly bool
+}
+
 // Options configures the host OS lockdown boundary.
 type Options struct {
-	// WorkspacePath is the optional host workspace directory. The locked
-	// process may open files below it. It must exist when Apply runs.
-	WorkspacePath string
-
-	// WorkspaceReadOnly limits the locked process to read access below
-	// WorkspacePath.
-	WorkspaceReadOnly bool
+	// Mounts lists the host directories that the locked process may open
+	// files below. Duplicate and nested entries are allowed. The lockdown only
+	// adds allow rules, so a path is writable when any entry that covers it is
+	// writable.
+	Mounts []HostMount
 
 	// AllowOutboundNet permits new outbound TCP and UDP connections and accept
 	// on pre-bound listeners when Track A (-net=nat) is active. Apply
@@ -72,11 +83,11 @@ type Status struct {
 	// with an active process limit of one.
 	SubprocessBlocked bool
 
-	// UnboundFileOpenBlocked reports that opens outside the workspace fail.
+	// UnboundFileOpenBlocked reports that opens outside every mount fail.
 	// macOS: probe opens failed in the whole process. Windows: probe opens
 	// failed on a thread that holds the restricted token, so only threads
 	// that call BindThread have this property. Linux: the seccomp filter
-	// rejects every open when no workspace exists. With a workspace, the filter
+	// rejects every open when no mount exists. With a mount, the filter
 	// rejects opens relative to the working directory but must allow opens
 	// relative to a directory descriptor, and seccomp cannot read the path. An
 	// absolute path opened through such a descriptor still reaches the host
@@ -111,8 +122,8 @@ var (
 // process can be partly locked and the caller must stop using it.
 //
 // Precondition: Open all hypervisor handles, cached .erofs layer descriptors,
-// network listeners/sockets, and the /workspace os.Root handle before calling
-// Apply.
+// network listeners/sockets, and the os.Root handle of every host mount before
+// calling Apply.
 func Apply(opts Options) (Status, error) {
 	lockdownMu.Lock()
 	defer lockdownMu.Unlock()
@@ -124,6 +135,9 @@ func Apply(opts Options) (Status, error) {
 			return Status{}, errors.New("hostlockdown: OutboundUDPPorts contains port 0")
 		}
 	}
+	if err := validateMounts(opts.Mounts); err != nil {
+		return Status{}, err
+	}
 	st, err := applyOSLockdown(opts)
 	if err != nil {
 		return st, err
@@ -132,6 +146,24 @@ func Apply(opts Options) (Status, error) {
 	lastStatus = st
 	lockedDownFlag.Store(true)
 	return st, nil
+}
+
+// validateMounts refuses an empty path and the root of a file system. A root
+// mount would allow every host file.
+func validateMounts(mounts []HostMount) error {
+	for i, m := range mounts {
+		if m.Path == "" {
+			return fmt.Errorf("hostlockdown: mount %d has an empty path", i)
+		}
+		abs, err := filepath.Abs(m.Path)
+		if err != nil {
+			return fmt.Errorf("hostlockdown: resolve mount %q: %w", m.Path, err)
+		}
+		if filepath.Dir(abs) == abs {
+			return fmt.Errorf("hostlockdown: mount %q is the root of a file system and would allow every host file", m.Path)
+		}
+	}
+	return nil
 }
 
 // IsLockedDown reports whether Apply has succeeded in the current process.
