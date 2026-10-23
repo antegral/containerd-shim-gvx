@@ -205,7 +205,7 @@ On Linux (`lockdown_linux.go` and `pkg/gvx/syscallfilter_linux.go`), it installs
 
 `tools/upstream` widens `//go:build linux` tags on allowlisted Sentry files after each `git merge upstream/go`, and it fences Linux-only files from the new targets. `-mode=audit` compares the tree with the pinned upstream archive and checks the SPEC import boundaries.
 
-The upstream baseline audit charged 16 of 2485 files (0.64%) against the `< 0.7%` ceiling. It reported 604 Linux fences separately. Including those fences, the modified share was 25%, above the ceiling under a strict count. These results do not verify the merged shim tree.
+The merged-tree audit at `0d0ef55` charged 16 of 2485 files (0.64%) against the `< 0.7%` ceiling. The charged share excludes Linux fences; the audit also reports a strict count that includes them.
 
 ### 3.7 Optional Containerd Control Adapter
 

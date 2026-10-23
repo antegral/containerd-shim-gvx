@@ -676,21 +676,23 @@ The gate `TestE2EGateETExec` decides whether a backend runs an executable that l
 
 ### 4.3 Containerd Shim Verification (Reference Module)
 
-This evidence predates the upstream merge and covers only the optional control adapter. It does not verify the merged tree or change guest-runtime verification above.
+Integration verification covers `0d0ef55` after the merge of upstream `5524535`. It does not establish compatibility for every incoming feature or change guest-runtime verification above.
+
+The focused native runs selected `internal/gvxshim`, `cmd/containerd-shim-gvx-v2`, `tools/upstream`, `pkg/sentry/platform/hvcommon`, and `pkg/fdnotifier`. The command package has no tests; Linux `pkg/fdnotifier` also has none. The Windows runs also passed the `TestGvxFallocate` cases in `third_party/x_sys/unix`. The macOS run used `scripts/codesign-exec.sh`.
 
 | Boundary | Executed result | Evidence limit |
 | :--- | :--- | :--- |
-| Linux command | JSON v3/ttRPC bootstrap, empty successful stderr, independent and repeated delete, owned state and socket cleanup | No guest workload |
-| Real SDK `2.1.5` | ShimManager shutdown and disconnect smoke passed; kernel peer PID matched Connect; task PID remained zero | Library lifecycle, not an external daemon |
-| External containerd `2.2.4` | Native creation returned the intended unsupported error; child, endpoints, lease, and bundle cleanup passed | No successful native sandbox |
-| Six production targets | Linux, Darwin, and Windows built on `amd64` and `arm64` | Cross-compilation does not prove native behavior |
-| Local Linux race verification | Native race tests passed | Control-plane coverage, not guest workloads |
-| Native Linux `arm64` | Full selected suite passed at `ef755d5` ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39959122675)); changed FIFO tests passed at `1b0fba5` ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39961165298)) | The FIFO rerun covered only the changed tests |
-| Native Darwin `arm64` | Full `internal/gvxshim` suite passed at `1b0fba5` ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39961165222)) | No guest workload |
-| Initial native Windows runs | Full `1b0fba5` runs passed every case except two fixture assumptions: [amd64](https://github.com/antegral/containerd-shim-gvx/actions/runs/39961165130), [arm64](https://github.com/antegral/containerd-shim-gvx/actions/runs/39961164855) | Neither initial full run passed |
-| Native Windows corrective reruns | Both corrected regressions passed at `e089bb8`: [amd64](https://github.com/antegral/containerd-shim-gvx/actions/runs/39962492219), [arm64](https://github.com/antegral/containerd-shim-gvx/actions/runs/39962491382) | Targeted tests only |
+| Linux command | JSON v3/ttRPC bootstrap, independent and repeated delete, child exit, and owned state and socket cleanup passed | No guest workload |
+| Real SDK `2.1.5` | ShimManager shutdown and disconnect smoke passed | Library lifecycle, not an external daemon |
+| External containerd `2.2.4` (`193637f7`) on Linux `amd64` | Native creation returned the intended unsupported error; cleanup passed | No successful native sandbox |
+| Six production targets | Whole-root builds passed for Linux, Darwin, and Windows on `amd64` and `arm64`; Darwin `arm64` also built with `pagesize_16k` | Cross-compilation does not prove native behavior |
+| Local Linux `amd64` | Race tests passed for `internal/gvxshim`, `tools/upstream`, and `pkg/sentry/platform/hvcommon`; focused vet passed | External containerd smoke passed separately with the actual binary |
+| Native Linux `arm64` | Focused packages passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996017628)) | Focused diagnose run; opt-in external containerd test skipped |
+| Native Darwin `arm64` | Focused packages passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996018107)) | Focused diagnose run, not the full CI workflow |
+| Native Windows `amd64` | Focused packages and fallocate cases passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996017757)) | Focused diagnose run, not the full CI workflow |
+| Native Windows `arm64` | Focused packages and fallocate cases passed ([run](https://github.com/antegral/containerd-shim-gvx/actions/runs/39996017707)) | Focused diagnose run, not the full CI workflow |
+| Upstream isolation | Both protection regressions failed before the fix and passed afterward; the audit charged 16/2485 files (0.64%), below 0.70% | Charged share excludes Linux fences |
 
-Windows evidence combines initial full runs with targeted corrective reruns. No full Windows suite reran at `e089bb8`.
-Darwin `amd64` remains compile-only.
+Darwin `amd64` remains compile-only. Workload creation and native sandbox creation remain unsupported; these results make no CRI or guest-execution claim.
 The [README smoke procedure](../README.md#23-containerd-control-shim-procedural-module) reproduces the SDK and external-daemon boundaries without registry or rootfs dependencies.
 
