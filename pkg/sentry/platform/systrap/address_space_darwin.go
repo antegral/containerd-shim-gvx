@@ -29,6 +29,7 @@ import (
 
 	"z.gfire.dev/gvx/pkg/context"
 	"z.gfire.dev/gvx/pkg/hostarch"
+	"z.gfire.dev/gvx/pkg/log"
 	"z.gfire.dev/gvx/pkg/sentry/memmap"
 	"z.gfire.dev/gvx/pkg/sentry/platform"
 )
@@ -117,6 +118,9 @@ type addressSpace struct {
 
 	// dead mirrors proc.dead for lock-free reads.
 	dead atomic.Bool
+
+	// selfStoreLogged records that logSelfStore ran.
+	selfStoreLogged atomic.Bool
 
 	// patchedBlocks counts blocks that the Sentry patched.
 	patchedBlocks atomic.Uint64
@@ -554,6 +558,26 @@ func (as *addressSpace) blockStateOf(base uint64) (blockState, hostarch.AccessTy
 		return 0, hostarch.NoAccess, false
 	}
 	return blk.state, blk.at, true
+}
+
+// isWritableExecutable reports whether base is an exec block that allows
+// writes. A write fault in such a block from an instruction inside the block
+// cannot succeed, because the engine gives the block either write or execute
+// access, never both.
+func (as *addressSpace) isWritableExecutable(base uint64) bool {
+	_, at, ok := as.blockStateOf(base)
+	return ok && at.Write && at.Execute
+}
+
+// logSelfStore tells the operator why a guest got SIGSEGV for a store to the
+// block of its own instruction. It logs once for each address space.
+func (as *addressSpace) logSelfStore(pc, far uint64) {
+	if as.selfStoreLogged.Swap(true) {
+		return
+	}
+	log.Warningf("systrap: the guest instruction at %#x stores to %#x in the same %dKB block. "+
+		"This engine gives a block write or execute access, never both, so the guest gets SIGSEGV. "+
+		"Run the executable with -platform=hvf.", pc, far, blockSize/1024)
 }
 
 func putWord(b []byte, w uint32) {

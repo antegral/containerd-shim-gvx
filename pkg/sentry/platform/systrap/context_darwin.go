@@ -617,6 +617,16 @@ func (c *Context) handleSignal(ctx context.Context, mm platform.MemoryManager, a
 		case ecDataAbort:
 			if esr&esrWnR != 0 {
 				base := blockRound(far)
+				if blockRound(pc) == base && as.isWritableExecutable(base) {
+					// The guest stores to the block that holds the storing
+					// instruction. Restoring the writable frame removes the
+					// execute permission under that instruction, and the next
+					// fetch maps the patched copy that removes the write
+					// permission again. The thread would loop, so the engine
+					// reports the fault instead.
+					as.logSelfStore(pc, far)
+					break
+				}
 				if ok, err := as.restoreData(base); err != nil {
 					return contextErr(err, unix.ENOMEM)
 				} else if ok {

@@ -643,6 +643,36 @@ func TestWritableExecutableBlock(t *testing.T) {
 	}
 }
 
+func TestSelfWritingBlockFaults(t *testing.T) {
+	// A guest that stores to the block that it executes would make the engine
+	// swap the write permission and the execute permission forever. The
+	// engine reports SIGSEGV for the store instead.
+	p := newPlatform(t)
+	r := newRig(t, p)
+	prog := append(loadAddr(1, codeVA+0x400), movz(2, 1), strW(2, 1))
+	r.mapPage(codeVA, hostarch.AccessType{Read: true, Write: true, Execute: true}, prog...)
+	r.mapPage(stackVA, hostarch.ReadWrite)
+	r.ac.SetIP(codeVA)
+	r.ac.SetStack(stackVA + blockSize - 0x100)
+	si, at, err := r.run()
+	wantSignal(t, si, at, err, linux.SIGSEGV, 2, codeVA+0x400, hostarch.Write)
+}
+
+func TestStoreFromAnotherBlockStillSucceeds(t *testing.T) {
+	// The loop breaker must not stop the ordinary case: code in one block
+	// writes to a writable and executable block that it does not run in.
+	p := newPlatform(t)
+	r := newRig(t, p)
+	prog := append(loadAddr(1, dataVA+0x400), movz(2, 0x55), strW(2, 1), ldrX(0, 1), movz(8, 9), insnSVC0)
+	r.program(prog...)
+	r.mapPage(dataVA, hostarch.AccessType{Read: true, Write: true, Execute: true})
+	si, _, err := r.run()
+	mustSyscall(t, si, err, 9, r.ac)
+	if got := r.regs().Regs[0]; got != 0x55 {
+		t.Errorf("the load returned %#x, want 0x55", got)
+	}
+}
+
 func TestSyscallRestart(t *testing.T) {
 	p := newPlatform(t)
 	r := newRig(t, p)
