@@ -158,6 +158,82 @@ func (h *hostRoot) open(rel string, flags int, perm os.FileMode) (*os.File, erro
 		return nil, err
 	}
 	defer release()
+	return openIn(parent, name, rel, flags, perm)
+}
+
+// hostDirHandle is an open directory descriptor. openDirAt returns one, and
+// its caller closes it with closeDir.
+type hostDirHandle int
+
+func (h *hostRoot) caseVerified() bool {
+	return false
+}
+
+func (h *hostRoot) rootDir() hostDirHandle {
+	return hostDirHandle(h.rootFD())
+}
+
+// checkChildName rejects a name that is not one plain directory entry name,
+// so that a pinned-directory call can never leave its directory.
+func checkChildName(name string) error {
+	if name == "" || name == "." || name == ".." || strings.IndexByte(name, '/') >= 0 {
+		return ErrPathTraversal
+	}
+	return nil
+}
+
+func (h *hostRoot) openDirAt(dir hostDirHandle, name string) (hostDirHandle, hostInfo, error) {
+	if err := checkChildName(name); err != nil {
+		return -1, hostInfo{}, err
+	}
+	fd, err := openatRetry(int(dir), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if isLinkRefusal(int(dir), name, err) {
+			return -1, hostInfo{}, ErrPathTraversal
+		}
+		return -1, hostInfo{}, fmt.Errorf("hostfs: open directory %q: %w", name, err)
+	}
+	var st unix.Stat_t
+	if err := retryEINTR(func() error { return unix.Fstat(fd, &st) }); err != nil {
+		_ = unix.Close(fd)
+		return -1, hostInfo{}, fmt.Errorf("hostfs: fstat directory %q: %w", name, err)
+	}
+	return hostDirHandle(fd), statToHostInfo(&st), nil
+}
+
+func (h *hostRoot) closeDir(dir hostDirHandle) error {
+	return unix.Close(int(dir))
+}
+
+func (h *hostRoot) fstatDir(dir hostDirHandle) (hostInfo, error) {
+	var st unix.Stat_t
+	if err := retryEINTR(func() error { return unix.Fstat(int(dir), &st) }); err != nil {
+		return hostInfo{}, fmt.Errorf("hostfs: fstat directory: %w", err)
+	}
+	return statToHostInfo(&st), nil
+}
+
+func (h *hostRoot) lstatAt(dir hostDirHandle, name string) (hostInfo, error) {
+	if err := checkChildName(name); err != nil {
+		return hostInfo{}, err
+	}
+	var st unix.Stat_t
+	if err := retryEINTR(func() error { return unix.Fstatat(int(dir), name, &st, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+		return hostInfo{}, fmt.Errorf("hostfs: lstat %q: %w", name, err)
+	}
+	return statToHostInfo(&st), nil
+}
+
+func (h *hostRoot) openChildAt(dir hostDirHandle, name string, flags int, perm os.FileMode) (*os.File, error) {
+	if err := checkChildName(name); err != nil {
+		return nil, err
+	}
+	return openIn(int(dir), name, name, flags, perm)
+}
+
+// openIn opens the entry name inside the directory descriptor parent. The
+// path rel only labels errors.
+func openIn(parent int, name, rel string, flags int, perm os.FileMode) (*os.File, error) {
 	// O_NONBLOCK keeps open from blocking on a host FIFO. The descriptor
 	// returns to blocking mode below once fstat proves a regular file.
 	openFlags := flags&(unix.O_ACCMODE|unix.O_CREAT|unix.O_EXCL|unix.O_TRUNC) | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NONBLOCK

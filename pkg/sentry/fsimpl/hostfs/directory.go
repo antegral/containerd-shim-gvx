@@ -98,6 +98,15 @@ func direntType(kind hostKind) uint8 {
 func (fd *dirFD) loadLocked() error {
 	d := fd.dentry
 	fs := d.fs
+	// A listing is a revalidation point: drop what the guest learned about
+	// the entries, so the next lookup asks the host again. See
+	// lookupChildLocked for the consistency contract.
+	fs.mu.Lock()
+	d.inode.negChildren = nil
+	for _, c := range d.children {
+		c.inode.invalidateMeta()
+	}
+	fs.mu.Unlock()
 	children, err := fs.ws.listDir(d.path())
 	if err != nil {
 		return translateHostError(err)
@@ -122,7 +131,7 @@ func (fd *dirFD) loadLocked() error {
 		case ino == 0:
 			// The platform layer did not report an inode number while
 			// listing, so ask for it. A miss means the entry vanished.
-			e, err := fs.ws.lookup(joinRelPath(rel, c.name))
+			e, err := fs.ws.lookupIn(rel, c.name)
 			if err != nil {
 				continue
 			}

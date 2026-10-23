@@ -85,6 +85,22 @@ type regularFD struct {
 	off int64
 }
 
+// openHost opens the host file of d. It passes the entry that the lookup
+// cached and the pinned handle of the directory, so it makes one host call
+// and no second lookup. When the host no longer holds that regular file, it
+// forgets the cached entry and resolves the path again, which gives the exact
+// error.
+func (d *dentry) openHost(flags int) (*os.File, error) {
+	rel := d.path()
+	f, err := d.fs.ws.openRegularWithAttr(rel, d.inode.snapshot(), flags)
+	if err == nil {
+		return f, nil
+	}
+	d.inode.invalidateMeta()
+	f, _, err = d.fs.ws.openRegular(rel, flags)
+	return f, err
+}
+
 func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.OpenOptions, created *os.File) (*vfs.FileDescription, error) {
 	f := created
 	writable := vfs.MayWriteFileWithOpenFlags(opts.Flags)
@@ -97,7 +113,7 @@ func (d *dentry) openRegular(ctx context.Context, rp *vfs.ResolvingPath, opts *v
 			hostFlags = os.O_RDWR
 		}
 		var err error
-		f, _, err = d.fs.ws.openRegular(d.path(), hostFlags)
+		f, err = d.openHost(hostFlags)
 		if err != nil {
 			return nil, translateHostError(err)
 		}
@@ -235,6 +251,7 @@ type handleWriter struct {
 func (w *handleWriter) Write(p []byte) (int, error) {
 	n, err := w.fd.h.f.WriteAt(p, w.off)
 	if n > 0 {
+		w.fd.dentry.inode.invalidateMeta()
 		w.fd.dentry.inode.data.writeThrough(w.off, p[:n])
 		w.off += int64(n)
 	}
@@ -385,7 +402,7 @@ func (i *inode) truncate(d *dentry, h *hostHandle, size int64) error {
 	if h != nil {
 		f = h.f
 	} else {
-		opened, _, err := i.fs.ws.openRegular(d.path(), os.O_WRONLY)
+		opened, err := d.openHost(os.O_WRONLY)
 		if err != nil {
 			return translateHostError(err)
 		}
@@ -399,6 +416,7 @@ func (i *inode) truncate(d *dentry, h *hostHandle, size int64) error {
 	if err := f.Truncate(size); err != nil {
 		return translateHostError(err)
 	}
+	i.invalidateMeta()
 	i.data.truncated(size)
 	return nil
 }
@@ -606,6 +624,7 @@ func (c *fileData) flushLocked(start, end uint64) error {
 			errs = append(errs, err)
 			continue
 		}
+		c.ino.invalidateMeta()
 		ch.dirty = c.writableMaps > 0
 	}
 	return errors.Join(errs...)
