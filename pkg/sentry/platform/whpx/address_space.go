@@ -121,6 +121,20 @@ func (as *AddressSpace) checkRange(addr hostarch.Addr, length uint64) error {
 	return nil
 }
 
+// chunkedFile is a memmap.File whose whole range stays mapped in host memory
+// with write access for the life of the file. pgalloc.MemoryFile is the only
+// implementation. The hvf backend recognizes it the same way.
+type chunkedFile interface {
+	memmap.File
+	// TotalSize returns the size of the host mapped range from offset 0.
+	TotalSize() uint64
+}
+
+func isChunkedFile(f memmap.File) bool {
+	_, ok := f.(chunkedFile)
+	return ok
+}
+
 // MapFile implements platform.AddressSpace.MapFile.
 func (as *AddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, _ bool) error {
 	if fr.Start&pageMask != 0 || fr.End&pageMask != 0 || !at.Any() {
@@ -129,7 +143,12 @@ func (as *AddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	if err := as.checkRange(addr, fr.Length()); err != nil {
 		return err
 	}
-	bs, err := f.MapInternal(fr, hostarch.AccessType{Read: true, Write: at.Write})
+	// A memory file keeps every chunk mapped with write access, whatever the
+	// guest may do with a page. The partition registers that memory once and
+	// writable, and the page-table entries of install enforce a read-only
+	// mapping. Any other file registers writable only when the request writes.
+	hostWrite := at.Write || isChunkedFile(f)
+	bs, err := f.MapInternal(fr, hostarch.AccessType{Read: true, Write: hostWrite})
 	if err != nil {
 		return err
 	}
@@ -139,7 +158,7 @@ func (as *AddressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	var buf [4]gpaRun
 	runs := buf[:0]
 	for !bs.IsEmpty() {
-		runs, err = as.p.mem.resolve(bs.Head().ToSlice(), at.Write, runs)
+		runs, err = as.p.mem.resolve(bs.Head().ToSlice(), hostWrite, runs)
 		if err != nil {
 			return err
 		}
