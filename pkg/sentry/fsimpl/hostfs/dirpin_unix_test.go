@@ -18,6 +18,7 @@ package hostfs
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"testing"
 
@@ -115,6 +116,65 @@ func TestRetiredPinsCloseTheirDescriptors(t *testing.T) {
 		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
 			t.Errorf("descriptor %d after the rename: %v, want EBADF (closed)", fd, err)
 		}
+	}
+}
+
+// On a volume that folds case, the host opens "SUB" when it stores "sub". The
+// workspace must refuse the wrong case when it opens a pin lazily, whether it
+// opens the pin for the first time or after a retirement.
+func TestPinOpenVerifiesTheCaseOfTheDirectory(t *testing.T) {
+	e := newEnv(t)
+	if !e.ws.host.caseInsensitive() && !hostFoldsCase(t, e.dir) {
+		t.Skip("the host file system is case-sensitive")
+	}
+	e.mustMkdir("sub")
+	e.writeFile("sub/file", []byte("x"))
+
+	pinned := func(rel string) bool {
+		e.ws.pinMu.Lock()
+		defer e.ws.pinMu.Unlock()
+		return e.ws.pins[rel] != nil
+	}
+	retireAll := func() {
+		e.ws.mu.Lock()
+		defer e.ws.mu.Unlock()
+		e.ws.closeSubtreeHandlesLocked(".")
+	}
+
+	// The first lookup of a wrong-case path finds no pin to reuse.
+	if _, err := e.ws.lookupPath("SUB/file"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lookupPath(SUB/file) = %v, want fs.ErrNotExist", err)
+	}
+	if pinned("SUB") {
+		t.Error("the workspace pinned the directory under the wrong case")
+	}
+	if _, err := e.ws.lookupPath("sub/file"); err != nil {
+		t.Fatalf("lookupPath(sub/file) = %v", err)
+	}
+	if !pinned("sub") {
+		t.Fatal("the lookup of sub/file did not pin sub")
+	}
+
+	// The pin retires, as eviction or an idle sweep would retire it. The wrong
+	// case must fail again, and the right case must open the pin again.
+	retireAll()
+	if pinned("sub") {
+		t.Fatal("the pin of sub survived the retirement")
+	}
+	if pin, err := e.ws.acquirePin("SUB"); !errors.Is(err, fs.ErrNotExist) {
+		if err == nil {
+			e.ws.releasePin(pin)
+		}
+		t.Fatalf("acquirePin(SUB) = %v, want fs.ErrNotExist", err)
+	}
+	if _, err := e.ws.lookupPath("SUB/file"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lookupPath(SUB/file) after the retirement = %v, want fs.ErrNotExist", err)
+	}
+	if pinned("SUB") {
+		t.Error("the workspace pinned the directory under the wrong case after a retirement")
+	}
+	if _, err := e.ws.lookupPath("sub/file"); err != nil {
+		t.Fatalf("lookupPath(sub/file) after the retirement = %v", err)
 	}
 }
 

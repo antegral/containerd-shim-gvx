@@ -168,6 +168,59 @@ func TestMapFileOfAReadOnlyViewNeverGrantsWrite(t *testing.T) {
 	}
 }
 
+// memoryFileFake is a fakeFile that reports the host size of a memory file.
+type memoryFileFake struct {
+	*fakeFile
+	total uint64
+}
+
+func (f memoryFileFake) TotalSize() uint64 { return f.total }
+
+func TestMemoryFileMappedReadOnlyThenWritableRegistersOnce(t *testing.T) {
+	const size = 8 * pageSize
+	fb := newFakeBackend()
+	p := newTestPlatform(t, fb, Options{})
+	as := newTestAS(t, p)
+	mem := withinOneArena(t, size)
+	file := memoryFileFake{fakeFile: fileOf(mem), total: size}
+	fr := memmap.FileRange{Start: 0, End: size}
+	maps0, unmaps0 := fb.calls()
+
+	// A fork copy-on-write page starts read-only. The page tables forbid the
+	// write, and the partition maps the memory writable, because the memory
+	// file owns it with write access.
+	if err := as.MapFile(0x400000, file, fr, hostarch.Read, false); err != nil {
+		t.Fatal(err)
+	}
+	gpa, got, _, ok := translate(as, 0x400000)
+	if !ok || got.Write {
+		t.Fatalf("the read-only request maps %#x with %+v (mapped %v), want a read-only entry", gpa, got, ok)
+	}
+	if mp, _, mapped := fb.mappingOf(gpa); !mapped || mp.flags&mapFlagWrite == 0 {
+		t.Fatal("the partition maps the memory file read-only, so a later write needs a second range")
+	}
+	if !file.lastAT.Write {
+		t.Error("MapInternal got a read-only access type for a memory file")
+	}
+	maps1, _ := fb.calls()
+	if maps1-maps0 != 1 {
+		t.Fatalf("the first request made %d map calls, want 1", maps1-maps0)
+	}
+
+	// The write after the copy-on-write break reuses the registered range.
+	if err := as.MapFile(0x400000, file, fr, hostarch.ReadWrite, false); err != nil {
+		t.Fatal(err)
+	}
+	rwGPA, got, _, _ := translate(as, 0x400000)
+	if rwGPA != gpa || !got.Write {
+		t.Fatalf("the write request maps %#x with %+v, want %#x and a writable entry", rwGPA, got, gpa)
+	}
+	if maps, unmaps := fb.calls(); maps != maps1 || unmaps != unmaps0 {
+		t.Errorf("the write request made %d map calls and %d unmap calls, want 0 and 0", maps-maps1, unmaps-unmaps0)
+	}
+	checkWritableEntriesHaveWritableMemory(t, fb, as, 0x400000, size/pageSize)
+}
+
 func TestLargeEntriesSplitOnPartialUnmap(t *testing.T) {
 	requireGuestPageSize(t)
 	const size = 4 << 20

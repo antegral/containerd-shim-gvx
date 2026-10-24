@@ -26,6 +26,8 @@ type importRule struct {
 	forbidden []string
 	// forbiddenLiterals lists string literals that must not appear in the package.
 	forbiddenLiterals []string
+	// skipTrees lists subtrees of pkg that another rule governs instead.
+	skipTrees []string
 }
 
 // importException permits one import that the SPEC table does not list.
@@ -135,6 +137,13 @@ var boundaryRules = []importRule{
 		pkg:       "pkg/sentry/platform/systrap",
 		allowed:   []string{"pkg/sentry/platform", "pkg/memutil", "pkg/abi/linux", "golang.org/x/arch/*"},
 		forbidden: []string{"pkg/sentry/kernel/*", "pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "cmd/*"},
+		// usertrap is upstream code. It reads guest memory through kernel.Task, so
+		// its own rule below keeps the other bans and drops the kernel ban.
+		skipTrees: []string{"pkg/sentry/platform/systrap/usertrap"},
+	},
+	{
+		pkg:       "pkg/sentry/platform/systrap/usertrap",
+		forbidden: []string{"pkg/sentry/platform/whpx", "pkg/sentry/platform/hvf", "cmd/*"},
 	},
 	{
 		pkg:       "pkg/sentry/fsimpl/hostfs",
@@ -317,7 +326,7 @@ func checkImports(relSlash string, tier IsolationTier, file *ast.File) []Boundar
 	pkgDir := path.Dir(relSlash)
 	var out []BoundaryViolation
 	for _, rule := range boundaryRules {
-		if !inTree(pkgDir, rule.pkg) {
+		if !inTree(pkgDir, rule.pkg) || slices.ContainsFunc(rule.skipTrees, func(tree string) bool { return inTree(pkgDir, tree) }) {
 			continue
 		}
 		for _, spec := range file.Imports {

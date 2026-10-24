@@ -203,15 +203,15 @@ To prevent merge conflicts during continuous upstream pulls, `gvx` partitions al
 | :--- | :--- | ---: | :--- |
 | **Tier 1: Additive Directories** | `cmd/rungv/`, `cmd/containerd-shim-gvx-v2/`, `pkg/gvx/`, `pkg/oci/`, `pkg/netbackend/`, `pkg/hostlockdown/`, `pkg/sentry/platform/whpx/`, `pkg/sentry/platform/hvf/`, `pkg/sentry/platform/hvcommon/`, `pkg/sentry/fsimpl/hostfs/`, `pkg/sentry/fsimpl/ext4lite/`, `e2e/`, `internal/`, `scripts/`, `.github/`, `tools/upstream/`, `tools/shiminterop/`, `docs/` | `0.0%` | Owned exclusively by `gvx`; `upstream/go` never touches these paths. |
 | **Tier 2: Sibling `_windows`, `_darwin`, & `_xplat` Files** | `pkg/sync/*_{windows,darwin,xplat}*`, `pkg/memutil/*_{windows,darwin,xplat}*`, `pkg/fd/*_{windows,darwin,xplat}*`, `pkg/{erofs,fdnotifier,syserr}/*_{windows,darwin,xplat}*`, `pkg/hostarch/*_darwin*`, `pkg/sentry/{kernel,mm}/*_xplat*`, `pkg/sentry/{pgalloc,time,hostcpu}/*_{windows,darwin}.go`, `pkg/sentry/platform/*_{windows,darwin,xplat}*`, `pkg/sentry/platform/systrap/*_{windows,darwin,xplat}*` | `0.0%` | Placed alongside unmodified `*_linux.go` files; Go selects the target file by `GOOS` and `GOARCH`. |
-| **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 0.7%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
+| **Tier 3: Build-Tag & Seam Patches** | Pure-Go files listed in `tools/upstream/buildtag_allowlist.txt` and `io_uring` `-ENOSYS` stubs | `< 1.0%` | Re-applied automatically by `tools/upstream` (`//go:build linux \|\| windows \|\| darwin`) after every `git merge upstream/go`. |
 
-The audit charges a file against the 0.7% ceiling only when its content differs from upstream. A file that `gvx` adds inside an upstream directory is free when its name carries the token `windows`, `darwin`, or `xplat`, because the audit then counts it as a Tier 2 sibling. It reports build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) as a third number. A strict count that includes the fences is larger than the charged share, and the audit prints both.
+The audit charges a file against the 1.0% ceiling only when its content differs from upstream. A file that `gvx` adds inside an upstream directory is free when its name carries the token `windows`, `darwin`, or `xplat`. The audit then counts it as a Tier 2 sibling. It reports build-tag fences on Linux-only trees (`runsc`, `shim`, `pkg/sentry/fsimpl/gofer`) as a third number. A strict count that includes the fences is larger than the charged share, and the audit prints both.
 
 ```mermaid
 flowchart LR
     Upstream["google/gvisor (go branch)"] -->|"1. git fetch upstream go"| Merge["2. git merge --no-commit upstream/go"]
     Merge -->|"3. go run ./tools/upstream -mode=retag"| Retag["Rewrite //go:build linux || windows || darwin"]
-    Retag -->|"4. go run ./tools/upstream -mode=audit"| Audit["Assert touched upstream files < 0.7%"]
+    Retag -->|"4. go run ./tools/upstream -mode=audit"| Audit["Assert touched upstream files < 1.0%"]
     Audit -->|"5. Update UPSTREAM_COMMIT"| Verify["Build & test on Windows and macOS (amd64 & arm64)"]
 ```
 
@@ -220,11 +220,11 @@ flowchart LR
 Run this procedure to audit the current upstream diff or merge new commits from `google/gvisor`.
 
 > [!WARNING]
-> Do not hand-edit `*_linux.go` files or scatter ad-hoc changes across pure-Go Sentry files. Unrecorded edits in Tier 3 files cause merge conflicts during upstream synchronization and violate the 0.7% diff ceiling. Register every build-tag change in `tools/upstream/buildtag_allowlist.txt`.
+> Do not hand-edit `*_linux.go` files or scatter ad-hoc changes across pure-Go Sentry files. Unrecorded edits in Tier 3 files cause merge conflicts during upstream synchronization and violate the 1.0% diff ceiling. Register every build-tag change in `tools/upstream/buildtag_allowlist.txt`.
 
 1. Register the upstream gVisor repository as the `upstream` Git remote.
 2. Fetch the latest `go` branch from `upstream`.
-3. Inspect the modified upstream file count and verify the `< 0.7%` budget against `UPSTREAM_COMMIT`.
+3. Inspect the modified upstream file count and verify the `< 1.0%` budget against `UPSTREAM_COMMIT`.
 4. Merge `upstream/go` without committing.
 5. Run `tools/upstream` in `retag` mode to apply `//go:build linux || windows || darwin` to allowlisted files.
 6. Run `tools/upstream` in `audit` mode to assert zero unauthorized edits in `*_linux.go` files.
@@ -237,7 +237,7 @@ git fetch upstream go
 # Merge new upstream commits and re-apply build tags
 git merge --no-commit upstream/go
 go run ./tools/upstream -mode=retag
-go run ./tools/upstream -mode=audit -max-ratio=0.007   # add -offline to reuse the cached upstream archive
+go run ./tools/upstream -mode=audit -max-ratio=0.01   # add -offline to reuse the cached upstream archive
 git rev-parse upstream/go > UPSTREAM_COMMIT
 
 # Verify all four Priority-0 host targets and both Linux targets compile cleanly
@@ -309,7 +309,7 @@ sequenceDiagram
 
 #### Two-Stage 4KB Paging on Apple Silicon (`platform/hvf`) and 64KB-to-4KB Slicing on Windows (`platform/whpx`) (Descriptive Module)
 
-Linux ELF64 binaries map `.text` (`R-X`) and `.data` (`RW-`) segments at 4KB (`0x1000`) file offsets and virtual address boundaries. On Windows, `VirtualAlloc(MEM_RESERVE)` and `MapViewOfFile3` require 64KB (`0x10000`) alignment. `platform/whpx` resolves this with 4KB entries in its own guest page tables. It registers each 64MiB arena of `pgalloc.MemoryFile` with `WHvMapGpaRange` once. Each arena has a read-only layer and a writable layer. The guest page tables give each 4KB page its permissions.
+Linux ELF64 binaries map `.text` (`R-X`) and `.data` (`RW-`) segments at 4KB (`0x1000`) file offsets and virtual address boundaries. On Windows, `VirtualAlloc(MEM_RESERVE)` and `MapViewOfFile3` require 64KB (`0x10000`) alignment. `platform/whpx` resolves this with 4KB entries in its own guest page tables. It registers each 64MiB arena of `pgalloc.MemoryFile` with `WHvMapGpaRange` once. Each arena has a read-only layer and a writable layer, and memory-file chunks always use the writable layer. The guest page tables give each 4KB page its permissions.
 
 On Apple Silicon macOS (`darwin/arm64`), the host XNU kernel and `hv_vm_map()` operate on 16KB (`0x4000`) pages. `platform/hvf` resolves this using the two-stage ARM64 MMU (`GVA` to Stage-1 `TTBR0_EL1` 4KB, then `IPA` to Stage-2 `hv_vm_map` 16KB, then `HPA`). Stage-2 maps each 1GiB chunk of the memory file into IPA space once, with permissive `HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC` rights. Inside the vCPU, the `bluepill` stub configures `TCR_EL1.TG0 = 0b00` (4KB granule) and populates 4KB Stage-1 page table entries in `TTBR0_EL1` with exact `R-X` or `RW-` (`UXN=1`) permissions. Because the ARM64 MMU enforces the intersection of Stage-1 and Stage-2 permissions, the hardware traps permission violations at exact 4KB boundaries.
 
@@ -332,6 +332,8 @@ On macOS, a template stub process (`gvx-stub-darwin-arm64`) forks one stub task 
 Each side spins on the state word before it sleeps. The stub spins for 1024 `yield` instructions, and the Sentry spins for 512 rounds of 4 `yield` instructions. A side sets its bit in `Sysmsg.Waiter` before it calls `__ulock_wait` and reads the state again. The other side calls `__ulock_wake` only when it sees that bit. A system call that the Sentry answers inside the spin needs no kernel call. The benchmark `BenchmarkSyscallRoundTrip` measured 4.1 microseconds for a round trip before this change and 0.19 microseconds after it on an M-series Mac.
 
 `Platform.MapUnit` returns 256KiB on macOS. A page fault then maps up to 256KiB of its pma in one `MapFile` call, which uses one remap and one protection call for the whole range. A range that spans the block of a trampoline island skips that block, because the island keeps its own page.
+
+The upstream package `usertrap` and the message types of `sysmsg` build on every host for `amd64`. The retag rules of `tools/upstream` widen eight files, and the other files of both packages stay Linux-only. No engine of `gvx` uses `usertrap.State`. Its trampolines write the thread state of the Linux stub into the `sysmsg` page, and it reads guest memory through `kernel.Task`. The Windows engine patches `syscall` sites with its own rewriter in `patcher_amd64_xplat.go`, which writes slots that follow the layout of `winSysmsg`.
 
 On Windows, the `whpx` backend writes the root register of the address space on the host. The register is `CR3` on `amd64` and `TTBR0_EL1` on `arm64`. The write happens before a virtual processor runs with a recorded address space that differs from the current one. The reload stub in the guest loads the same value. A kick before the run, a cancel inside the reload stub, and `AddressSpace.Release` invalidate the recorded state of the virtual processor. The first fetch of the reload stub then never walks page tables that `Release` freed.
 

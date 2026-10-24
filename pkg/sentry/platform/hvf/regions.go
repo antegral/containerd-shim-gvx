@@ -79,12 +79,31 @@ type region struct {
 	size   uintptr
 	ipa    uint64
 	copied []byte
+	// filled marks the 4KB pages of copied that hold source bytes.
+	filled []bool
 	// refs counts the address spaces that may hold a Stage-1 mapping of the
 	// region. The count changes under regionMap.mu.
 	refs int
 }
 
 func (r *region) end() uintptr { return r.host + r.size }
+
+// fill copies the pages of block that lie in r into the private copy. block is
+// a slice of the host mapping that starts and ends at a 4KB boundary. The
+// copy holds no other byte of the host pages around the block: a host page
+// can be larger than the 4KB pages that the guest maps from one file range.
+func (r *region) fill(block []byte) {
+	first := uintptr(unsafe.Pointer(unsafe.SliceData(block)))
+	lo, hi := max(first, r.host), min(first+uintptr(len(block)), r.end())
+	for p := lo; p < hi; p += pageSize4K {
+		i := (p - r.host) / pageSize4K
+		if r.filled[i] {
+			continue
+		}
+		copy(r.copied[p-r.host:p-r.host+pageSize4K], block[p-first:])
+		r.filled[i] = true
+	}
+}
 
 // ownerRegions holds the regions of one memmap.File, ordered by host address.
 // Host address ranges belong to one file: the file can unmap and reuse the
@@ -249,8 +268,11 @@ func (m *regionMap) resolve(u *regionUser, f memmap.File, bs safemem.BlockSeq, w
 			if write && r.copied != nil {
 				return nil, fmt.Errorf("%w: the memory is a private copy of read-only memory", errHostBlockRejected)
 			}
-			u.use(r)
 			take := min(n-off, r.end()-(base+off))
+			if r.copied != nil {
+				r.fill(slice[off : off+take])
+			}
+			u.use(r)
 			ipa := r.ipa + uint64(base+off-r.host)
 			if k := len(segs) - 1; k >= 0 && segs[k].ipa+segs[k].length == ipa {
 				segs[k].length += uint64(take)
@@ -350,21 +372,20 @@ func (m *regionMap) addLocked(o *ownerRegions, block []byte, start, end uintptr,
 	return nil
 }
 
-// copyLocked fills r with a private copy of the host range and maps it.
+// copyLocked fills r with a private copy of the pages of block and maps it.
+// The rest of the host pages stays zero until a later resolve asks for it.
 func (m *regionMap) copyLocked(r *region, block []byte) error {
 	mem, err := m.be.allocCopy(r.size)
 	if err != nil {
 		return fmt.Errorf("hvf: allocate a private copy of read-only memory: %w", err)
 	}
-	// The range extends from the first host page of block to the last. Both
-	// pages belong to the host mapping of block.
-	first := uintptr(unsafe.Pointer(unsafe.SliceData(block)))
-	src := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(unsafe.SliceData(block)), int(r.host)-int(first))), r.size)
-	copy(mem, src)
+	r.copied = mem
+	r.filled = make([]bool, r.size/pageSize4K)
+	r.fill(block)
 	if err := m.be.mapHost(uintptr(unsafe.Pointer(unsafe.SliceData(mem))), r.ipa, r.size); err != nil {
+		r.copied, r.filled = nil, nil
 		return errors.Join(err, m.be.freeCopy(mem))
 	}
-	r.copied = mem
 	return nil
 }
 

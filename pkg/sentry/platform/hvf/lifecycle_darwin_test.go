@@ -227,9 +227,27 @@ func TestReplacementStopsVCPUsBeforeTheOldMemoryChanges(t *testing.T) {
 		next := 1 - cur
 		mapHostBytes(t, g.as, guestDataAddr, pages[next], hostarch.ReadWrite)
 		binary.LittleEndian.PutUint64(pages[cur], poison)
-		time.Sleep(300 * time.Microsecond)
-		if got := atomic.LoadUint64((*uint64)(unsafe.Pointer(&observer[0]))); got != uint64(next+1) {
-			t.Fatalf("iteration %d: the observer holds %#x, want %d: a vCPU read the old page after MapFile returned", i, got, next+1)
+		// The guest resumes after MapFile returns. It can store its saved
+		// register once, which holds the old valid value. It must never read
+		// the poisoned old page. Poll for the new value, and stop at once on
+		// the poison.
+		observed := func() uint64 { return atomic.LoadUint64((*uint64)(unsafe.Pointer(&observer[0]))) }
+		deadline := time.Now().Add(2 * time.Second)
+		for got := observed(); got != uint64(next+1); got = observed() {
+			if got == poison {
+				t.Fatalf("iteration %d: the observer holds the poison %#x: a vCPU read the old page after MapFile returned", i, got)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("iteration %d: the observer holds %#x after 2s, want %d: the guest did not read the new page", i, got, next+1)
+			}
+			runtime.Gosched()
+		}
+		// A vCPU with a stale translation would read the old page again.
+		for range 256 {
+			if got := observed(); got == poison {
+				t.Fatalf("iteration %d: the observer holds the poison %#x after the new value: a vCPU read the old page after MapFile returned", i, got)
+			}
+			runtime.Gosched()
 		}
 		binary.LittleEndian.PutUint64(pages[cur], uint64(cur+1))
 		cur = next

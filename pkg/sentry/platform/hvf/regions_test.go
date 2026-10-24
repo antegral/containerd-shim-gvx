@@ -15,6 +15,7 @@
 package hvf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -371,6 +372,100 @@ func TestReadOnlyMemoryGetsACopyForReadsOnly(t *testing.T) {
 	}
 	if _, unmaps := be.counts(); unmaps != 1 {
 		t.Errorf("unmaps = %d, want 1", unmaps)
+	}
+}
+
+// copiedRegion returns the only region of f, which must hold a private copy.
+func copiedRegion(t *testing.T, m *regionMap, f memmap.File) *region {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	o := m.owners[f]
+	if o == nil || len(o.regions) != 1 || o.regions[0].copied == nil {
+		t.Fatalf("want one region with a private copy, owner = %+v", o)
+	}
+	return o.regions[0]
+}
+
+// patternMem returns host memory in which no byte is zero, so a copy of memory
+// that the test did not ask for shows up.
+func patternMem(size int) []byte {
+	mem := alignedMem(size)
+	for i := range mem {
+		mem[i] = byte(i%251 + 1)
+	}
+	return mem
+}
+
+func refuseAll(be *fakeStage2, mem []byte) {
+	base := uintptr(unsafe.Pointer(&mem[0]))
+	be.refuse = func(host uintptr) bool { return host >= base && host < base+uintptr(len(mem)) }
+}
+
+func TestPrivateCopyHoldsOnlyTheBytesOfTheBlock(t *testing.T) {
+	be := &fakeStage2{}
+	mem := patternMem(64 << 10)
+	refuseAll(be, mem)
+	m := newTestRegionMap(be, testIPABase+1<<30)
+	file := &plainFile{mem: mem}
+	var u regionUser
+	// The block is the second 4KB page of the host page [16KB, 32KB).
+	const lo, hi = 20 << 10, 24 << 10
+	bs, _ := file.MapInternal(memmap.FileRange{Start: lo, End: hi}, hostarch.Read)
+
+	segs, err := m.resolve(&u, file, bs, false)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	r := copiedRegion(t, m, file)
+	off := uintptr(unsafe.Pointer(&mem[lo])) - r.host
+	if off != 4<<10 || r.size != testGranule {
+		t.Fatalf("the block lies at %#x in a region of %#x bytes, want %#x in %#x", off, r.size, 4<<10, testGranule)
+	}
+	if len(segs) != 1 || segs[0].ipa != r.ipa+uint64(off) || segs[0].length != hi-lo {
+		t.Errorf("segments %+v, want one segment of the block at ipa %#x", segs, r.ipa+uint64(off))
+	}
+	if !bytes.Equal(r.copied[off:off+(hi-lo)], mem[lo:hi]) {
+		t.Error("the copy differs from the block")
+	}
+	for i, b := range r.copied {
+		if uintptr(i) >= off && uintptr(i) < off+(hi-lo) {
+			continue
+		}
+		if b != 0 {
+			t.Fatalf("byte %#x of the copy is %#x: the copy holds memory outside the block", i, b)
+		}
+	}
+}
+
+func TestAnotherBlockOfACopiedRegionGetsItsOwnBytes(t *testing.T) {
+	be := &fakeStage2{}
+	mem := patternMem(64 << 10)
+	refuseAll(be, mem)
+	m := newTestRegionMap(be, testIPABase+1<<30)
+	file := &plainFile{mem: mem}
+	var u regionUser
+	resolve := func(lo, hi uint64) {
+		t.Helper()
+		bs, _ := file.MapInternal(memmap.FileRange{Start: lo, End: hi}, hostarch.Read)
+		if _, err := m.resolve(&u, file, bs, false); err != nil {
+			t.Fatalf("resolve [%#x, %#x): %v", lo, hi, err)
+		}
+	}
+	resolve(20<<10, 24<<10)
+	// The next 4KB page lies in the same host page, so the copy already covers it.
+	resolve(24<<10, 28<<10)
+	if be.copies != 1 || m.copyCount() != 1 {
+		t.Fatalf("copies = %d, regions with a copy = %d, want one of each", be.copies, m.copyCount())
+	}
+	r := copiedRegion(t, m, file)
+	for page := uintptr(0); page < r.size; page += 4 << 10 {
+		src := mem[16<<10+page : 16<<10+page+4<<10]
+		want := bytes.Equal(r.copied[page:page+4<<10], src)
+		asked := page == 4<<10 || page == 8<<10
+		if want != asked {
+			t.Errorf("page %#x of the copy holds the memory = %v, want %v", page, want, asked)
+		}
 	}
 }
 

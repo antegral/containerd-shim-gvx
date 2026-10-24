@@ -91,6 +91,13 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 		return nil, err
 	}
 	h, info, err := w.host.openDirAt(parent.h, name)
+	if err == nil && !w.host.caseVerified() {
+		// A case-insensitive volume opens "DIR" when it stores "dir". The pin
+		// would then stand for a name that the guest must not see.
+		if err = w.verifyDirName(rel, parent); err != nil {
+			_ = w.host.closeDir(h)
+		}
+	}
 	w.releasePinLocked(parent)
 	if err != nil {
 		return nil, err
@@ -104,6 +111,21 @@ func (w *Workspace) acquirePinLocked(rel string) (*dirPin, error) {
 	w.pins[rel] = p
 	w.armSweepLocked()
 	return p, nil
+}
+
+// verifyDirName fails with nameMismatch when the host stores the directory rel
+// under a name with another case. parent is the pin of the directory that
+// holds rel. The caller holds w.pinMu, and exactNameIn takes only the lock of
+// the name snapshots.
+func (w *Workspace) verifyDirName(rel string, parent *dirPin) error {
+	ok, err := w.exactNameIn(rel, parent)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nameMismatch(rel)
+	}
+	return nil
 }
 
 // holdPin returns the existing pin of rel with one reference, or nil. It
